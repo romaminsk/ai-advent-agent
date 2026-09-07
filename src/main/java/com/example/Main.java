@@ -1,24 +1,30 @@
 package com.example;
 
-import java.io.BufferedReader;
-import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.PrintStream;
-import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 /**
- * Консольный интерфейс агента.
- * Здесь нет ни JSON, ни HTTP — только чтение ввода, вывод ответа
- * и обращение к отдельному агенту LlmAgent.
+ * Консольное приложение агента. Координирует работу: создаёт конфигурацию,
+ * агента и терминальный интерфейс; вся работа с терминалом — в TerminalUi,
+ * всё общение с LLM — в LlmAgent.
  *
- * Поддерживает многошаговый диалог: агент учитывает историю текущей беседы,
- * а также локальные команды /help, /history, /reset, /exit (без вызова API).
+ * Параметры запуска:
+ *   --help   — справка (без API-ключа и обращения к API);
+ *   --plain  — упрощённый режим без цветов, спиннера и сложного редактирования.
  */
 public final class Main {
 
     public static void main(String[] args) {
-        // 1. Загружаем конфигурацию.
+        boolean plainRequested = false;
+        for (String arg : args) {
+            if ("--help".equals(arg) || "-h".equals(arg)) {
+                printCliHelp(System.out);
+                return;
+            }
+            if ("--plain".equals(arg)) {
+                plainRequested = true;
+            }
+        }
+
         Config config;
         try {
             config = Config.fromEnv();
@@ -28,104 +34,91 @@ public final class Main {
             return;
         }
 
-        // 2. Запускаем консольный цикл.
-        run(new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8)),
-                System.out, config);
+        LlmAgent agent = new LlmAgent(config);
+        TerminalUi ui = TerminalUi.create(plainRequested);
+        try {
+            runLoop(ui, agent, config.model());
+        } finally {
+            ui.close();
+        }
     }
 
-    /**
-     * Консольный цикл. Пакетно-приватный метод выделен для локальных тестов:
-     * ввод и вывод передаются параметрами, в тестах подставляется локальный сервер.
-     */
-    static void run(BufferedReader reader, PrintStream out, Config config) {
-        // Один экземпляр агента на всё время работы; историю беседы хранит агент.
-        LlmAgent agent = new LlmAgent(config);
-
-        out.println("CLI-агент запущен. Модель: " + config.model());
-        out.println("Агент учитывает историю текущей беседы. Команды: /help, /history, /reset, /exit.");
-        out.println("Пустая строка пропускается, exit или quit — выход.");
-
-        try {
-            while (true) {
-                out.print("> ");
-                out.flush();
-
-                String line = reader.readLine();
-                if (line == null) {
-                    // EOF (Ctrl+D): корректно завершаем приложение. История не сохраняется.
-                    out.println();
-                    break;
+    /** Основной цикл чата: команды обрабатываются локально, сообщения уходят агенту. */
+    static void runLoop(TerminalUi ui, LlmAgent agent, String model) {
+        ui.showWelcome(model);
+        while (true) {
+            TerminalUi.Input input = ui.nextInput();
+            switch (input.type()) {
+                case EOF -> {
+                    ui.showSystem("Работа завершена. История диалога не сохраняется.");
+                    return;
                 }
-
-                String userMessage = line.trim();
-                if (userMessage.isEmpty()) {
-                    continue;
+                case COMMAND -> {
+                    if (handleCommand(ui, agent, model, input.text())) {
+                        return;
+                    }
                 }
-
-                // Локальные команды обрабатываются без обращения к API.
-                if (userMessage.equals("/help")) {
-                    printHelp(out);
-                    continue;
-                }
-                if (userMessage.equals("/history")) {
-                    printHistory(out, agent.getHistory());
-                    continue;
-                }
-                if (userMessage.equals("/reset")) {
-                    agent.resetConversation();
-                    out.println("Начата новая беседа. История очищена.");
-                    continue;
-                }
-                if (userMessage.equals("/exit")) {
-                    break;
-                }
-                if (userMessage.startsWith("/")) {
-                    out.println("Неизвестная команда. Введите /help для справки.");
-                    continue;
-                }
-                if (userMessage.equalsIgnoreCase("exit") || userMessage.equalsIgnoreCase("quit")) {
-                    break;
-                }
-
-                try {
-                    String answer = agent.ask(userMessage);
-                    out.println("Агент: " + answer);
-                } catch (AgentException e) {
-                    // Обычную ошибку запроса показываем и позволяем ввести следующий запрос.
-                    // История беседы при ошибке не изменяется.
-                    out.println("Ошибка запроса: " + e.getMessage());
-                    if (Thread.currentThread().isInterrupted()) {
-                        break;
+                case MESSAGE -> {
+                    try (TerminalUi.ProgressIndicator progress = ui.startProgress()) {
+                        String answer = agent.ask(input.text());
+                        ui.showMessage(answer);
+                    } catch (AgentException e) {
+                        // Обычную ошибку запроса показываем; чат можно продолжить.
+                        // При прерывании корректно завершаем работу.
+                        ui.showError(e.getMessage());
+                        if (Thread.currentThread().isInterrupted()) {
+                            ui.showSystem("Работа завершена. История диалога не сохраняется.");
+                            return;
+                        }
                     }
                 }
             }
-        } catch (IOException e) {
-            out.println("Ошибка чтения ввода: " + e.getMessage());
-        } finally {
-            out.println("Работа завершена. История диалога не сохраняется.");
         }
     }
 
-    /** Справка по командам. */
-    private static void printHelp(PrintStream out) {
-        out.println("Доступные команды:");
-        out.println("  /help    — справка");
-        out.println("  /history — показать сохранённые сообщения с ролями");
-        out.println("  /reset   — начать новую беседу (очистить историю)");
-        out.println("  /exit    — завершить приложение");
-        out.println("Также работают exit и quit. Пустая строка пропускается.");
+    /**
+     * Выполняет служебную команду; возвращает true, если приложение должно завершиться.
+     * Служебные команды не вызывают API.
+     */
+    private static boolean handleCommand(TerminalUi ui, LlmAgent agent, String model, String command) {
+        String normalized = command.toLowerCase(java.util.Locale.ROOT);
+        switch (normalized) {
+            case "/exit", "exit", "quit" -> {
+                ui.showSystem("Работа завершена. История диалога не сохраняется.");
+                return true;
+            }
+            case "/help" -> ui.showHelp();
+            case "/history" -> ui.showHistory(agent.getHistory());
+            case "/reset" -> {
+                if (agent.getHistory().isEmpty() || ui.confirmReset()) {
+                    agent.resetConversation();
+                    ui.showSystem("Начата новая беседа. История очищена.");
+                } else {
+                    ui.showSystem("Сброс отменён. История сохранена.");
+                }
+            }
+            case "/clear" -> {
+                // Очистка экрана не трогает историю диалога.
+                ui.clearScreen();
+                ui.showWelcome(model);
+            }
+            default -> ui.showSystem("Неизвестная команда. Введите /help для справки.");
+        }
+        return false;
     }
 
-    /** Печатает снимок истории с ролями; без обращения к API. */
-    private static void printHistory(PrintStream out, List<ChatMessage> history) {
-        if (history.isEmpty()) {
-            out.println("История диалога пуста.");
-            return;
-        }
-        out.println("Сохранённые сообщения (" + history.size() / 2 + " пар):");
-        for (ChatMessage message : history) {
-            out.println("[" + message.role() + "] " + message.content());
-        }
+    /** Справка по запуску приложения; не требует API-ключа и не обращается к API. */
+    private static void printCliHelp(java.io.PrintStream out) {
+        out.println("AI Advent Agent — интерактивный CLI-чат с LLM.");
+        out.println();
+        out.println("Использование: ai-agent [параметры]");
+        out.println("  --help    — эта справка");
+        out.println("  --plain   — упрощённый режим: без цветов, спиннера и сложного редактирования");
+        out.println();
+        out.println("Переменные окружения: LLM_API_KEY, LLM_API_URL, LLM_MODEL");
+        out.println("(при запуске через launcher загружаются из локального .env проекта).");
+        out.println();
+        out.println("Команды чата: /help, /history, /reset, /clear, /multiline, /exit (также exit, quit).");
     }
 
     private Main() {

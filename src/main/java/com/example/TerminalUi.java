@@ -1,0 +1,105 @@
+package com.example;
+
+import java.util.List;
+
+/**
+ * Терминальный интерфейс агента: приветствие, ввод, отображение ответов,
+ * статусы ожидания, ошибки и справка.
+ *
+ * Main координирует работу через этот интерфейс; LlmAgent не зависит
+ * от терминала, цветов и библиотек ввода.
+ */
+public interface TerminalUi extends AutoCloseable {
+
+    /** Тип ввода: команда (без вызова API), сообщение для агента, конец ввода. */
+    enum InputType { COMMAND, MESSAGE, EOF }
+
+    /**
+     * Ввод пользователя. COMMAND — служебная строка (начинается с «/»,
+     * а также exit и quit); MESSAGE — готовый текст запроса, в том числе
+     * собранный в многострочном режиме.
+     */
+    record Input(InputType type, String text) {
+        public static Input command(String text) {
+            return new Input(InputType.COMMAND, text);
+        }
+
+        public static Input message(String text) {
+            return new Input(InputType.MESSAGE, text);
+        }
+
+        public static Input eof() {
+            return new Input(InputType.EOF, "");
+        }
+    }
+
+    /** Индикатор ожидания ответа; закрывается в finally после ответа или ошибки. */
+    interface ProgressIndicator extends AutoCloseable {
+        @Override
+        void close();
+    }
+
+    /** Компактный блок при старте и после /clear (модель передаётся из Config). */
+    void showWelcome(String model);
+
+    /**
+     * Блокирующее чтение ввода. В многострочном режиме собирает строки
+     * в один MESSAGE (до /send или /cancel); служебные строки внутри
+     * многострочного режима считаются содержимым сообщения.
+     */
+    Input nextInput();
+
+    /** Ответ агента: заголовок «Агент», затем исходный текст без изменений. */
+    void showMessage(String answer);
+
+    /** Служебное сообщение (подтверждения, подсказки). */
+    void showSystem(String text);
+
+    /** Ошибка: выделяется и цветом, и текстом. */
+    void showError(String text);
+
+    /** Справка по командам чата. */
+    void showHelp();
+
+    /** История текущей беседы с ролями. */
+    void showHistory(List<ChatMessage> history);
+
+    /** Подтверждение сброса непустой истории: true, если пользователь согласился. */
+    boolean confirmReset();
+
+    /** Индикатор на время HTTP-запроса; используйте в try-with-resources. */
+    ProgressIndicator startProgress();
+
+    /** Очистка экрана без изменения истории; без поддержки — ничего не делает. */
+    void clearScreen();
+
+    /** Освобождает терминальные ресурсы, восстанавливает состояние терминала. */
+    @Override
+    void close();
+
+    /**
+     * Фабрика: интерактивный режим (JLine) — если терминал настоящий и не
+     * запрошен --plain; иначе упрощённый режим без цветов и анимации.
+     * NO_COLOR и TERM=dumb учитываются автоматически.
+     */
+    static TerminalUi create(boolean plainRequested) {
+        boolean interactive = !plainRequested
+                && System.console() != null
+                && !"dumb".equalsIgnoreCase(System.getenv("TERM"));
+        if (interactive) {
+            try {
+                return new InteractiveTerminalUi();
+            } catch (Exception e) {
+                // Не удалось инициализировать терминал — работаем в упрощённом режиме.
+                return new PlainTerminalUi();
+            }
+        }
+        return new PlainTerminalUi();
+    }
+
+    /** NO_COLOR отключает цвета (стандартная переменная окружения). */
+    static boolean colorsEnabled() {
+        String noColor = System.getenv("NO_COLOR");
+        return noColor == null || noColor.isEmpty();
+    }
+}

@@ -13,7 +13,9 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintStream;
+import java.io.PrintWriter;
 import java.io.StringReader;
+import java.io.StringWriter;
 import java.net.InetSocketAddress;
 import java.net.http.HttpClient;
 import java.nio.charset.StandardCharsets;
@@ -35,7 +37,10 @@ import java.util.concurrent.atomic.AtomicReference;
  * - неизменность истории при ошибках запроса;
  * - resetConversation, session ID, лимит истории целыми парами;
  * - снимок getHistory;
- * - локальные команды CLI без вызова API.
+ * - диспетчер команд Main (через подставной интерфейс);
+ * - plain-интерфейс: многострочный ввод, разделение потоков, отсутствие ANSI;
+ * - обезвреживание управляющих последовательностей;
+ * - индикатор ожидания (спиннер останавливается и стирает строку).
  *
  * Запуск: mvn test-compile exec:java@self-test
  */
@@ -56,6 +61,9 @@ public final class SelfTest {
         checkConfigErrors();
         checkEmptyQueryNoApiCall();
         checkDialogOnLocalServer();
+        checkPlainTerminalUi();
+        checkAnsiSanitizer();
+        checkProgressSpinner();
 
         System.out.println("OK: все проверки пройдены (" + passed + ").");
     }
@@ -297,8 +305,8 @@ public final class SelfTest {
                 expect("снимок истории не изменяется при новых запросах",
                         snapshot.size() == LlmAgent.MAX_HISTORY_TURNS * 2);
 
-                // --- Локальные команды CLI не вызывают API ---
-                checkCliCommands(config, hitCounter);
+                // --- Диспетчер команд Main и интерфейс ---
+                checkMainDispatch(agent, hitCounter);
             } finally {
                 server.stop(0);
             }
@@ -307,44 +315,304 @@ public final class SelfTest {
         }
     }
 
-    // ---------- Проверки локальных команд CLI ----------
+    // ---------- Диспетчер команд Main (через подставной интерфейс) ----------
 
-    private static void checkCliCommands(Config config, AtomicInteger hitCounter) {
-        int hitsBefore = hitCounter.get();
+    /** Подставной интерфейс: сценарий ввода фиксирован, вывод накапливается. */
+    private static final class FakeUi implements TerminalUi {
+        private final List<TerminalUi.Input> script;
+        private int cursor = 0;
+        final List<String> messages = new ArrayList<>();
+        final List<String> systems = new ArrayList<>();
+        final List<String> errors = new ArrayList<>();
+        int helpCount = 0;
+        int historyCalls = 0;
+        int clearCount = 0;
+        int progressCount = 0;
+        int confirmCount = 0;
+        boolean confirmAnswer = false;
 
-        ByteArrayOutputStream output = new ByteArrayOutputStream();
-        Main.run(reader("/help\n/history\n/reset\n/history\n/exit\n"),
-                new PrintStream(output, true, StandardCharsets.UTF_8), config);
-        String text = output.toString(StandardCharsets.UTF_8);
-        expect("CLI: команды не вызывают API",
-                hitCounter.get() == hitsBefore && !text.contains("Ошибка запроса"));
-        expect("CLI: приветствие сообщает об истории и командах",
-                text.contains("Агент учитывает историю текущей беседы.")
-                        && text.contains("Команды: /help, /history, /reset, /exit."));
-        expect("CLI: /help выводит справку",
-                text.contains("Доступные команды:") && text.contains("/history"));
-        expect("CLI: /history при пустой истории выводит заглушку",
-                text.contains("История диалога пуста."));
-        expect("CLI: /reset очищает историю",
-                text.contains("Начата новая беседа. История очищена."));
-        expect("CLI: /exit завершает приложение",
-                text.contains("Работа завершена. История диалога не сохраняется."));
+        FakeUi(TerminalUi.Input... inputs) {
+            this.script = List.of(inputs);
+        }
 
-        output.reset();
-        Main.run(reader("quit\n"), new PrintStream(output, true, StandardCharsets.UTF_8), config);
-        expect("CLI: quit завершает работу без вызова API",
-                hitCounter.get() == hitsBefore
-                        && output.toString(StandardCharsets.UTF_8).contains("Работа завершена."));
+        @Override
+        public TerminalUi.Input nextInput() {
+            if (cursor >= script.size()) {
+                return TerminalUi.Input.eof();
+            }
+            return script.get(cursor++);
+        }
 
-        output.reset();
-        Main.run(reader(""), new PrintStream(output, true, StandardCharsets.UTF_8), config);
-        expect("CLI: EOF корректно завершает приложение",
-                hitCounter.get() == hitsBefore
-                        && output.toString(StandardCharsets.UTF_8).contains("Работа завершена."));
+        @Override
+        public void showWelcome(String model) {
+        }
+
+        @Override
+        public void showMessage(String answer) {
+            messages.add(answer);
+        }
+
+        @Override
+        public void showSystem(String text) {
+            systems.add(text);
+        }
+
+        @Override
+        public void showError(String text) {
+            errors.add(text);
+        }
+
+        @Override
+        public void showHelp() {
+            helpCount++;
+        }
+
+        @Override
+        public void showHistory(List<ChatMessage> history) {
+            historyCalls++;
+        }
+
+        @Override
+        public boolean confirmReset() {
+            confirmCount++;
+            return confirmAnswer;
+        }
+
+        @Override
+        public TerminalUi.ProgressIndicator startProgress() {
+            progressCount++;
+            return () -> {
+            };
+        }
+
+        @Override
+        public void clearScreen() {
+            clearCount++;
+        }
+
+        @Override
+        public void close() {
+        }
     }
 
+    private static void checkMainDispatch(LlmAgent agent, AtomicInteger hitCounter) {
+        // Начинаем с чистой беседы, чтобы ожидания были детерминированы.
+        agent.resetConversation();
+
+        // Служебные команды не вызывают API.
+        int hitsBefore = hitCounter.get();
+        FakeUi commandsUi = new FakeUi(
+                TerminalUi.Input.command("/help"),
+                TerminalUi.Input.command("/history"),
+                TerminalUi.Input.command("/clear"),
+                TerminalUi.Input.command("/exit"));
+        Main.runLoop(commandsUi, agent, "test-model");
+        expect("команды не вызывают API", hitCounter.get() == hitsBefore);
+        expect("/help выводит справку", commandsUi.helpCount == 1);
+        expect("/history вызывается", commandsUi.historyCalls == 1);
+        expect("/clear очищает только экран", commandsUi.clearCount == 1);
+        expect("/exit завершает приложение", commandsUi.systems.stream()
+                .anyMatch(s -> s.contains("Работа завершена")));
+
+        // Неизвестная команда — подсказка, а не запрос к API.
+        agent.resetConversation();
+        hitsBefore = hitCounter.get();
+        FakeUi unknownUi = new FakeUi(TerminalUi.Input.command("/foo"));
+        Main.runLoop(unknownUi, agent, "test-model");
+        expect("неизвестная команда выдаёт подсказку и не вызывает API",
+                hitCounter.get() == hitsBefore
+                        && unknownUi.systems.stream().anyMatch(s -> s.contains("Неизвестная команда")));
+
+        // Сообщение уходит агенту ровно один раз.
+        agent.resetConversation();
+        hitsBefore = hitCounter.get();
+        FakeUi messageUi = new FakeUi(
+                TerminalUi.Input.message("Ответь одним словом: столица Франции?"),
+                TerminalUi.Input.command("/exit"));
+        Main.runLoop(messageUi, agent, "test-model");
+        expect("MESSAGE вызывает агент ровно один раз",
+                hitCounter.get() == hitsBefore + 1 && messageUi.messages.size() == 1);
+
+        // /clear не трогает историю.
+        agent.resetConversation();
+        FakeUi clearUi = new FakeUi(
+                TerminalUi.Input.message("вопрос для /clear"),
+                TerminalUi.Input.command("/clear"),
+                TerminalUi.Input.command("/exit"));
+        Main.runLoop(clearUi, agent, "test-model");
+        expect("/clear не сбрасывает историю",
+                clearUi.clearCount == 1 && agent.getHistory().size() == 2);
+
+        // /reset с подтверждением: отказ сохраняет историю.
+        agent.resetConversation();
+        FakeUi resetNoUi = new FakeUi(
+                TerminalUi.Input.message("вопрос для /reset"),
+                TerminalUi.Input.command("/reset"),
+                TerminalUi.Input.command("/exit"));
+        resetNoUi.confirmAnswer = false;
+        Main.runLoop(resetNoUi, agent, "test-model");
+        expect("/reset при отказе сохраняет историю",
+                resetNoUi.confirmCount == 1 && agent.getHistory().size() == 2
+                        && resetNoUi.systems.stream().anyMatch(s -> s.contains("отменён")));
+
+        // /reset после подтверждения очищает историю.
+        FakeUi resetYesUi = new FakeUi(TerminalUi.Input.command("/reset"), TerminalUi.Input.command("/exit"));
+        resetYesUi.confirmAnswer = true;
+        Main.runLoop(resetYesUi, agent, "test-model");
+        expect("/reset после подтверждения начинает новую беседу",
+                resetYesUi.confirmCount == 1 && agent.getHistory().isEmpty()
+                        && resetYesUi.systems.stream().anyMatch(s -> s.contains("Начата новая беседа")));
+
+        // /reset при пустой истории — без подтверждения.
+        FakeUi resetEmptyUi = new FakeUi(TerminalUi.Input.command("/reset"), TerminalUi.Input.command("/exit"));
+        Main.runLoop(resetEmptyUi, agent, "test-model");
+        expect("/reset при пустой истории не запрашивает подтверждение",
+                resetEmptyUi.confirmCount == 0 && resetEmptyUi.systems.stream()
+                        .anyMatch(s -> s.contains("Начата новая беседа")));
+
+        // После обычной ошибки можно продолжить чат.
+        agent.resetConversation();
+        hitsBefore = hitCounter.get();
+        FakeUi errorUi = new FakeUi(
+                TerminalUi.Input.message("case=http-500"),
+                TerminalUi.Input.message("вопрос после ошибки"),
+                TerminalUi.Input.command("exit"));
+        Main.runLoop(errorUi, agent, "test-model");
+        expect("ошибка запроса не прерывает чат",
+                hitCounter.get() == hitsBefore + 2
+                        && errorUi.errors.stream().anyMatch(s -> s.contains("HTTP-статус 500"))
+                        && errorUi.messages.size() == 1
+                        && agent.getHistory().size() == 2);
+
+        // exit и quit совместимы с прежним поведением.
+        FakeUi exitUi = new FakeUi(TerminalUi.Input.command("exit"));
+        Main.runLoop(exitUi, agent, "test-model");
+        FakeUi quitUi = new FakeUi(TerminalUi.Input.command("quit"));
+        Main.runLoop(quitUi, agent, "test-model");
+        expect("exit и quit завершают приложение",
+                exitUi.systems.stream().anyMatch(s -> s.contains("Работа завершена"))
+                        && quitUi.systems.stream().anyMatch(s -> s.contains("Работа завершена")));
+
+        // EOF корректно завершает цикл.
+        FakeUi eofUi = new FakeUi();
+        Main.runLoop(eofUi, agent, "test-model");
+        expect("EOF завершает приложение", eofUi.systems.stream()
+                .anyMatch(s -> s.contains("Работа завершена")));
+    }
+
+    // ---------- Plain-интерфейс: ввод, многострочный режим, отсутствие ANSI ----------
+
+    private static void checkPlainTerminalUi() {
+        CapturedStream out;
+        CapturedStream err;
+
+        // Многострочный режим: строки собираются в одно сообщение.
+        PlainTerminalUi ui = new PlainTerminalUi(
+                reader("/multiline\nпервая строка\nвторая строка\n/send\n"),
+                capturingStream().stream, capturingStream().stream);
+        TerminalUi.Input composed = ui.nextInput();
+        expect("многострочный ввод отправляется одним сообщением",
+                composed.type() == TerminalUi.InputType.MESSAGE
+                        && composed.text().equals("первая строка\nвторая строка"));
+
+        // /cancel отменяет набор и возвращает обычное приглашение.
+        ui = new PlainTerminalUi(
+                reader("/multiline\nчерновик\n/cancel\n/help\n"),
+                capturingStream().stream, capturingStream().stream);
+        TerminalUi.Input afterCancel = ui.nextInput();
+        expect("/cancel отменяет набор без отправки",
+                afterCancel.type() == TerminalUi.InputType.COMMAND
+                        && afterCancel.text().equals("/help"));
+
+        // /send при пустом наборе: API не вызывается, набор продолжается.
+        ui = new PlainTerminalUi(
+                reader("/multiline\n/send\nтекст после пустой отправки\n/send\n"),
+                capturingStream().stream, capturingStream().stream);
+        TerminalUi.Input afterEmptySend = ui.nextInput();
+        expect("пустой /send не отправляет сообщение",
+                afterEmptySend.type() == TerminalUi.InputType.MESSAGE
+                        && afterEmptySend.text().equals("текст после пустой отправки"));
+
+        // EOF корректно завершает ввод.
+        ui = new PlainTerminalUi(reader(""), capturingStream().stream, capturingStream().stream);
+        expect("EOF даёт Input(EOF)", ui.nextInput().type() == TerminalUi.InputType.EOF);
+
+        // Разделение потоков: ответы — в stdout, остальное — в stderr; без ANSI.
+        out = capturingStream();
+        err = capturingStream();
+        PlainTerminalUi splitUi = new PlainTerminalUi(reader("exit\n"), out.stream, err.stream);
+        splitUi.showWelcome("test-model");
+        TerminalUi.Input input = splitUi.nextInput();
+        splitUi.showSystem("Служебное сообщение без секретов");
+        splitUi.showError("что-то сломалось");
+        splitUi.showHelp();
+        splitUi.showHistory(List.of());
+        splitUi.showMessage("Ответ **с Markdown**\nи переносами");
+        String outText = out.text();
+        String errText = err.text();
+        expect("exit распознаётся как команда",
+                input.type() == TerminalUi.InputType.COMMAND && input.text().equals("exit"));
+        expect("ответы идут в stdout, служебные сообщения — в stderr",
+                outText.contains("Агент") && outText.contains("с Markdown")
+                        && !errText.contains("с Markdown")
+                        && errText.contains("AI Advent Agent")
+                        && errText.contains("История диалога пуста."));
+        expect("plain-режим не содержит ANSI-последовательностей",
+                !outText.contains("\u001B") && !errText.contains("\u001B"));
+        expect("приветствие plain-режима сообщает о контексте",
+                errText.contains("Контекст текущей беседы включён"));
+    }
+
+    /** Вывод в память для проверок: и как PrintStream, и как текст. */
+    private static CapturedStream capturingStream() {
+        return new CapturedStream();
+    }
+
+    private static final class CapturedStream {
+        final java.io.ByteArrayOutputStream buffer = new java.io.ByteArrayOutputStream();
+        final PrintStream stream = new PrintStream(buffer, true, StandardCharsets.UTF_8);
+
+        String text() {
+            return buffer.toString(StandardCharsets.UTF_8);
+        }
+    }
+
+    /** Потоковый ввод со заранее заданным текстом — для тестов интерфейса. */
     private static BufferedReader reader(String input) {
         return new BufferedReader(new StringReader(input));
+    }
+
+    // ---------- Обезвреживание управляющих последовательностей ----------
+
+    private static void checkAnsiSanitizer() {
+        expect("CSI-последовательности удаляются",
+                AnsiSanitizer.sanitize("\u001b[31mкрасный\u001b[0m").equals("красный"));
+        expect("OSC (заголовок окна) удаляется",
+                AnsiSanitizer.sanitize("\u001b]0;взлом\u0007текст").equals("текст"));
+        expect("переносы и табуляция сохраняются",
+                AnsiSanitizer.sanitize("a\nb\tc").equals("a\nb\tc"));
+        expect("одиночный ESC удаляется",
+                !AnsiSanitizer.sanitize("a\u001bb").contains("\u001B"));
+        expect("CRLF заменяется обычным переносом",
+                AnsiSanitizer.sanitize("a\r\nb\rc").equals("a\nb\nc"));
+    }
+
+    // ---------- Индикатор ожидания ----------
+
+    private static void checkProgressSpinner() {
+        // В отключённом режиме спиннер не печатает ничего.
+        StringWriter disabledBuffer = new StringWriter();
+        new ProgressSpinner(new PrintWriter(disabledBuffer), false).close();
+        expect("отключённый спиннер не печатает ничего", disabledBuffer.toString().isEmpty());
+
+        // Включённый спиннер: close() останавливает поток и стирает строку с курсором.
+        StringWriter enabledBuffer = new StringWriter();
+        ProgressSpinner enabled = new ProgressSpinner(new PrintWriter(enabledBuffer), true);
+        enabled.close();
+        String output = enabledBuffer.toString();
+        expect("спиннер показывает «Ожидаем ответ…»", output.contains("Ожидаем ответ"));
+        expect("спиннер останавливается и стирает строку",
+                !enabled.isThreadAlive() && output.endsWith("\r\u001b[2K\u001b[?25h"));
     }
 
     // ---------- Сервисные методы тестового сервера ----------
