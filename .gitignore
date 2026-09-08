@@ -39,3 +39,8 @@ build/
 
 ### Локальные env-файлы с секретами ###
 .env
+
+### История беседы агента: приватные тексты переписки, не для репозитория ###
+conversation.json
+conversation.json.lock
+conversation.json.*.tmp

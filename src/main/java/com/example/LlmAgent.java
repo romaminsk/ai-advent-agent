@@ -15,6 +15,7 @@ import java.net.http.HttpTimeoutException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.UUID;
 
 /**
@@ -23,9 +24,12 @@ import java.util.UUID;
  * обработку ошибок и разбор ответа.
  *
  * Агент владеет историей беседы: завершённые пары user/assistant хранятся
- * только в памяти и передаются в API явно через массив messages
- * (идентификатор сессии сам по себе память не обеспечивает).
- * HttpClient и ObjectMapper создаются один раз и переиспользуются.
+ * в памяти и передаются в API явно через массив messages (идентификатор
+ * сессии сам по себе память не обеспечивает). Постоянное хранение выделено
+ * {@link ConversationStore}: при создании агент восстанавливает из него
+ * сохранённую беседу, после каждого успешного ответа — сохраняет обновлённое
+ * состояние (не откладывая запись до выхода). HttpClient и ObjectMapper
+ * создаются один раз и переиспользуются.
  */
 public final class LlmAgent {
 
@@ -38,7 +42,7 @@ public final class LlmAgent {
                     + "Отвечай на языке пользователя, если он не попросил иначе. "
                     + "Если информации недостаточно, уточни вопрос.";
 
-    /** Максимум завершённых пар user/assistant в одном запросе и в памяти. */
+    /** Максимум завершённых пар user/assistant в запросе, в памяти и в файле истории. */
     public static final int MAX_HISTORY_TURNS = 20;
 
     private final Config config;
@@ -50,37 +54,74 @@ public final class LlmAgent {
      * x-opencode-session на каждый запрос (официальная документация провайдера:
      * opencode.ai/docs/go — «Send a stable session ID in x-opencode-session
      * for each conversation»). Одна беседа = период до {@link #resetConversation()}.
-     * Важно: session ID не заменяет историю — контекст всегда передаётся через messages.
+     * Идентификатор восстанавливается из хранилища и сохраняется в нём вместе
+     * с историей. Важно: session ID не заменяет историю — контекст всегда
+     * передаётся через messages.
      */
     private String sessionId = UUID.randomUUID().toString();
 
     /**
      * Завершённые пары user/assistant текущей беседы (system-сообщение здесь
      * не хранится, оно добавляется при формировании каждого запроса).
-     * История живёт только в памяти и исчезает при завершении работы.
+     * При старте список заполняется из {@link ConversationStore}.
      */
     private final List<ChatMessage> history = new ArrayList<>();
 
-    public LlmAgent(Config config) {
+    /** true, если из хранилища восстановлена непустая история беседы. */
+    private boolean contextRestored;
+
+    private final ConversationStore store;
+
+    /** Создаёт агента с готовым хранилищем; сохранённая беседа восстанавливается сразу. */
+    public LlmAgent(Config config, ConversationStore store) {
         this(config, HttpClient.newBuilder()
                 .connectTimeout(CONNECT_TIMEOUT)
-                .build());
+                .build(), store);
     }
 
     /** Пакетно-приватный конструктор для локальных тестов с собственным HttpClient. */
-    LlmAgent(Config config, HttpClient httpClient) {
+    LlmAgent(Config config, HttpClient httpClient, ConversationStore store) {
         this.config = config;
         this.httpClient = httpClient;
+        this.store = Objects.requireNonNull(store, "store");
         this.objectMapper = new ObjectMapper();
+        restoreFromStore();
+    }
+
+    /**
+     * Восстанавливает контекст при старте: если в хранилище есть сохранённая
+     * беседа, загружает её пары user/assistant и sessionId. Повреждённый файл
+     * или неизвестная версия формата останавливают запуск с ошибкой
+     * ({@link ConversationStoreException}); файл при этом не изменяется.
+     */
+    private void restoreFromStore() {
+        ConversationState state = store.load();
+        if (!state.messages().isEmpty()) {
+            history.addAll(state.messages());
+            contextRestored = true;
+        }
+        sessionId = state.sessionId();
+    }
+
+    /** true, если при старте из хранилища была восстановлена непустая история. */
+    public boolean hasRestoredContext() {
+        return contextRestored;
     }
 
     /**
      * Принимает сообщение пользователя и возвращает итоговый текст ответа модели
      * (choices[0].message.content).
      *
-     * История обновляется только после успешного ответа: при таймауте, HTTP-ошибке,
-     * некорректном JSON, пустом ответе или прерывании история остаётся неизменной,
-     * поэтому повторный ввод не создаёт дубликатов.
+     * Порядок работы: подготовка запроса с текущей историей → HTTP-запрос →
+     * проверка ответа → новое состояние с парой user/assistant (с лимитом) →
+     * сохранение в хранилище → обновление истории в памяти → возврат ответа.
+     * Запись выполняется сразу после успешного ответа, не откладывается до выхода.
+     *
+     * При таймауте, HTTP-ошибке, некорректном JSON, пустом ответе или прерывании
+     * ни память, ни файл истории не изменяются, повторный ввод не создаёт
+     * дубликатов. Отдельная ситуация — сбой записи после успешного ответа
+     * ({@link ConversationSaveException}): история не меняется, полученный
+     * ответ доставляется вызывающему коду через исключение.
      */
     public String ask(String userMessage) {
         if (userMessage == null || userMessage.isBlank()) {
@@ -104,23 +145,41 @@ public final class LlmAgent {
 
         String answer = extractContent(response.body());
 
-        // Успех: сохраняем новую завершённую пару и при необходимости
-        // удаляем самые старые целые пары.
-        history.add(new ChatMessage("user", userMessage));
-        history.add(new ChatMessage("assistant", answer));
-        trimHistory();
+        // Успех: новое состояние = текущая история + завершённая пара,
+        // с применением существующего лимита (только целые старые пары).
+        List<ChatMessage> updated = new ArrayList<>(history);
+        updated.add(new ChatMessage("user", userMessage));
+        updated.add(new ChatMessage("assistant", answer));
+        trimToLimit(updated);
+        ConversationState newState = new ConversationState(sessionId, updated);
 
+        try {
+            // Сохраняем на диск ровно тот контекст, который дальше будет в памяти.
+            store.save(newState);
+        } catch (ConversationStoreException e) {
+            // Файл и память не изменились; повторный платный запрос не выполняем,
+            // а полученный ответ не теряем — доставляем его через исключение.
+            throw new ConversationSaveException(answer, e.getMessage(), e);
+        }
+
+        history.clear();
+        history.addAll(updated);
         return answer;
     }
 
     /**
-     * Начинает новую беседу: очищает историю user/assistant и создаёт новый
-     * идентификатор x-opencode-session. Системная инструкция сохраняется —
+     * Начинает новую беседу: сначала безопасно записывает в хранилище пустую
+     * беседу с новым sessionId (при ошибке записи исключение уходит вызывающему
+     * коду и старое состояние остаётся неизменным и в памяти, и в файле),
+     * затем очищает историю в памяти. Системная инструкция сохраняется —
      * она не хранится в истории, а добавляется при формировании каждого запроса.
      */
     public void resetConversation() {
+        ConversationState empty = ConversationState.newEmpty();
+        store.save(empty);
         history.clear();
-        sessionId = UUID.randomUUID().toString();
+        sessionId = empty.sessionId();
+        contextRestored = false;
     }
 
     /**
@@ -148,13 +207,13 @@ public final class LlmAgent {
         return outgoing;
     }
 
-    /** После успешного ответа оставляем не более MAX_HISTORY_TURNS последних пар. */
-    private void trimHistory() {
+    /** Оставляет в списке не более MAX_HISTORY_TURNS последних целых пар. */
+    private static void trimToLimit(List<ChatMessage> messages) {
         // Удаляем только целые пары с начала списка: список всегда чередует
         // user/assistant, поэтому удаление первых двух элементов сохраняет парность.
-        while (history.size() > MAX_HISTORY_TURNS * 2) {
-            history.remove(0);
-            history.remove(0);
+        while (messages.size() > MAX_HISTORY_TURNS * 2) {
+            messages.remove(0);
+            messages.remove(0);
         }
     }
 
