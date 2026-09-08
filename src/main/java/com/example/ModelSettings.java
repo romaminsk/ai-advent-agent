@@ -38,15 +38,20 @@ public record ModelSettings(
     public static final String BALANCED = "balanced";
     public static final String DETAILED = "detailed";
 
-    /** Экспериментальные начальные лимиты профилей, не проверенные оптимумы. */
+    /**
+     * Экспериментальные начальные лимиты профилей, не проверенные оптимумы.
+     * Реальный случай glm-5.3-flash: лимит 1024 (бывший balanced) был
+     * израсходован внутренними рассуждениями модели до видимого текста
+     * (finish_reason: length, пустой content) — поэтому лимиты подняты:
+     * 1024/2048/4096.
+     */
     public static final Map<String, Integer> PROFILE_LIMITS =
-            Map.of(FAST, 512, BALANCED, 1024, DETAILED, 2048);
+            Map.of(FAST, 1024, BALANCED, 2048, DETAILED, 4096);
 
     /**
      * Профиль по умолчанию. balanced, а не fast: у модели с внутренними
      * рассуждениями слишком маленький лимит может быть израсходован на
-     * reasoning и дать пустой видимый ответ; 1024 ограничивает время
-     * генерации, сохраняя запас.
+     * reasoning и дать пустой видимый ответ.
      */
     public static final String DEFAULT_PROFILE = BALANCED;
 

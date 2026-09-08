@@ -1234,7 +1234,7 @@ public final class SelfTest {
         ModelSettings defaults = ModelSettings.from(env);
         expect("без переменных выбирается профиль balanced",
                 ModelSettings.BALANCED.equals(defaults.profile()));
-        expect("лимит генерации по умолчанию 1024", defaults.maxOutputTokens() == 1024);
+        expect("лимит генерации по умолчанию 2048", defaults.maxOutputTokens() == 2048);
         expect("таймаут по умолчанию 180 секунд", defaults.requestTimeoutSeconds() == 180);
         expect("temperature по умолчанию не отправляется", defaults.temperature() == null);
         expect("лимит контекста по умолчанию не задан", defaults.contextMaxTurns() == null);
@@ -1244,7 +1244,7 @@ public final class SelfTest {
         env.put("LLM_RESPONSE_MODE", " FAST ");
         expect("профиль fast читается без учёта регистра и пробелов",
                 ModelSettings.FAST.equals(ModelSettings.from(env).profile())
-                        && ModelSettings.from(env).maxOutputTokens() == 512);
+                        && ModelSettings.from(env).maxOutputTokens() == 1024);
 
         env.put("LLM_MAX_OUTPUT_TOKENS", "777");
         ModelSettings overridden = ModelSettings.from(env);
@@ -1257,7 +1257,7 @@ public final class SelfTest {
         env.remove("LLM_MAX_OUTPUT_TOKENS");
         ModelSettings fast = ModelSettings.from(env);
         expect("без переопределения переключение профиля меняет лимит",
-                fast.withProfile(ModelSettings.DETAILED).maxOutputTokens() == 2048);
+                fast.withProfile(ModelSettings.DETAILED).maxOutputTokens() == 4096);
 
         env.put("LLM_TEMPERATURE", "0.3");
         expect("LLM_TEMPERATURE читается",
@@ -1327,8 +1327,8 @@ public final class SelfTest {
             LlmAgent agent = new LlmAgent(config, ModelSettings.from(env), client, store);
             agent.ask("вопрос для проверки параметров");
             JsonNode body = MAPPER.readTree(lastBody.get());
-            expect("в запросе отправляется max_tokens профиля fast (512)",
-                    body.path("max_tokens").asInt(-1) == 512);
+            expect("в запросе отправляется max_tokens профиля fast (1024)",
+                    body.path("max_tokens").asInt(-1) == 1024);
             expect("temperature включается при явном переопределении",
                     body.has("temperature") && body.path("temperature").asDouble(-1) == 0.3);
             expect("model и messages не изменены",
@@ -1353,8 +1353,8 @@ public final class SelfTest {
             LlmAgent balancedAgent = new LlmAgent(config, ModelSettings.defaults(), client, store2);
             balancedAgent.ask("вопрос для проверки базовых параметров");
             JsonNode balancedBody = MAPPER.readTree(lastBody.get());
-            expect("в базовом профиле max_tokens равен 1024",
-                    balancedBody.path("max_tokens").asInt(-1) == 1024);
+            expect("в базовом профиле max_tokens равен 2048",
+                    balancedBody.path("max_tokens").asInt(-1) == 2048);
             expect("без явного переопределения temperature не отправляется",
                     !balancedBody.has("temperature"));
             expect("в базовом профиле системная инструкция без изменений",
@@ -1470,7 +1470,7 @@ public final class SelfTest {
             String normalText = String.join("\n", normalUi.systems);
             expect("диагностика показывает профиль, лимит и метрики времени",
                     normalText.contains("профиль balanced")
-                            && normalText.contains("лимит генерации 1024")
+                            && normalText.contains("лимит генерации 2048")
                             && normalText.contains("Диагностика")
                             && normalText.contains("HTTP до полного ответа"));
             expect("диагностика показывает finish_reason и usage из ответа",
@@ -1556,12 +1556,12 @@ public final class SelfTest {
             expect("команды /mode не вызывают API", hitCounter.get() == hitsAfterAsk);
             expect("/mode показывает текущий профиль и лимит",
                     modeUi.systems.stream().anyMatch(
-                            s -> s.contains("Профиль: balanced · лимит генерации: 1024")));
-            expect("профиль переключается на fast с лимитом 512",
+                            s -> s.contains("Профиль: balanced · лимит генерации: 2048")));
+            expect("профиль переключается на fast с лимитом 1024",
                     modeUi.systems.stream().anyMatch(
-                            s -> s.contains("Профиль изменён: fast · лимит генерации: 512"))
+                            s -> s.contains("Профиль изменён: fast · лимит генерации: 1024"))
                             && ModelSettings.FAST.equals(agent.currentSettings().profile())
-                            && agent.currentSettings().maxOutputTokens() == 512);
+                            && agent.currentSettings().maxOutputTokens() == 1024);
             expect("неизвестный профиль даёт понятную ошибку",
                     modeUi.errors.stream().anyMatch(s -> s.contains("Неизвестный профиль")));
             expect("/mode не трогает файл истории",

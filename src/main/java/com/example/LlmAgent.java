@@ -415,7 +415,8 @@ public final class LlmAgent {
                 // Лимит мог быть израсходован на внутренние рассуждения модели.
                 message += " Лимит генерации (max_tokens=" + settings.maxOutputTokens()
                         + ") мог быть израсходован до видимого текста. Увеличьте лимит: "
-                        + "/mode detailed или переменная LLM_MAX_OUTPUT_TOKENS.";
+                        + "/mode detailed или переменная LLM_MAX_OUTPUT_TOKENS "
+                        + "(например, " + (settings.maxOutputTokens() * 2) + ").";
             }
             throw new AgentException(message);
         }
