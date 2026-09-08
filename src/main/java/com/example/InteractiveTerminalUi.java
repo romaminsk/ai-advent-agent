@@ -43,7 +43,9 @@ final class InteractiveTerminalUi implements TerminalUi {
         this.reader = LineReaderBuilder.builder()
                 .terminal(terminal)
                 .completer(new StringsCompleter(
-                        "/help", "/history", "/reset", "/clear", "/multiline", "/exit", "exit", "quit"))
+                        "/help", "/history", "/reset", "/clear", "/multiline", "/mode",
+                        "/mode fast", "/mode balanced", "/mode detailed",
+                        "/exit", "exit", "quit"))
                 .build();
         // История ввода хранится только в памяти: файл истории не подключается.
         this.colors = TerminalUi.colorsEnabled();
@@ -170,6 +172,7 @@ final class InteractiveTerminalUi implements TerminalUi {
         out.println("  /reset     — очистить контекст и начать новую беседу");
         out.println("  /clear     — очистить экран, не удаляя историю диалога");
         out.println("  /multiline — многострочный ввод (/send — отправить, /cancel — отмена)");
+        out.println("  /mode      — профиль ответа: /mode показать, /mode fast|balanced|detailed");
         out.println("  /exit      — завершение (также exit, quit)");
         out.println("Стрелки вверх/вниз — предыдущие сообщения, Tab — автодополнение команд.");
         out.flush();

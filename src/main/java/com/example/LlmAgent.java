@@ -30,11 +30,20 @@ import java.util.UUID;
  * сохранённую беседу, после каждого успешного ответа — сохраняет обновлённое
  * состояние (не откладывая запись до выхода). HttpClient и ObjectMapper
  * создаются один раз и переиспользуются.
+ *
+ * Параметры запроса (лимит генерации, temperature, таймаут, лимит
+ * отправляемого контекста) централизованы в {@link ModelSettings};
+ * в JSON запроса отправляются только подтверждённые контрактом
+ * OpenAI-совместимого эндпоинта поля: model, messages, max_tokens
+ * и temperature (последний — только при явном переопределении).
+ * Провайдерские параметры вроде reasoning_effort или enable_thinking
+ * наугад не добавляются. Для каждого запроса собираются метрики
+ * {@link RequestDiagnostics}: время подготовки, HTTP до полного тела,
+ * разбора и записи истории.
  */
 public final class LlmAgent {
 
     private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(30);
-    private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(180);
 
     /** Постоянная системная инструкция; отправляется первым сообщением каждого запроса. */
     private static final String SYSTEM_PROMPT =
@@ -42,12 +51,24 @@ public final class LlmAgent {
                     + "Отвечай на языке пользователя, если он не попросил иначе. "
                     + "Если информации недостаточно, уточни вопрос.";
 
-    /** Максимум завершённых пар user/assistant в запросе, в памяти и в файле истории. */
+    /** Короткое предпочтение краткости только для профиля fast. */
+    private static final String SHORT_ANSWER_SUFFIX =
+            " Отвечай кратко и по существу. Если пользователь явно просит подробности, "
+                    + "полный код или определённый формат, соблюдай его запрос.";
+
+    /** Максимум завершённых пар user/assistant в памяти и в файле истории. */
     public static final int MAX_HISTORY_TURNS = 20;
 
     private final Config config;
     private final HttpClient httpClient;
     private final ObjectMapper objectMapper;
+    private final ConversationStore store;
+
+    /**
+     * Текущие настройки модели. Заменяются только командой /mode
+     * ({@link #setProfile(String)}); сам объект неизменяемый.
+     */
+    private ModelSettings settings;
 
     /**
      * Идентификатор текущей беседы. Шлюз OpenCode Go требует заголовок
@@ -70,18 +91,25 @@ public final class LlmAgent {
     /** true, если из хранилища восстановлена непустая история беседы. */
     private boolean contextRestored;
 
-    private final ConversationStore store;
+    /** Метрики последнего выполненного запроса; null, пока запросов не было. */
+    private RequestDiagnostics lastDiagnostics;
 
-    /** Создаёт агента с готовым хранилищем; сохранённая беседа восстанавливается сразу. */
+    /** Создаёт агента с настройками по умолчанию и готовым хранилищем. */
     public LlmAgent(Config config, ConversationStore store) {
-        this(config, HttpClient.newBuilder()
+        this(config, ModelSettings.defaults(), store);
+    }
+
+    /** Создаёт агента с заданными настройками; сохранённая беседа восстанавливается сразу. */
+    public LlmAgent(Config config, ModelSettings settings, ConversationStore store) {
+        this(config, settings, HttpClient.newBuilder()
                 .connectTimeout(CONNECT_TIMEOUT)
                 .build(), store);
     }
 
     /** Пакетно-приватный конструктор для локальных тестов с собственным HttpClient. */
-    LlmAgent(Config config, HttpClient httpClient, ConversationStore store) {
+    LlmAgent(Config config, ModelSettings settings, HttpClient httpClient, ConversationStore store) {
         this.config = config;
+        this.settings = Objects.requireNonNull(settings, "settings");
         this.httpClient = httpClient;
         this.store = Objects.requireNonNull(store, "store");
         this.objectMapper = new ObjectMapper();
@@ -108,6 +136,31 @@ public final class LlmAgent {
         return contextRestored;
     }
 
+    /** Текущие настройки модели (профиль, лимит, таймаут, диагностика). */
+    public ModelSettings currentSettings() {
+        return settings;
+    }
+
+    /**
+     * Переключает профиль ответа (команда /mode). Действует до конца текущего
+     * запуска; историю не трогает. Явный LLM_MAX_OUTPUT_TOKENS сохраняет
+     * приоритет над лимитом профиля. Неизвестный профиль — ошибка.
+     */
+    public ModelSettings setProfile(String profile) {
+        settings = settings.withProfile(profile);
+        return settings;
+    }
+
+    /** Метрики последнего выполненного запроса; null, пока запросов не было. */
+    public RequestDiagnostics getLastDiagnostics() {
+        return lastDiagnostics;
+    }
+
+    /** Системная инструкция для профиля: общие правила, для fast — плюс краткость. */
+    static String systemPromptFor(String profile) {
+        return ModelSettings.FAST.equals(profile) ? SYSTEM_PROMPT + SHORT_ANSWER_SUFFIX : SYSTEM_PROMPT;
+    }
+
     /**
      * Принимает сообщение пользователя и возвращает итоговый текст ответа модели
      * (choices[0].message.content).
@@ -119,22 +172,29 @@ public final class LlmAgent {
      *
      * При таймауте, HTTP-ошибке, некорректном JSON, пустом ответе или прерывании
      * ни память, ни файл истории не изменяются, повторный ввод не создаёт
-     * дубликатов. Отдельная ситуация — сбой записи после успешного ответа
-     * ({@link ConversationSaveException}): история не меняется, полученный
-     * ответ доставляется вызывающему коду через исключение.
+     * дубликатов, повторные платные запросы не выполняются. Отдельная ситуация —
+     * сбой записи после успешного ответа ({@link ConversationSaveException}):
+     * история не меняется, полученный ответ доставляется вызывающему коду.
      */
     public String ask(String userMessage) {
         if (userMessage == null || userMessage.isBlank()) {
             // Пустой запрос не отправляем — API не вызываем вовсе.
             throw new AgentException("Пустой запрос: нечего отправлять модели.");
         }
+        long totalStart = System.nanoTime();
 
         // Временный список сообщений для этого запроса; историю ещё не трогаем.
         List<ChatMessage> outgoing = buildOutgoingMessages(userMessage);
-
         HttpRequest request = buildRequest(outgoing);
-        HttpResponse<String> response = send(request);
+        long prepareNanos = System.nanoTime() - totalStart;
 
+        long httpStart = System.nanoTime();
+        HttpResponse<String> response = send(request);
+        long httpNanos = System.nanoTime() - httpStart;
+
+        // Время до получения полного тела ответа, не «время до первого токена»:
+        // запрос непотоковый.
+        long parseStart = System.nanoTime();
         if (response.statusCode() < 200 || response.statusCode() >= 300) {
             // Статус и краткое описание; тело ответа и заголовки не выводим.
             // Историю не очищаем и не дополняем: неудавшийся запрос в неё не попадает.
@@ -142,8 +202,9 @@ public final class LlmAgent {
                     "Сервер вернул HTTP-статус " + response.statusCode()
                             + ". Запрос не выполнен (автоматические повторы отключены).");
         }
-
-        String answer = extractContent(response.body());
+        ParsedAnswer parsed = parseAnswer(response.body());
+        long parseNanos = System.nanoTime() - parseStart;
+        String answer = parsed.content();
 
         // Успех: новое состояние = текущая история + завершённая пара,
         // с применением существующего лимита (только целые старые пары).
@@ -153,6 +214,7 @@ public final class LlmAgent {
         trimToLimit(updated);
         ConversationState newState = new ConversationState(sessionId, updated);
 
+        long saveStart = System.nanoTime();
         try {
             // Сохраняем на диск ровно тот контекст, который дальше будет в памяти.
             store.save(newState);
@@ -161,9 +223,31 @@ public final class LlmAgent {
             // а полученный ответ не теряем — доставляем его через исключение.
             throw new ConversationSaveException(answer, e.getMessage(), e);
         }
+        long saveNanos = System.nanoTime() - saveStart;
 
         history.clear();
         history.addAll(updated);
+
+        int includedPairs = (outgoing.size() - 2) / 2;
+        int omittedPairs = history.size() / 2 - includedPairs;
+        lastDiagnostics = new RequestDiagnostics(
+                settings.profile(),
+                settings.maxOutputTokens(),
+                settings.temperature(),
+                outgoing.size(),
+                includedPairs,
+                omittedPairs,
+                lastRequestBytes,
+                prepareNanos,
+                httpNanos,
+                parseNanos,
+                saveNanos,
+                System.nanoTime() - totalStart,
+                parsed.finishReason(),
+                parsed.usage() != null ? parsed.usage().promptTokens() : null,
+                parsed.usage() != null ? parsed.usage().completionTokens() : null,
+                parsed.usage() != null ? parsed.usage().totalTokens() : null);
+
         return answer;
     }
 
@@ -192,15 +276,18 @@ public final class LlmAgent {
 
     /**
      * Собирает сообщения одного запроса в порядке:
-     * system → предыдущие завершённые пары (не более MAX_HISTORY_TURNS последних) →
-     * новый запрос пользователя. Каждое сообщение — отдельный объект массива,
-     * история не склеивается в одну строку.
+     * system → предыдущие завершённые пары (не более effectiveContextMaxTurns
+     * последних) → новый запрос пользователя. Каждое сообщение — отдельный
+     * объект массива, история не склеивается в одну строку. Лимит
+     * LLM_CONTEXT_MAX_TURNS ограничивает только отправку: файл истории
+     * и память сохраняют всю существующую политику хранения.
      */
     private List<ChatMessage> buildOutgoingMessages(String userMessage) {
         List<ChatMessage> outgoing = new ArrayList<>();
-        outgoing.add(new ChatMessage("system", SYSTEM_PROMPT));
+        outgoing.add(new ChatMessage("system", systemPromptFor(settings.profile())));
 
-        int from = Math.max(0, history.size() - MAX_HISTORY_TURNS * 2);
+        int maxTurns = settings.effectiveContextMaxTurns(MAX_HISTORY_TURNS);
+        int from = Math.max(0, history.size() - maxTurns * 2);
         outgoing.addAll(history.subList(from, history.size()));
 
         outgoing.add(new ChatMessage("user", userMessage));
@@ -217,10 +304,23 @@ public final class LlmAgent {
         }
     }
 
-    /** Формирует OpenAI-совместимое тело запроса из готового списка сообщений. */
+    /** Размер последнего сформированного тела запроса в байтах UTF-8. */
+    private int lastRequestBytes;
+
+    /**
+     * Формирует OpenAI-совместимое тело запроса из готового списка сообщений:
+     * model, messages, max_tokens (верхний предел генерации из профиля
+     * или LLM_MAX_OUTPUT_TOKENS) и temperature — только при явном
+     * переопределении. Другие параметры сэмплирования (top_p и т.п.)
+     * и провайдерские поля наугад не отправляются.
+     */
     private HttpRequest buildRequest(List<ChatMessage> outgoing) {
         ObjectNode body = objectMapper.createObjectNode();
         body.put("model", config.model());
+        body.put("max_tokens", settings.maxOutputTokens());
+        if (settings.temperature() != null) {
+            body.put("temperature", settings.temperature());
+        }
 
         ArrayNode messages = body.putArray("messages");
         for (ChatMessage message : outgoing) {
@@ -236,16 +336,18 @@ public final class LlmAgent {
             // Практически недостижимо для простого дерева, но обязателен по контракту API.
             throw new AgentException("Не удалось сформировать JSON-запрос.", e);
         }
+        byte[] jsonBytes = json.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        lastRequestBytes = jsonBytes.length;
 
         return HttpRequest.newBuilder()
                 .uri(URI.create(config.apiUrl()))
-                .timeout(REQUEST_TIMEOUT)
+                .timeout(Duration.ofSeconds(settings.requestTimeoutSeconds()))
                 .header("Content-Type", "application/json")
                 .header("Authorization", "Bearer " + config.apiKey())
                 // Обязателен для эндпоинта OpenCode Go, подтверждено документацией
                 // и ошибкой HTTP 400 MissingSessionID при его отсутствии.
                 .header("x-opencode-session", sessionId)
-                .POST(HttpRequest.BodyPublishers.ofString(json))
+                .POST(HttpRequest.BodyPublishers.ofByteArray(jsonBytes))
                 .build();
     }
 
@@ -255,7 +357,8 @@ public final class LlmAgent {
             return httpClient.send(request, HttpResponse.BodyHandlers.ofString());
         } catch (HttpTimeoutException e) {
             throw new AgentException(
-                    "Превышен таймаут ожидания ответа сервера (180 секунд).", e);
+                    "Превышен таймаут ожидания ответа сервера ("
+                            + settings.requestTimeoutSeconds() + " секунд).", e);
         } catch (InterruptedException e) {
             // Восстанавливаем флаг прерывания и корректно прекращаем работу.
             Thread.currentThread().interrupt();
@@ -268,8 +371,23 @@ public final class LlmAgent {
         }
     }
 
-    /** Разбирает JSON-ответ и извлекает choices[0].message.content. */
-    private String extractContent(String responseBody) {
+    /** Результат разбора ответа: видимый текст, finish_reason и usage (если есть). */
+    private record ParsedAnswer(String content, String finishReason, Usage usage) {
+    }
+
+    /**
+     * Использование токенов по стандартным полям OpenAI-совместимого ответа.
+     * null — поле отсутствует (нет данных), а не ноль.
+     */
+    private record Usage(Integer promptTokens, Integer completionTokens, Integer totalTokens) {
+    }
+
+    /**
+     * Разбирает JSON-ответ: choices[0].message.content (итоговый видимый текст),
+     * choices[0].finish_reason и корневой usage. reasoning_content и другие
+     * служебные поля пользователю не подставляются и в историю не попадают.
+     */
+    private ParsedAnswer parseAnswer(String responseBody) {
         JsonNode root;
         try {
             root = objectMapper.readTree(responseBody);
@@ -282,13 +400,41 @@ public final class LlmAgent {
             throw new AgentException("В ответе сервера отсутствует массив choices с вариантами ответа.");
         }
 
-        JsonNode contentNode = choices.get(0).path("message").path("content");
+        JsonNode choice = choices.get(0);
+        JsonNode finishReasonNode = choice.get("finish_reason");
+        String finishReason = finishReasonNode != null && finishReasonNode.isTextual()
+                ? finishReasonNode.asText()
+                : null;
+
+        JsonNode contentNode = choice.path("message").path("content");
         if (!contentNode.isTextual() || contentNode.asText().isBlank()) {
-            // reasoning_content и другие служебные поля пользователю не подставляем.
-            throw new AgentException("Модель вернула пустой итоговый ответ "
-                    + "(choices[0].message.content отсутствует или пуст).");
+            // Пустую пару в историю не записываем и запрос не повторяем автоматически.
+            String message = "Модель вернула пустой итоговый ответ "
+                    + "(choices[0].message.content отсутствует или пуст).";
+            if ("length".equals(finishReason)) {
+                // Лимит мог быть израсходован на внутренние рассуждения модели.
+                message += " Лимит генерации (max_tokens=" + settings.maxOutputTokens()
+                        + ") мог быть израсходован до видимого текста. Увеличьте лимит: "
+                        + "/mode detailed или переменная LLM_MAX_OUTPUT_TOKENS.";
+            }
+            throw new AgentException(message);
         }
 
-        return contentNode.asText().trim();
+        return new ParsedAnswer(contentNode.asText().trim(), finishReason, parseUsage(root.get("usage")));
+    }
+
+    /** Разбирает usage по стандартным полям; отсутствующие поля — null. */
+    private static Usage parseUsage(JsonNode usageNode) {
+        if (usageNode == null || !usageNode.isObject()) {
+            return null;
+        }
+        return new Usage(
+                intValueOrNull(usageNode.get("prompt_tokens")),
+                intValueOrNull(usageNode.get("completion_tokens")),
+                intValueOrNull(usageNode.get("total_tokens")));
+    }
+
+    private static Integer intValueOrNull(JsonNode node) {
+        return node != null && node.isNumber() ? node.asInt() : null;
     }
 }

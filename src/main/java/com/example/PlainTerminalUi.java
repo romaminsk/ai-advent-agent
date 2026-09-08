@@ -130,6 +130,7 @@ final class PlainTerminalUi implements TerminalUi {
         err.println("  /reset     — очистить контекст и начать новую беседу");
         err.println("  /clear     — очистить экран, не удаляя историю диалога");
         err.println("  /multiline — многострочный ввод (/send — отправить, /cancel — отмена)");
+        err.println("  /mode      — профиль ответа: /mode показать, /mode fast|balanced|detailed");
         err.println("  /exit      — завершение (также exit, quit)");
     }
 

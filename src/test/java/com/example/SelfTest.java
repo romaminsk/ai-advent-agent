@@ -28,6 +28,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -88,6 +89,11 @@ public final class SelfTest {
             checkPlainTerminalUi();
             checkAnsiSanitizer();
             checkProgressSpinner();
+            checkModelSettings();
+            checkRequestParameters();
+            checkContextLimit();
+            checkDiagnosticsAndLimit();
+            checkModeCommand();
             checkTwoProcessIntegration();
         } finally {
             deleteRecursively(baseTempDir);
@@ -208,7 +214,7 @@ public final class SelfTest {
                         "https://127.0.0.1:" + server.getAddress().getPort() + "/v1/chat/completions",
                         "glm-5.3-flash");
                 JsonConversationStore store = tempStore();
-                LlmAgent agent = new LlmAgent(config, trustedHttpClient(keyStore), store);
+                LlmAgent agent = new LlmAgent(config, ModelSettings.defaults(), trustedHttpClient(keyStore), store);
                 Path historyFile = store.file();
 
                 // --- Первый запрос: system + user ---
@@ -865,7 +871,7 @@ public final class SelfTest {
             String question1 = "Запомни: кодовое слово «северный маяк», цвет — зелёный.\n"
                     + "Вторая строка вопроса с \"кавычками\"";
             try (JsonConversationStore store1 = new JsonConversationStore(historyFile)) {
-                LlmAgent agent1 = new LlmAgent(config, client, store1);
+                LlmAgent agent1 = new LlmAgent(config, ModelSettings.defaults(), client, store1);
                 expect("первый запуск начинает без истории",
                         !agent1.hasRestoredContext() && agent1.getHistory().isEmpty());
                 expect("первый запуск получает ответ", "Ответ 1".equals(agent1.ask(question1)));
@@ -885,7 +891,7 @@ public final class SelfTest {
 
             // --- Второй «запуск»: восстановление и передача контекста в API ---
             try (JsonConversationStore store2 = new JsonConversationStore(historyFile)) {
-                LlmAgent agent2 = new LlmAgent(config, client, store2);
+                LlmAgent agent2 = new LlmAgent(config, ModelSettings.defaults(), client, store2);
                 expect("новый экземпляр восстанавливает пару из файла",
                         agent2.hasRestoredContext()
                                 && agent2.getHistory().equals(List.of(
@@ -989,7 +995,7 @@ public final class SelfTest {
                     "https://127.0.0.1:" + server.getAddress().getPort() + "/v1/chat/completions",
                     "glm-5.3-flash");
             FailingStore failingStore = new FailingStore();
-            LlmAgent agent = new LlmAgent(config, trustedHttpClient(keyStore), failingStore);
+            LlmAgent agent = new LlmAgent(config, ModelSettings.defaults(), trustedHttpClient(keyStore), failingStore);
 
             // Ответ получен, но записать не удалось: отдельная ошибка сохранения.
             ConversationSaveException failure = null;
@@ -1157,7 +1163,7 @@ public final class SelfTest {
                     .resolve("conversation.json");
 
             JsonConversationStore store1 = new JsonConversationStore(historyFile);
-            LlmAgent agent1 = new LlmAgent(config, client, store1);
+            LlmAgent agent1 = new LlmAgent(config, ModelSettings.defaults(), client, store1);
             agent1.ask("вопрос перед командами");
             byte[] afterAsk = Files.readAllBytes(historyFile);
 
@@ -1205,7 +1211,7 @@ public final class SelfTest {
             // Перезапуск: сброс пережил выход, старая история не вернулась.
             store1.close();
             try (JsonConversationStore store2 = new JsonConversationStore(historyFile)) {
-                LlmAgent agent2 = new LlmAgent(config, client, store2);
+                LlmAgent agent2 = new LlmAgent(config, ModelSettings.defaults(), client, store2);
                 expect("после перезапуска история пуста (сброс переживает выход)",
                         agent2.getHistory().isEmpty() && !agent2.hasRestoredContext());
                 agent2.ask("вопрос для проверки session id после перезапуска");
@@ -1213,6 +1219,375 @@ public final class SelfTest {
                         afterReset.path("sessionId").asText()
                                 .equals(sessions.get(sessions.size() - 1)));
             }
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    // ---------- Настройки модели: профили, приоритет, валидация ----------
+
+    private static void checkModelSettings() {
+        Map<String, String> env = new java.util.HashMap<>();
+
+        // Значения по умолчанию без переменных окружения.
+        ModelSettings defaults = ModelSettings.from(env);
+        expect("без переменных выбирается профиль balanced",
+                ModelSettings.BALANCED.equals(defaults.profile()));
+        expect("лимит генерации по умолчанию 1024", defaults.maxOutputTokens() == 1024);
+        expect("таймаут по умолчанию 180 секунд", defaults.requestTimeoutSeconds() == 180);
+        expect("temperature по умолчанию не отправляется", defaults.temperature() == null);
+        expect("лимит контекста по умолчанию не задан", defaults.contextMaxTurns() == null);
+        expect("диагностика по умолчанию выключена", !defaults.diagnostics());
+
+        // Профили и приоритет явных значений.
+        env.put("LLM_RESPONSE_MODE", " FAST ");
+        expect("профиль fast читается без учёта регистра и пробелов",
+                ModelSettings.FAST.equals(ModelSettings.from(env).profile())
+                        && ModelSettings.from(env).maxOutputTokens() == 512);
+
+        env.put("LLM_MAX_OUTPUT_TOKENS", "777");
+        ModelSettings overridden = ModelSettings.from(env);
+        expect("LLM_MAX_OUTPUT_TOKENS переопределяет лимит профиля",
+                overridden.maxOutputTokens() == 777 && overridden.limitOverridden());
+        expect("при переключении профиля явный лимит сохраняется",
+                overridden.withProfile("detailed").maxOutputTokens() == 777
+                        && ModelSettings.DETAILED.equals(overridden.withProfile("detailed").profile()));
+
+        env.remove("LLM_MAX_OUTPUT_TOKENS");
+        ModelSettings fast = ModelSettings.from(env);
+        expect("без переопределения переключение профиля меняет лимит",
+                fast.withProfile(ModelSettings.DETAILED).maxOutputTokens() == 2048);
+
+        env.put("LLM_TEMPERATURE", "0.3");
+        expect("LLM_TEMPERATURE читается",
+                Double.valueOf(0.3).equals(ModelSettings.from(env).temperature()));
+        env.put("LLM_REQUEST_TIMEOUT_SECONDS", "30");
+        env.put("LLM_CONTEXT_MAX_TURNS", "4");
+        env.put("LLM_DIAGNOSTICS", "TRUE");
+        ModelSettings full = ModelSettings.from(env);
+        expect("таймаут и лимит контекста читаются",
+                full.requestTimeoutSeconds() == 30 && full.contextMaxTurns() == 4);
+        expect("LLM_DIAGNOSTICS=true включается без учёта регистра", full.diagnostics());
+
+        // Граничные допустимые значения temperature.
+        env.put("LLM_TEMPERATURE", "0");
+        expect("temperature 0 допустима",
+                Double.valueOf(0).equals(ModelSettings.from(env).temperature()));
+        env.put("LLM_TEMPERATURE", "2.0");
+        expect("temperature 2.0 допустима",
+                Double.valueOf(2).equals(ModelSettings.from(env).temperature()));
+
+        // Ошибки некорректных значений — с именем переменной в сообщении.
+        expectSettingsError(env, "LLM_RESPONSE_MODE", "turbo");
+        expectSettingsError(env, "LLM_MAX_OUTPUT_TOKENS", "0");
+        expectSettingsError(env, "LLM_MAX_OUTPUT_TOKENS", "abc");
+        expectSettingsError(env, "LLM_TEMPERATURE", "2.5");
+        expectSettingsError(env, "LLM_TEMPERATURE", "NaN");
+        expectSettingsError(env, "LLM_TEMPERATURE", "два");
+        expectSettingsError(env, "LLM_REQUEST_TIMEOUT_SECONDS", "0");
+        expectSettingsError(env, "LLM_CONTEXT_MAX_TURNS", "-1");
+        expectSettingsError(env, "LLM_DIAGNOSTICS", "yes");
+    }
+
+    private static void expectSettingsError(Map<String, String> env, String name, String value) {
+        Map<String, String> copy = new java.util.HashMap<>(env);
+        copy.put(name, value);
+        boolean reported;
+        try {
+            ModelSettings.from(copy);
+            reported = false;
+        } catch (AgentException e) {
+            reported = e.getMessage().contains(name);
+        }
+        expect(name + "=" + value + " отклоняется с понятной ошибкой", reported);
+    }
+
+    // ---------- Параметры HTTP-запроса ----------
+
+    private static void checkRequestParameters() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        AtomicReference<String> lastBody = new AtomicReference<>();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            lastBody.set(requestBody);
+            return new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                    + "\"content\":\"Ответ\"}}]}").getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort() + "/v1/chat/completions",
+                    "glm-5.3-flash");
+            HttpClient client = trustedHttpClient(keyStore);
+
+            // Профиль fast с явной temperature.
+            Map<String, String> env = new java.util.HashMap<>();
+            env.put("LLM_RESPONSE_MODE", "fast");
+            env.put("LLM_TEMPERATURE", "0.3");
+            JsonConversationStore store = tempStore();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.from(env), client, store);
+            agent.ask("вопрос для проверки параметров");
+            JsonNode body = MAPPER.readTree(lastBody.get());
+            expect("в запросе отправляется max_tokens профиля fast (512)",
+                    body.path("max_tokens").asInt(-1) == 512);
+            expect("temperature включается при явном переопределении",
+                    body.has("temperature") && body.path("temperature").asDouble(-1) == 0.3);
+            expect("model и messages не изменены",
+                    "glm-5.3-flash".equals(body.path("model").asText())
+                            && body.path("messages").size() == 2);
+            java.util.Set<String> fieldNames = new java.util.HashSet<>();
+            body.fieldNames().forEachRemaining(fieldNames::add);
+            java.util.Set<String> unsupported = java.util.Set.of(
+                    "reasoning_effort", "enable_thinking", "thinking",
+                    "max_completion_tokens", "top_p");
+            expect("в запросе нет неподтверждённых провайдерских параметров",
+                    fieldNames.stream().noneMatch(unsupported::contains));
+            expect("для fast системная инструкция дополняется предпочтением краткости",
+                    body.path("messages").get(0).path("content").asText()
+                            .equals(LlmAgent.systemPromptFor(ModelSettings.FAST))
+                            && body.path("messages").get(0).path("content").asText()
+                            .contains("кратко и по существу"));
+            store.close();
+
+            // Базовый профиль balanced: temperature не отправляется.
+            JsonConversationStore store2 = tempStore();
+            LlmAgent balancedAgent = new LlmAgent(config, ModelSettings.defaults(), client, store2);
+            balancedAgent.ask("вопрос для проверки базовых параметров");
+            JsonNode balancedBody = MAPPER.readTree(lastBody.get());
+            expect("в базовом профиле max_tokens равен 1024",
+                    balancedBody.path("max_tokens").asInt(-1) == 1024);
+            expect("без явного переопределения temperature не отправляется",
+                    !balancedBody.has("temperature"));
+            expect("в базовом профиле системная инструкция без изменений",
+                    balancedBody.path("messages").get(0).path("content").asText()
+                            .equals(SYSTEM_PROMPT_TEXT));
+            store2.close();
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    // ---------- Лимит отправляемого контекста: архив не теряется ----------
+
+    private static void checkContextLimit() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        AtomicReference<String> lastBody = new AtomicReference<>();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            lastBody.set(requestBody);
+            return new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                    + "\"content\":\"Ответ\"}}]}").getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort() + "/v1/chat/completions",
+                    "glm-5.3-flash");
+            HttpClient client = trustedHttpClient(keyStore);
+            Map<String, String> env = new java.util.HashMap<>();
+            env.put("LLM_CONTEXT_MAX_TURNS", "2");
+            env.put("LLM_MAX_OUTPUT_TOKENS", "128");
+            JsonConversationStore store = tempStore();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.from(env), client, store);
+            Path historyFile = store.file();
+
+            for (int i = 1; i <= 4; i++) {
+                agent.ask("вопрос " + i);
+            }
+            agent.ask("вопрос с урезанным контекстом");
+
+            JsonNode messages = MAPPER.readTree(lastBody.get()).path("messages");
+            // system + 2 последние пары + новый запрос.
+            expect("в запрос уходят только последние целые пары по лимиту контекста",
+                    messages.size() == 6
+                            && "system".equals(messages.get(0).path("role").asText())
+                            && "вопрос 3".equals(messages.get(1).path("content").asText())
+                            && "вопрос 4".equals(messages.get(3).path("content").asText())
+                            && "вопрос с урезанным контекстом".equals(
+                            messages.get(5).path("content").asText()));
+
+            JsonNode saved = MAPPER.readTree(Files.readString(historyFile, StandardCharsets.UTF_8));
+            expect("лимит отправки не удаляет архив: в файле все пары",
+                    saved.path("messages").size() == 10);
+
+            List<ChatMessage> memoryBeforeRestart = agent.getHistory();
+            store.close();
+            try (JsonConversationStore reopened = new JsonConversationStore(historyFile)) {
+                LlmAgent restored = new LlmAgent(config, ModelSettings.from(env), client, reopened);
+                expect("после перезапуска история восстанавливается целиком",
+                        restored.getHistory().equals(memoryBeforeRestart));
+            }
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    // ---------- Диагностика, finish_reason и обработка лимита ----------
+
+    private static void checkDiagnosticsAndLimit() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        AtomicInteger hitCounter = new AtomicInteger();
+        AtomicInteger successCounter = new AtomicInteger();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            hitCounter.incrementAndGet();
+            if (requestBody.contains("case=truncated")) {
+                return new Response(200, ("{\"choices\":[{\"finish_reason\":\"length\","
+                        + "\"message\":{\"role\":\"assistant\",\"content\":\"частичный ответ\"}}],"
+                        + "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20,\"total_tokens\":30}}")
+                        .getBytes(StandardCharsets.UTF_8));
+            }
+            if (requestBody.contains("case=empty-length")) {
+                return new Response(200, ("{\"choices\":[{\"finish_reason\":\"length\","
+                        + "\"message\":{\"role\":\"assistant\",\"content\":\"\"}}]}")
+                        .getBytes(StandardCharsets.UTF_8));
+            }
+            if (requestBody.contains("case=no-usage")) {
+                return new Response(200, ("{\"choices\":[{\"finish_reason\":\"stop\","
+                        + "\"message\":{\"role\":\"assistant\",\"content\":\"Ответ без usage\"}}]}")
+                        .getBytes(StandardCharsets.UTF_8));
+            }
+            return new Response(200, ("{\"choices\":[{\"finish_reason\":\"stop\",\"message\":"
+                    + "{\"role\":\"assistant\",\"content\":\"Ответ "
+                    + successCounter.incrementAndGet() + "\"}}],"
+                    + "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20,\"total_tokens\":30}}")
+                    .getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort() + "/v1/chat/completions",
+                    "glm-5.3-flash");
+            HttpClient client = trustedHttpClient(keyStore);
+            Map<String, String> env = new java.util.HashMap<>();
+            env.put("LLM_DIAGNOSTICS", "true");
+            JsonConversationStore store = tempStore();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.from(env), client, store);
+
+            // Обычный ответ с usage: диагностика без секретов и текстов переписки.
+            FakeUi normalUi = new FakeUi(
+                    TerminalUi.Input.message("вопрос-секрет-42"),
+                    TerminalUi.Input.command("/exit"));
+            expect("запрос с диагностикой завершается нормально",
+                    Main.runLoop(normalUi, agent, "glm-5.3-flash") == 0);
+            String normalText = String.join("\n", normalUi.systems);
+            expect("диагностика показывает профиль, лимит и метрики времени",
+                    normalText.contains("профиль balanced")
+                            && normalText.contains("лимит генерации 1024")
+                            && normalText.contains("Диагностика")
+                            && normalText.contains("HTTP до полного ответа"));
+            expect("диагностика показывает finish_reason и usage из ответа",
+                    normalText.contains("finish_reason: stop")
+                            && normalText.contains("prompt_tokens: 10")
+                            && normalText.contains("completion_tokens: 20")
+                            && normalText.contains("total_tokens: 30"));
+            expect("диагностика не содержит ключ API и тексты переписки",
+                    !normalText.contains("test-key") && !normalText.contains("секрет-42"));
+
+            // Обрезанный по лимиту ответ: показан, с предупреждением, без повторов.
+            FakeUi truncatedUi = new FakeUi(
+                    TerminalUi.Input.message("case=truncated"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(truncatedUi, agent, "glm-5.3-flash");
+            expect("обрезанный ответ показывается пользователю",
+                    truncatedUi.messages.contains("частичный ответ"));
+            expect("при остановке по лимиту выводится предупреждение",
+                    truncatedUi.systems.stream().anyMatch(s -> s.contains("обрезан по лимиту")));
+            expect("при обрезанном ответе повторный запрос не выполняется",
+                    hitCounter.get() == 2);
+            expect("последние метрики фиксируют finish_reason length",
+                    agent.getLastDiagnostics() != null && agent.getLastDiagnostics().limitReached());
+
+            // Пустой итоговый ответ при лимите — на отдельном агенте с чистой
+            // историей, чтобы маркер предыдущего сценария не попадал в запрос.
+            JsonConversationStore emptyStore = tempStore();
+            LlmAgent emptyAgent = new LlmAgent(config, ModelSettings.from(env), client, emptyStore);
+            expect("пустой ответ при исчерпанном лимите объясняется",
+                    expectAgentError(emptyAgent, "case=empty-length").contains("max_tokens"));
+            expect("после пустого ответа история в памяти не изменилась",
+                    emptyAgent.getHistory().isEmpty());
+            expect("после пустого ответа повторный запрос не выполнялся",
+                    hitCounter.get() == 3);
+            emptyStore.close();
+
+            // Отсутствующий usage — «нет данных», а не ноль (чистая история,
+            // чтобы маркер предыдущего сценария не попал в запрос).
+            JsonConversationStore noUsageStore = tempStore();
+            LlmAgent noUsageAgent = new LlmAgent(config, ModelSettings.from(env), client, noUsageStore);
+            FakeUi noUsageUi = new FakeUi(
+                    TerminalUi.Input.message("case=no-usage"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(noUsageUi, noUsageAgent, "glm-5.3-flash");
+            expect("при отсутствующем usage диагностика показывает «нет данных»",
+                    noUsageUi.systems.stream().anyMatch(s -> s.contains("usage: нет данных")));
+            noUsageStore.close();
+            store.close();
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    // ---------- Команда /mode без вызова API ----------
+
+    private static void checkModeCommand() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        AtomicInteger hitCounter = new AtomicInteger();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            hitCounter.incrementAndGet();
+            return new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                    + "\"content\":\"Ответ\"}}]}").getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort() + "/v1/chat/completions",
+                    "glm-5.3-flash");
+            HttpClient client = trustedHttpClient(keyStore);
+            JsonConversationStore store = tempStore();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.defaults(), client, store);
+            agent.ask("вопрос перед /mode");
+            byte[] fileBeforeMode = Files.readAllBytes(store.file());
+            int hitsAfterAsk = hitCounter.get();
+
+            FakeUi modeUi = new FakeUi(
+                    TerminalUi.Input.command("/mode"),
+                    TerminalUi.Input.command("/mode fast"),
+                    TerminalUi.Input.command("/mode turbo"),
+                    TerminalUi.Input.command("/history"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(modeUi, agent, "glm-5.3-flash");
+            expect("команды /mode не вызывают API", hitCounter.get() == hitsAfterAsk);
+            expect("/mode показывает текущий профиль и лимит",
+                    modeUi.systems.stream().anyMatch(
+                            s -> s.contains("Профиль: balanced · лимит генерации: 1024")));
+            expect("профиль переключается на fast с лимитом 512",
+                    modeUi.systems.stream().anyMatch(
+                            s -> s.contains("Профиль изменён: fast · лимит генерации: 512"))
+                            && ModelSettings.FAST.equals(agent.currentSettings().profile())
+                            && agent.currentSettings().maxOutputTokens() == 512);
+            expect("неизвестный профиль даёт понятную ошибку",
+                    modeUi.errors.stream().anyMatch(s -> s.contains("Неизвестный профиль")));
+            expect("/mode не трогает файл истории",
+                    Arrays.equals(Files.readAllBytes(store.file()), fileBeforeMode));
+            expect("/mode не очищает память",
+                    agent.getHistory().size() == 2 && modeUi.historyCalls == 1);
+            store.close();
+
+            // Явный LLM_MAX_OUTPUT_TOKENS сохраняет приоритет при /mode.
+            Map<String, String> env = new java.util.HashMap<>();
+            env.put("LLM_MAX_OUTPUT_TOKENS", "300");
+            JsonConversationStore overriddenStore = tempStore();
+            LlmAgent overriddenAgent = new LlmAgent(
+                    config, ModelSettings.from(env), client, overriddenStore);
+            FakeUi overrideUi = new FakeUi(
+                    TerminalUi.Input.command("/mode"),
+                    TerminalUi.Input.command("/mode fast"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(overrideUi, overriddenAgent, "glm-5.3-flash");
+            expect("приветствие /mode отмечает переопределение лимита окружением",
+                    overrideUi.systems.stream().anyMatch(
+                            s -> s.contains("лимит задан LLM_MAX_OUTPUT_TOKENS")));
+            expect("при переключении профиля лимит из окружения сохраняется",
+                    overriddenAgent.currentSettings().maxOutputTokens() == 300
+                            && ModelSettings.FAST.equals(overriddenAgent.currentSettings().profile()));
+            overriddenStore.close();
         } finally {
             server.stop(0);
             Files.deleteIfExists(keyStore);
