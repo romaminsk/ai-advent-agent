@@ -43,7 +43,8 @@ final class InteractiveTerminalUi implements TerminalUi {
         this.reader = LineReaderBuilder.builder()
                 .terminal(terminal)
                 .completer(new StringsCompleter(
-                        "/help", "/history", "/reset", "/clear", "/multiline", "/mode",
+                        "/help", "/history", "/tokens", "/stats", "/reset", "/clear",
+                        "/multiline", "/mode",
                         "/mode fast", "/mode balanced", "/mode detailed",
                         "/exit", "exit", "quit"))
                 .build();
@@ -169,6 +170,8 @@ final class InteractiveTerminalUi implements TerminalUi {
         out.println("Команды:");
         out.println("  /help      — справка");
         out.println("  /history   — история текущего диалога");
+        out.println("  /tokens    — оценка токенов истории, контекста и резервов (без вызова API)");
+        out.println("  /stats     — фактический расход токенов и стоимость за сессию (без вызова API)");
         out.println("  /reset     — очистить контекст и начать новую беседу");
         out.println("  /clear     — очистить экран, не удаляя историю диалога");
         out.println("  /multiline — многострочный ввод (/send — отправить, /cancel — отмена)");

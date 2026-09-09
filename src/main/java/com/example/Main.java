@@ -1,5 +1,8 @@
 package com.example;
 
+import java.math.BigDecimal;
+import java.util.List;
+
 /**
  * Консольное приложение агента. Координирует работу: создаёт конфигурацию,
  * хранилище контекста, агента и терминальный интерфейс; вся работа
@@ -83,6 +86,12 @@ public final class Main {
                     }
                 }
                 case MESSAGE -> {
+                    // Предупреждение о прогнозируемом превышении контекстного
+                    // бюджета (только политика warn; block блокирует внутри агента).
+                    String budgetWarning = agent.predictContextBudgetWarning(input.text());
+                    if (budgetWarning != null) {
+                        ui.showSystem(budgetWarning);
+                    }
                     try (TerminalUi.ProgressIndicator progress = ui.startProgress()) {
                         String answer = agent.ask(input.text());
                         ui.showMessage(answer);
@@ -143,12 +152,14 @@ public final class Main {
                     + "или задайте LLM_MAX_OUTPUT_TOKENS.");
         }
         if (agent.currentSettings().diagnostics()) {
-            ui.showSystem(formatDiagnostics(diagnostics, model));
+            ui.showSystem(formatDiagnostics(diagnostics, model, agent.sessionStats(),
+                    agent.currentSettings()));
         }
     }
 
     /** Краткие метрики последнего запроса; отсутствующие значения — «нет данных». */
-    static String formatDiagnostics(RequestDiagnostics d, String model) {
+    static String formatDiagnostics(RequestDiagnostics d, String model,
+                                    SessionTokenStats.Snapshot stats, ModelSettings settings) {
         StringBuilder text = new StringBuilder("Диагностика: модель ").append(model)
                 .append(" · профиль ").append(d.profile())
                 .append(" · лимит генерации ").append(d.maxOutputTokens());
@@ -166,7 +177,45 @@ public final class Main {
         text.append("\n  finish_reason: ")
                 .append(d.finishReason() == null ? "нет данных" : d.finishReason());
         text.append("\n  usage: ").append(formatUsage(d));
+        appendTokenEstimates(text, d);
+        appendSessionTokens(text, stats, settings);
         return text.toString();
+    }
+
+    /** Оценочные (≈) токен-поля запроса: отдельно от фактических значений usage. */
+    private static void appendTokenEstimates(StringBuilder text, RequestDiagnostics d) {
+        text.append("\n  оценка (≈ локальная, не точный подсчёт): сообщение ≈")
+                .append(orNoData(d.estimatedUserMessageTokens()))
+                .append(" · отправленный запрос ≈").append(orNoData(d.estimatedRequestTokens()))
+                .append(" (накладные ≈").append(orNoData(d.estimatedRequestOverheadTokens()))
+                .append(")")
+                .append(" · видимый ответ ≈").append(orNoData(d.estimatedAnswerTokens()))
+                .append(" · история после ≈").append(orNoData(d.estimatedHistoryTokensAfter()))
+                .append(" (").append(d.savedMessagesAfter() == null
+                        ? "нет данных" : d.savedMessagesAfter() + " сообщений")
+                .append(")");
+        if (d.contextBudgetExceeded()) {
+            text.append("\n  внимание: локальная оценка превысила настроенный контекстный ")
+                    .append("бюджет (LLM_CONTEXT_WINDOW_TOKENS); запрос отправлен — политика ")
+                    .append("warn. Это оценка, поведение API может отличаться");
+        }
+    }
+
+    /** Накопленные фактические расходы сессии и расчётная стоимость. */
+    private static void appendSessionTokens(StringBuilder text, SessionTokenStats.Snapshot stats,
+                                            ModelSettings settings) {
+        text.append("\n  сессия: попыток API ").append(stats.apiAttempts())
+                .append(" · с usage ").append(stats.requestsWithUsage())
+                .append(" · вход ").append(usageTotals(stats.totalPromptTokens(), stats))
+                .append(" · выход ").append(usageTotals(stats.totalCompletionTokens(), stats));
+        if (stats.apiAttempts() > 0 && !stats.complete()) {
+            text.append(" · итог неполный (есть запросы без usage или с частичным usage)");
+        }
+        text.append("\n  ").append(costSummaryLine(settings, stats));
+    }
+
+    private static String usageTotals(long value, SessionTokenStats.Snapshot stats) {
+        return stats.requestsWithUsage() > 0 ? String.valueOf(value) : "нет данных";
     }
 
     /** usage по стандартным полям OpenAI-совместимого ответа; без оценки по символам. */
@@ -176,6 +225,8 @@ public final class Main {
         }
         return "prompt_tokens: " + orNoData(d.promptTokens())
                 + " · completion_tokens: " + orNoData(d.completionTokens())
+                + " (может включать служебные категории, например reasoning — "
+                + "это не токены видимого текста)"
                 + " · total_tokens: " + orNoData(d.totalTokens());
     }
 
@@ -185,6 +236,132 @@ public final class Main {
 
     private static String millis(long nanos) {
         return String.valueOf(nanos / 1_000_000);
+    }
+
+    // ---------- Токены и статистика сессии (команды без вызова API) ----------
+
+    /**
+     * /tokens — локальная оценка (≈) без вызова API: сохранённая история,
+     * контекст следующего запроса с текущим ограничением отправки (без ещё
+     * не введённого сообщения), резерв выхода и контекстное окно.
+     * Прогноз не выдаётся за измеренный запрос.
+     */
+    static String formatTokens(LlmAgent agent, String model) {
+        ModelSettings settings = agent.currentSettings();
+        List<ChatMessage> history = agent.getHistory();
+        int pairLimit = agent.nextContextPairLimit();
+        int includedPairs = Math.min(history.size() / 2, pairLimit);
+        int omittedPairs = history.size() / 2 - includedPairs;
+
+        StringBuilder text = new StringBuilder("Токены (без вызова API); источник подсчёта: ")
+                .append(agent.tokenCounter().description());
+        text.append("\n  модель ").append(model)
+                .append(" · профиль ").append(settings.profile())
+                .append(" · резерв выхода (max_tokens): ").append(settings.maxOutputTokens());
+        text.append("\n  сохранённая история: ").append(history.size()).append(" сообщений (")
+                .append(history.size() / 2).append(" пар) · ≈")
+                .append(agent.estimateHistoryTokens())
+                .append(" токенов — system-инструкция не входит (не хранится в истории), ")
+                .append("метаданные JSON-файла не учитываются");
+        text.append("\n  контекст следующего запроса (без нового сообщения): system + ")
+                .append(includedPairs).append(" пар · ≈")
+                .append(agent.estimateNextContextTokens()).append(" токенов");
+        if (omittedPairs > 0) {
+            text.append(" · без ").append(omittedPairs)
+                    .append(" более ранних пар (ограничение LLM_CONTEXT_MAX_TURNS=")
+                    .append(pairLimit).append(")");
+        } else if (settings.contextMaxTurns() != null) {
+            text.append(" · ограничение LLM_CONTEXT_MAX_TURNS=").append(pairLimit);
+        } else {
+            text.append(" · лимит пар не задан (по умолчанию ").append(pairLimit).append(")");
+        }
+        if (settings.contextWindowTokens() != null) {
+            text.append("\n  контекстное окно: ").append(settings.contextWindowTokens())
+                    .append(" токенов (источник: ручная настройка LLM_CONTEXT_WINDOW_TOKENS)")
+                    .append(" · бюджет проверки: оценка входа + резерв выхода");
+        } else {
+            text.append("\n  контекстное окно: лимит контекста неизвестен ")
+                    .append("(LLM_CONTEXT_WINDOW_TOKENS не задана) — процент заполнения ")
+                    .append("не вычисляется, попадание не гарантируется");
+        }
+        text.append("\n  это прогноз без вызова API, а не измеренный запрос; ")
+                .append("фактический расход показывает usage после ответа");
+        return text.toString();
+    }
+
+    /**
+     * /stats — статистика сессии без вызова API: попытки API, фактические
+     * суммы usage, запросы с неизвестным расходом, расчётная стоимость.
+     */
+    static String formatStats(LlmAgent agent) {
+        SessionTokenStats.Snapshot stats = agent.sessionStats();
+        ModelSettings settings = agent.currentSettings();
+        StringBuilder text = new StringBuilder(
+                "Статистика сессии (счётчики сбрасываются при перезапуске; история при этом сохраняется)");
+        text.append("\n  попыток обращения к API: ").append(stats.apiAttempts())
+                .append(" · с usage: ").append(stats.requestsWithUsage())
+                .append(" · с неизвестным расходом (без usage): ")
+                .append(stats.requestsWithoutUsage());
+        boolean anyUsage = stats.requestsWithUsage() > 0;
+        text.append("\n  входные токены (фактические, сумма prompt_tokens): ")
+                .append(usageTotals(stats.totalPromptTokens(), stats))
+                .append("\n  выходные токены (фактические, сумма completion_tokens): ")
+                .append(usageTotals(stats.totalCompletionTokens(), stats));
+        if (stats.apiAttempts() == 0) {
+            text.append("\n  итог: запросов ещё не было");
+        } else if (stats.complete()) {
+            text.append("\n  итог: полный (все запросы с полным usage)");
+        } else {
+            text.append("\n  итог: НЕПОЛНЫЙ (есть запросы без usage или с частичным usage; ")
+                    .append("расход таких запросов не учтён)");
+        }
+        text.append("\n  ").append(costLine(settings, stats, anyUsage));
+        return text.toString();
+    }
+
+    /** Полная строка стоимости для /stats; без тарифа — «нет данных», не 0. */
+    private static String costLine(ModelSettings settings, SessionTokenStats.Snapshot stats,
+                                   boolean anyUsage) {
+        BigDecimal inputPrice = settings.inputPricePer1M();
+        BigDecimal outputPrice = settings.outputPricePer1M();
+        if (inputPrice == null && outputPrice == null) {
+            return "Стоимость: нет данных — тариф не настроен "
+                    + "(необязательные LLM_INPUT_PRICE_PER_1M, LLM_OUTPUT_PRICE_PER_1M: "
+                    + "USD за 1 000 000 входных/выходных токенов)";
+        }
+        if (inputPrice == null || outputPrice == null) {
+            return "Стоимость: нет данных — задана только одна из переменных "
+                    + "LLM_INPUT_PRICE_PER_1M, LLM_OUTPUT_PRICE_PER_1M; для расчёта нужны обе";
+        }
+        if (!anyUsage) {
+            return "Стоимость: нет данных — не было запросов с usage (тариф задан)";
+        }
+        BigDecimal inputCost = TokenCost.perMillion(inputPrice, stats.totalPromptTokens());
+        BigDecimal outputCost = TokenCost.perMillion(outputPrice, stats.totalCompletionTokens());
+        String cost = TokenCost.formatUsd(TokenCost.total(inputCost, outputCost));
+        String note = " (расчётная стоимость учтённых запросов по тарифу вход "
+                + inputPrice.toPlainString() + " / выход " + outputPrice.toPlainString()
+                + " USD за 1 000 000 токенов; это расчёт, а не фактическое списание "
+                + "провайдера; кэширование, reasoning-тарифы и ценовые ступени, "
+                + "если они есть, простой моделью не учитываются)";
+        if (!stats.complete()) {
+            note += " · итог неполный: стоимость рассчитана только по запросам с usage";
+        }
+        return "Стоимость: ≈" + cost + note;
+    }
+
+    /** Краткая строка стоимости для диагностики после ответа. */
+    private static String costSummaryLine(ModelSettings settings, SessionTokenStats.Snapshot stats) {
+        if (settings.inputPricePer1M() == null || settings.outputPricePer1M() == null) {
+            return "стоимость: нет данных — тариф не настроен";
+        }
+        if (stats.requestsWithUsage() == 0) {
+            return "стоимость: нет данных — нет запросов с usage (тариф задан)";
+        }
+        BigDecimal total = TokenCost.total(
+                TokenCost.perMillion(settings.inputPricePer1M(), stats.totalPromptTokens()),
+                TokenCost.perMillion(settings.outputPricePer1M(), stats.totalCompletionTokens()));
+        return "стоимость: ≈" + TokenCost.formatUsd(total) + " (расчётная, не списание)";
     }
 
     /**
@@ -200,6 +377,8 @@ public final class Main {
             }
             case "/help" -> ui.showHelp();
             case "/history" -> ui.showHistory(agent.getHistory());
+            case "/tokens" -> ui.showSystem(formatTokens(agent, model));
+            case "/stats" -> ui.showSystem(formatStats(agent));
             case "/reset" -> {
                 if (agent.getHistory().isEmpty() || ui.confirmReset()) {
                     try {
@@ -264,6 +443,8 @@ public final class Main {
         out.println("Переменные окружения: LLM_API_KEY, LLM_API_URL, LLM_MODEL,");
         out.println("LLM_RESPONSE_MODE (fast/balanced/detailed), LLM_MAX_OUTPUT_TOKENS,");
         out.println("LLM_TEMPERATURE, LLM_REQUEST_TIMEOUT_SECONDS, LLM_CONTEXT_MAX_TURNS,");
+        out.println("LLM_CONTEXT_WINDOW_TOKENS, LLM_CONTEXT_OVERFLOW_POLICY (warn/block),");
+        out.println("LLM_INPUT_PRICE_PER_1M, LLM_OUTPUT_PRICE_PER_1M (USD за 1M токенов),");
         out.println("LLM_DIAGNOSTICS, LLM_HISTORY_FILE");
         out.println("(при запуске через launcher загружаются из локального .env проекта).");
         out.println();
@@ -271,7 +452,8 @@ public final class Main {
         out.println("по умолчанию) и восстанавливается при следующем запуске;");
         out.println("переменная LLM_HISTORY_FILE задаёт другой абсолютный путь.");
         out.println();
-        out.println("Команды чата: /help, /history, /reset, /clear, /multiline, /exit (также exit, quit).");
+        out.println("Команды чата: /help, /history, /tokens, /stats, /reset, /clear, /multiline,");
+        out.println("/exit (также exit, quit).");
     }
 
     private Main() {

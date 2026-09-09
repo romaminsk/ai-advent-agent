@@ -1,5 +1,6 @@
 package com.example;
 
+import java.math.BigDecimal;
 import java.util.Locale;
 import java.util.Map;
 
@@ -18,9 +19,16 @@ import java.util.Map;
  * - LLM_REQUEST_TIMEOUT_SECONDS — таймаут ожидания ответа (по умолчанию 180);
  * - LLM_CONTEXT_MAX_TURNS — необязательный предел пар, отправляемых в API
  *   (файл истории не урезается — ограничивается только запрос);
+ * - LLM_CONTEXT_WINDOW_TOKENS — необязательный контекстный бюджет модели
+ *   в токенах (ручная настройка: подтверждённый лимит glm-5.3-flash
+ *   в код не зашит и не угадывается);
+ * - LLM_CONTEXT_OVERFLOW_POLICY — поведение при прогнозируемом превышении
+ *   бюджета: warn (предупредить и отправить) или block (локальная блокировка);
+ * - LLM_INPUT_PRICE_PER_1M и LLM_OUTPUT_PRICE_PER_1M — необязательный тариф
+ *   «USD за 1 000 000 входных/выходных токенов»; отсутствие значения не равно 0;
  * - LLM_DIAGNOSTICS — краткие метрики запроса (true/false).
  *
- * Лимиты профилей — экспериментальные начальные значения (512/1024/2048),
+ * Лимиты профилей — экспериментальные начальные значения,
  * а не проверенные оптимумы для glm-5.3-flash. max_tokens — верхний предел
  * генерации, а не обязательная длина ответа; его уменьшение не ускоряет
  * генерацию до первого токена.
@@ -32,6 +40,10 @@ public record ModelSettings(
         Double temperature,
         int requestTimeoutSeconds,
         Integer contextMaxTurns,
+        Integer contextWindowTokens,
+        ContextOverflowPolicy overflowPolicy,
+        BigDecimal inputPricePer1M,
+        BigDecimal outputPricePer1M,
         boolean diagnostics) {
 
     public static final String FAST = "fast";
@@ -63,7 +75,8 @@ public record ModelSettings(
     /** Настройки по умолчанию без чтения окружения (для тестов и базового конструктора). */
     public static ModelSettings defaults() {
         return new ModelSettings(DEFAULT_PROFILE, PROFILE_LIMITS.get(DEFAULT_PROFILE),
-                false, null, DEFAULT_REQUEST_TIMEOUT_SECONDS, null, false);
+                false, null, DEFAULT_REQUEST_TIMEOUT_SECONDS, null,
+                null, ContextOverflowPolicy.DEFAULT, null, null, false);
     }
 
     /** Читает настройки из переменных окружения. */
@@ -78,6 +91,12 @@ public record ModelSettings(
         Double temperature = readTemperature(env);
         Integer timeout = readOptionalPositiveInt(env, "LLM_REQUEST_TIMEOUT_SECONDS");
         Integer contextMaxTurns = readOptionalPositiveInt(env, "LLM_CONTEXT_MAX_TURNS");
+        Integer contextWindowTokens = readOptionalPositiveInt(env, "LLM_CONTEXT_WINDOW_TOKENS");
+        ContextOverflowPolicy overflowPolicy =
+                ContextOverflowPolicy.parse(env.get("LLM_CONTEXT_OVERFLOW_POLICY"),
+                        "LLM_CONTEXT_OVERFLOW_POLICY");
+        BigDecimal inputPrice = readOptionalPrice(env, "LLM_INPUT_PRICE_PER_1M");
+        BigDecimal outputPrice = readOptionalPrice(env, "LLM_OUTPUT_PRICE_PER_1M");
         boolean diagnostics = readBoolean(env, "LLM_DIAGNOSTICS");
         return new ModelSettings(
                 profile,
@@ -86,13 +105,18 @@ public record ModelSettings(
                 temperature,
                 timeout != null ? timeout : DEFAULT_REQUEST_TIMEOUT_SECONDS,
                 contextMaxTurns,
+                contextWindowTokens,
+                overflowPolicy,
+                inputPrice,
+                outputPrice,
                 diagnostics);
     }
 
     /**
      * Тот же экземпляр с другим профилем. Явный LLM_MAX_OUTPUT_TOKENS
      * сохраняет приоритет: лимит не меняется, меняется только профиль
-     * (и связанное с ним поведение системной инструкции).
+     * (и связанное с ним поведение системной инструкции). Тарифы и
+     * контекстный бюджет сменой профиля не меняются.
      */
     public ModelSettings withProfile(String newProfile) {
         String normalized = normalizeProfile(newProfile);
@@ -102,7 +126,9 @@ public record ModelSettings(
         }
         int limit = limitOverridden ? maxOutputTokens : PROFILE_LIMITS.get(normalized);
         return new ModelSettings(normalized, limit, limitOverridden,
-                temperature, requestTimeoutSeconds, contextMaxTurns, diagnostics);
+                temperature, requestTimeoutSeconds, contextMaxTurns,
+                contextWindowTokens, overflowPolicy, inputPricePer1M, outputPricePer1M,
+                diagnostics);
     }
 
     /** Лимит отправляемых в API пар: явная настройка или прежнее поведение. */
@@ -162,6 +188,31 @@ public record ModelSettings(
             throw new AgentException("LLM_TEMPERATURE должна быть конечным числом "
                     + "в диапазоне от 0 до " + formatNumber(MAX_TEMPERATURE)
                     + ", получено: " + value.trim() + ".");
+        }
+        return parsed;
+    }
+
+    /**
+     * Необязательный неотрицательный тариф «USD за 1 000 000 токенов».
+     * Отсутствие значения — null (не равно 0): без тарифа стоимость
+     * «нет данных». Явный 0 допустим. Дробные значения — через точку.
+     */
+    private static BigDecimal readOptionalPrice(Map<String, String> env, String name) {
+        String value = env.get(name);
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        BigDecimal parsed;
+        try {
+            parsed = new BigDecimal(value.trim());
+        } catch (NumberFormatException e) {
+            throw new AgentException(name + " должна быть неотрицательным числом "
+                    + "(USD за 1 000 000 токенов, дробная часть через точку), получено: "
+                    + value.trim() + ".", e);
+        }
+        if (parsed.signum() < 0) {
+            throw new AgentException(name + " не может быть отрицательной, получено: "
+                    + value.trim() + ".");
         }
         return parsed;
     }
