@@ -141,6 +141,10 @@ public final class SelfTest {
             checkOldHistoryCompatible();
             checkSessionTokenLimitSettings();
             checkSessionTokenLimitFeature();
+            checkClearCommand();
+            checkClearConfirmationUi();
+            checkClearDemoIsolation();
+            checkClearErrorKeepsMemory();
             checkDemoTokensMode();
             checkDemoFailureClassifications();
             checkDemoCommandsNoApi();
@@ -456,6 +460,9 @@ public final class SelfTest {
         int helpCount = 0;
         int historyCalls = 0;
         int clearCount = 0;
+        int confirmClearCount = 0;
+        boolean confirmClearAnswer = false;
+        String confirmClearSubject;
         int progressCount = 0;
         int confirmCount = 0;
         boolean confirmAnswer = false;
@@ -508,6 +515,13 @@ public final class SelfTest {
         }
 
         @Override
+        public boolean confirmHistoryClear(String subject) {
+            confirmClearCount++;
+            confirmClearSubject = subject;
+            return confirmClearAnswer;
+        }
+
+        @Override
         public TerminalUi.ProgressIndicator startProgress() {
             progressCount++;
             return () -> {
@@ -539,7 +553,10 @@ public final class SelfTest {
         expect("команды не вызывают API", hitCounter.get() == hitsBefore);
         expect("/help выводит справку", commandsUi.helpCount == 1);
         expect("/history вызывается", commandsUi.historyCalls == 1);
-        expect("/clear очищает только экран", commandsUi.clearCount == 1);
+        expect("/clear запрашивает подтверждение предмета очистки",
+                commandsUi.confirmClearCount == 1
+                        && "текущего диалога".equals(commandsUi.confirmClearSubject)
+                        && commandsUi.systems.stream().anyMatch(s -> s.contains("Удаление отменено")));
         expect("/exit завершает приложение", commandsUi.systems.stream()
                 .anyMatch(s -> s.contains("Работа завершена")));
 
@@ -562,15 +579,17 @@ public final class SelfTest {
         expect("MESSAGE вызывает агент ровно один раз",
                 hitCounter.get() == hitsBefore + 1 && messageUi.messages.size() == 1);
 
-        // /clear не трогает историю.
+        // /clear без подтверждения не трогает историю.
         agent.resetConversation();
         FakeUi clearUi = new FakeUi(
                 TerminalUi.Input.message("вопрос для /clear"),
                 TerminalUi.Input.command("/clear"),
                 TerminalUi.Input.command("/exit"));
         Main.runLoop(clearUi, agent, "test-model");
-        expect("/clear не сбрасывает историю",
-                clearUi.clearCount == 1 && agent.getHistory().size() == 2);
+        expect("/clear без подтверждения сохраняет историю",
+                clearUi.confirmClearCount == 1
+                        && !clearUi.confirmClearAnswer
+                        && agent.getHistory().size() == 2);
 
         // /reset с подтверждением: отказ сохраняет историю.
         agent.resetConversation();
@@ -1218,15 +1237,15 @@ public final class SelfTest {
             agent1.ask("вопрос перед командами");
             byte[] afterAsk = Files.readAllBytes(historyFile);
 
-            // /clear меняет только экран: файл и память не трогает.
+            // /clear без подтверждения: файл и память не трогает.
             FakeUi clearUi = new FakeUi(
                     TerminalUi.Input.command("/clear"),
                     TerminalUi.Input.command("/exit"));
             expect("/clear завершает цикл нормально",
                     Main.runLoop(clearUi, agent1, "test-model") == 0);
-            expect("/clear не меняет файл истории",
+            expect("/clear без подтверждения не меняет файл истории",
                     Arrays.equals(Files.readAllBytes(historyFile), afterAsk));
-            expect("/clear не меняет память", agent1.getHistory().size() == 2);
+            expect("/clear без подтверждения не меняет память", agent1.getHistory().size() == 2);
 
             // Отказ от подтверждения (история непуста) оставляет файл без изменений.
             byte[] beforeDeclinedReset = Files.readAllBytes(historyFile);
@@ -2505,6 +2524,231 @@ public final class SelfTest {
             server.stop(0);
             Files.deleteIfExists(keyStore);
         }
+    }
+
+    // ---------- День 8+: /clear — удаление истории текущего диалога ----------
+
+    private static void checkClearCommand() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        AtomicInteger hitCounter = new AtomicInteger();
+        AtomicReference<String> lastBody = new AtomicReference<>();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            hitCounter.incrementAndGet();
+            lastBody.set(requestBody);
+            return new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                    + "\"content\":\"Ответ " + hitCounter.get() + "\"}}],\"usage\":{\"prompt_tokens\":10,"
+                    + "\"completion_tokens\":20,\"total_tokens\":30}}")
+                    .getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort() + "/v1/chat/completions",
+                    "glm-5.3-flash");
+            HttpClient client = trustedHttpClient(keyStore);
+            JsonConversationStore store = tempStore();
+            LlmAgent agent = newEnvAgent(config, client, store, new java.util.HashMap<>());
+            agent.ask("вопрос до очистки");
+            agent.setSessionTokenLimit(5000L);
+            expect("перед очисткой есть история, расход и лимит",
+                    agent.getHistory().size() == 2
+                            && agent.sessionStats().knownTotal() == 30
+                            && agent.currentSettings().sessionTokenLimit() == 5000L);
+
+            // Подтверждение y: очистка памяти и файла, без API.
+            int hitsBeforeClear = hitCounter.get();
+            FakeUi clearUi = new FakeUi(
+                    TerminalUi.Input.command("/clear"),
+                    TerminalUi.Input.command("/exit"));
+            clearUi.confirmClearAnswer = true;
+            Main.runLoop(clearUi, agent, "glm-5.3-flash");
+            expect("подтверждение y удаляет историю в памяти",
+                    agent.getHistory().isEmpty());
+            expect("/clear не вызывает API", hitCounter.get() == hitsBeforeClear);
+            JsonNode saved = MAPPER.readTree(
+                    Files.readString(store.file(), StandardCharsets.UTF_8));
+            expect("файл истории очищен атомарно в совместимом формате",
+                    saved.path("schemaVersion").asInt(-1)
+                            == JsonConversationStore.SUPPORTED_SCHEMA_VERSION
+                            && !saved.path("sessionId").asText().isBlank()
+                            && saved.path("messages").isEmpty());
+            expect("сообщение об успехе упоминает сохранение статистики",
+                    clearUi.systems.stream().anyMatch(s ->
+                            s.contains("История текущего диалога удалена")
+                                    && s.contains("Статистика расхода токенов за сессию сохранена")));
+            expect("статистика сессии не сброшена очисткой",
+                    agent.sessionStats().apiAttempts() == 1
+                            && agent.sessionStats().knownTotal() == 30);
+            expect("лимит сессии сохранён после очистки",
+                    agent.currentSettings().sessionTokenLimit() == 5000L);
+            expect("/tokens показывает пустую историю",
+                    Main.formatTokens(agent, "glm-5.3-flash").contains("0 сообщений (0 пар)"));
+            expect("/stats продолжает показывать прежний расход",
+                    Main.formatStats(agent).contains(
+                            "входные токены (фактические, сумма prompt_tokens): 10"));
+
+            // Повторная очистка уже пустой истории — снова с подтверждением.
+            FakeUi clearAgainUi = new FakeUi(
+                    TerminalUi.Input.command("/clear"),
+                    TerminalUi.Input.command("/exit"));
+            clearAgainUi.confirmClearAnswer = true;
+            Main.runLoop(clearAgainUi, agent, "glm-5.3-flash");
+            expect("повторная очистка пустой истории проходит штатно",
+                    agent.getHistory().isEmpty() && clearAgainUi.confirmClearCount == 1);
+
+            // Следующий запрос формируется без удалённых сообщений; system сохранён.
+            agent.ask("новый вопрос после очистки");
+            JsonNode body = MAPPER.readTree(lastBody.get());
+            expect("после очистки запрос содержит только system и новое сообщение",
+                    body.path("messages").size() == 2
+                            && "system".equals(body.path("messages").get(0).path("role").asText())
+                            && "новый вопрос после очистки".equals(
+                            body.path("messages").get(1).path("content").asText())
+                            && !lastBody.get().contains("вопрос до очистки"));
+
+            // Перезапуск: старая переписка не восстанавливается.
+            store.close();
+            try (JsonConversationStore reopened = new JsonConversationStore(store.file())) {
+                LlmAgent restarted = new LlmAgent(config, ModelSettings.defaults(), client, reopened);
+                expect("после перезапуска восстанавливается только новая беседа",
+                        restarted.getHistory().equals(List.of(
+                                new ChatMessage("user", "новый вопрос после очистки"),
+                                new ChatMessage("assistant", "Ответ 2")))
+                                && !restarted.getHistory().toString().contains("вопрос до очистки"));
+            }
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Подтверждение очистки в UI: только y/yes подтверждают, остальное отменяет. */
+    private static void checkClearConfirmationUi() {
+        CapturedStream err = capturingStream();
+        PlainTerminalUi yesUi = new PlainTerminalUi(reader("y\n"),
+                capturingStream().stream, err.stream);
+        expect("подтверждение y удаляет историю",
+                yesUi.confirmHistoryClear("текущего диалога"));
+        expect("текст подтверждения объясняет правила",
+                err.text().contains("Удалить всю историю текущего диалога?")
+                        && err.text().contains("в памяти и в файле хранения")
+                        && err.text().contains("Отменить удаление после подтверждения нельзя")
+                        && err.text().contains("Продолжить? [y/N]"));
+        expect("подтверждение YES без учёта регистра",
+                new PlainTerminalUi(reader("YES\n"), capturingStream().stream,
+                        capturingStream().stream).confirmHistoryClear("текущего диалога"));
+        expect("пустой ввод отменяет удаление",
+                !new PlainTerminalUi(reader("\n"), capturingStream().stream,
+                        capturingStream().stream).confirmHistoryClear("текущего диалога"));
+        expect("ответ n отменяет удаление",
+                !new PlainTerminalUi(reader("n\n"), capturingStream().stream,
+                        capturingStream().stream).confirmHistoryClear("текущего диалога"));
+        expect("ответ «да» не подтверждает (только y/yes)",
+                !new PlainTerminalUi(reader("да\n"), capturingStream().stream,
+                        capturingStream().stream).confirmHistoryClear("текущего диалога"));
+        expect("EOF отменяет удаление",
+                !new PlainTerminalUi(reader(""), capturingStream().stream,
+                        capturingStream().stream).confirmHistoryClear("текущего диалога"));
+        CapturedStream demoErr = capturingStream();
+        new PlainTerminalUi(reader("y\n"), capturingStream().stream, demoErr.stream)
+                .confirmHistoryClear("демонстрационного диалога");
+        expect("в демо подтверждение называет демонстрационный диалог",
+                demoErr.text().contains("Удалить всю историю демонстрационного диалога?"));
+    }
+
+    private static void checkClearDemoIsolation() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        AtomicInteger hitCounter = new AtomicInteger();
+        List<String> bodies = new ArrayList<>();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            hitCounter.incrementAndGet();
+            bodies.add(requestBody);
+            return new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                    + "\"content\":\"Ответ " + hitCounter.get() + "\"}}],\"usage\":{\"prompt_tokens\":15,"
+                    + "\"completion_tokens\":25}}").getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort() + "/v1/chat/completions",
+                    "glm-5.3-flash");
+            HttpClient client = trustedHttpClient(keyStore);
+            JsonConversationStore mainStore = tempStore();
+            LlmAgent mainAgent = newEnvAgent(config, client, mainStore, new java.util.HashMap<>());
+            mainAgent.ask("основной вопрос");
+            int mainHits = hitCounter.get();
+
+            FakeUi ui = new FakeUi(
+                    TerminalUi.Input.command("/demo tokens"),
+                    TerminalUi.Input.message("вопрос демо один"),
+                    TerminalUi.Input.command("/clear"),
+                    TerminalUi.Input.message("вопрос демо два"),
+                    TerminalUi.Input.command("/demo stats"),
+                    TerminalUi.Input.command("/demo stop"),
+                    TerminalUi.Input.command("/exit"));
+            ui.confirmClearAnswer = true;
+            Main.runLoop(ui, mainAgent, "glm-5.3-flash");
+
+            expect("/clear в демо называет демонстрационный диалог и сохраняет таблицу",
+                    ui.systems.stream().anyMatch(s ->
+                            s.contains("История демонстрационного диалога удалена")
+                                    && s.contains("Расход и таблица демонстрационного режима сохранены")));
+            expect("таблица демо показывает очистку истории между попытками",
+                    ui.systems.stream().anyMatch(s ->
+                            s.contains("история очищена (/clear)")
+                                    && s.contains("1 | 15 | 25 | 40")
+                                    && s.contains("2 | 15 | 25 | 80")));
+            expect("запрос после очистки демо идёт с пустой историей",
+                    MAPPER.readTree(bodies.get(2)).path("messages").size() == 2
+                            && bodies.get(2).contains("вопрос демо два")
+                            && !bodies.get(2).contains("вопрос демо один"));
+            expect("основная беседа не изменялась демо-очисткой",
+                    mainAgent.getHistory().equals(List.of(
+                            new ChatMessage("user", "основной вопрос"),
+                            new ChatMessage("assistant", "Ответ 1")))
+                            && hitCounter.get() == mainHits + 2);
+            mainStore.close();
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Хранилище с сохранённой парой, у которого запись всегда падает. */
+    private static final class HistoryButFailingStore implements ConversationStore {
+        @Override
+        public ConversationState load() {
+            return new ConversationState("sid-clear-error", List.of(
+                    new ChatMessage("user", "вопрос до сбоя"),
+                    new ChatMessage("assistant", "ответ до сбоя")));
+        }
+
+        @Override
+        public void save(ConversationState state) {
+            throw new ConversationStoreException("тестовый отказ записи (диск недоступен)");
+        }
+
+        @Override
+        public void close() {
+        }
+    }
+
+    private static void checkClearErrorKeepsMemory() {
+        Config config = new Config("test-key",
+                "https://example.com/v1/chat/completions", "glm-5.3-flash");
+        LlmAgent agent = new LlmAgent(config, new HistoryButFailingStore());
+        FakeUi ui = new FakeUi(
+                TerminalUi.Input.command("/clear"),
+                TerminalUi.Input.command("/exit"));
+        ui.confirmClearAnswer = true;
+        expect("после ошибки записи чат продолжает работать",
+                Main.runLoop(ui, agent, "test-model") == 0);
+        expect("ошибка записи не интерпретируется как успешное удаление",
+                ui.errors.stream().anyMatch(s -> s.contains("Очистка не выполнена"))
+                        && ui.systems.stream().noneMatch(s ->
+                        s.contains("История текущего диалога удалена")));
+        expect("при ошибке записи история в памяти сохранена",
+                agent.getHistory().equals(List.of(
+                        new ChatMessage("user", "вопрос до сбоя"),
+                        new ChatMessage("assistant", "ответ до сбоя"))));
     }
 
     // ---------- День 8+: ручной режим измерения токенов (/demo) ----------

@@ -67,6 +67,13 @@ public interface TerminalUi extends AutoCloseable {
     /** Подтверждение сброса непустой истории: true, если пользователь согласился. */
     boolean confirmReset();
 
+    /**
+     * Подтверждение удаления истории диалога (/clear): subject — «текущего
+     * диалога» или «демонстрационного диалога». true — только y или yes
+     * без учёта регистра; пустой ввод, EOF и любой другой ответ — отказ.
+     */
+    boolean confirmHistoryClear(String subject);
+
     /** Индикатор на время HTTP-запроса; используйте в try-with-resources. */
     ProgressIndicator startProgress();
 

@@ -43,6 +43,9 @@ final class TokenDemoSession {
     private final LlmAgent agent;
     private final JsonConversationStore store;
     private final List<AttemptRow> attempts = new java.util.ArrayList<>();
+
+    /** Номера попыток, после которых история демо-беседы была очищена (/clear). */
+    private final List<Integer> clearedAfterAttempts = new java.util.ArrayList<>();
     private Integer firstSuccessfulPrompt;
     private Integer lastSuccessfulPrompt;
     private Integer previousKnownPrompt;
@@ -265,6 +268,10 @@ final class TokenDemoSession {
                     .append(" | ").append(row.httpNanos() == null
                             ? "нет данных" : String.valueOf(row.httpNanos() / 1_000_000))
                     .append(" | ").append(row.status());
+            if (clearedAfterAttempts.contains(row.number())) {
+                // Пометка очистки истории: следующий запрос шёл с пустой историей.
+                text.append("\n  — | — | — | — | — | — | история очищена (/clear)");
+            }
         }
         if (attempts.isEmpty()) {
             text.append("\n  попыток ещё не было");
@@ -371,10 +378,22 @@ final class TokenDemoSession {
     /** Очищает журнал попыток (команда /reset в демо-режиме: новая беседа). */
     void clearLog() {
         attempts.clear();
+        clearedAfterAttempts.clear();
         firstSuccessfulPrompt = null;
         lastSuccessfulPrompt = null;
         previousKnownPrompt = null;
         lastDeltaPrompt = null;
+    }
+
+    /**
+     * Отмечает очистку истории демо-беседы (/clear): таблица сохраняется,
+     * между попытками появляется строка «история очищена», чтобы по таблице
+     * было видно, что следующий запрос шёл с пустой историей.
+     */
+    void markHistoryCleared() {
+        if (!attempts.isEmpty()) {
+            clearedAfterAttempts.add(attempts.get(attempts.size() - 1).number());
+        }
     }
 
     /**

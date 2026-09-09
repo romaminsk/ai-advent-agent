@@ -95,7 +95,7 @@ public final class Main {
                             if (demoRef.demo != null && normalized.equals("/reset")) {
                                 demoRef.demo.clearLog(); // новая демонстрационная беседа
                             }
-                            if (handleCommand(ui, activeAgent, model, input.text())) {
+                            if (handleCommand(ui, activeAgent, model, input.text(), demoRef)) {
                                 return 0;
                             }
                         }
@@ -639,7 +639,8 @@ public final class Main {
      * Выполняет служебную команду; возвращает true, если приложение должно завершиться.
      * Служебные команды не вызывают API.
      */
-    private static boolean handleCommand(TerminalUi ui, LlmAgent agent, String model, String command) {
+    private static boolean handleCommand(TerminalUi ui, LlmAgent agent, String model,
+                                         String command, DemoRef demoRef) {
         String normalized = command.toLowerCase(java.util.Locale.ROOT);
         switch (normalized) {
             case "/exit", "exit", "quit" -> {
@@ -651,6 +652,7 @@ public final class Main {
             case "/tokens" -> ui.showSystem(formatTokens(agent, model));
             case "/stats" -> ui.showSystem(formatStats(agent));
             case "/limit" -> handleLimitCommand(ui, agent, "/limit");
+            case "/clear" -> handleClearCommand(ui, agent, demoRef);
             case "/reset" -> {
                 if (agent.getHistory().isEmpty() || ui.confirmReset()) {
                     try {
@@ -666,11 +668,6 @@ public final class Main {
                     ui.showSystem("Сброс отменён. История сохранена.");
                 }
             }
-            case "/clear" -> {
-                // Очистка экрана не трогает историю диалога (ни память, ни файл).
-                ui.clearScreen();
-                ui.showWelcome(model);
-            }
             default -> {
                 if (normalized.equals("/mode") || normalized.startsWith("/mode ")) {
                     handleModeCommand(ui, agent, normalized);
@@ -682,6 +679,40 @@ public final class Main {
             }
         }
         return false;
+    }
+
+    /**
+     * /clear — удаление всей истории текущего диалога после явного
+     * подтверждения (только y/yes). Пустая беседа сначала атомарно
+     * записывается на диск тем же механизмом, что и /reset (новая сессия
+     * x-opencode-session), затем очищается память. Статистика сессии,
+     * лимиты и тарифы не сбрасываются — удаление не отменяет потраченные
+     * токены. В демо-режиме очищается только история демонстрационного
+     * диалога. Команда не вызывает API; при ошибке записи история
+     * в памяти сохраняется, CLI продолжает работать.
+     */
+    private static void handleClearCommand(TerminalUi ui, LlmAgent agent, DemoRef demoRef) {
+        boolean demoMode = demoRef.demo != null;
+        String subject = demoMode ? "демонстрационного диалога" : "текущего диалога";
+        if (!ui.confirmHistoryClear(subject)) {
+            ui.showSystem("Удаление отменено. История сохранена.");
+            return;
+        }
+        try {
+            agent.resetConversation();
+            if (demoMode) {
+                // Журнал попыток демо сохраняется: между попытками появляется
+                // пометка «история очищена (/clear)».
+                demoRef.demo.markHistoryCleared();
+                ui.showSystem("История демонстрационного диалога удалена.\n"
+                        + "Расход и таблица демонстрационного режима сохранены.");
+            } else {
+                ui.showSystem("История текущего диалога удалена. Можно начать новую беседу.\n"
+                        + "Статистика расхода токенов за сессию сохранена.");
+            }
+        } catch (ConversationStoreException e) {
+            ui.showError("Очистка не выполнена, история не изменена: " + e.getMessage());
+        }
     }
 
     /**

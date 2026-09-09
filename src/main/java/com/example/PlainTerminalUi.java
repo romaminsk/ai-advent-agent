@@ -158,7 +158,7 @@ final class PlainTerminalUi implements TerminalUi {
         err.println("  /stats     — фактический расход токенов и стоимость за сессию (без вызова API)");
         err.println("  /limit     — лимит расхода за сессию: /limit показать, /limit <число>, /limit off");
         err.println("  /reset     — очистить контекст и начать новую беседу");
-        err.println("  /clear     — очистить экран, не удаляя историю диалога");
+        err.println("  /clear     — удалить историю текущего диалога (подтверждение y/yes; статистика сессии сохраняется)");
         err.println("  /multiline — многострочный ввод (/send — отправить, /cancel — отмена)");
         err.println("  /paste     — вставка длинного текста одним сообщением (/send, /cancel)");
         err.println("  /demo      — режим измерения токенов: /demo tokens, /demo stats, /demo stop");
@@ -184,6 +184,20 @@ final class PlainTerminalUi implements TerminalUi {
         return answer != null && (answer.trim().equalsIgnoreCase("y")
                 || answer.trim().equalsIgnoreCase("yes")
                 || answer.trim().equalsIgnoreCase("да"));
+    }
+
+    /**
+     * Подтверждение удаления истории (/clear). Только y или yes (без учёта
+     * регистра) подтверждают; пустой ввод, EOF и любой другой ответ отменяют.
+     */
+    @Override
+    public boolean confirmHistoryClear(String subject) {
+        err.println("Удалить всю историю " + subject + "?");
+        err.println("Она будет очищена в памяти и в файле хранения.");
+        err.println("Отменить удаление после подтверждения нельзя.");
+        String answer = readLine("Продолжить? [y/N] ");
+        String trimmed = answer == null ? "" : answer.trim().toLowerCase(java.util.Locale.ROOT);
+        return trimmed.equals("y") || trimmed.equals("yes");
     }
 
     @Override

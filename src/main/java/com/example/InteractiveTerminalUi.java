@@ -202,7 +202,7 @@ final class InteractiveTerminalUi implements TerminalUi {
         out.println("  /stats     — фактический расход токенов и стоимость за сессию (без вызова API)");
         out.println("  /limit     — лимит расхода за сессию: /limit показать, /limit <число>, /limit off");
         out.println("  /reset     — очистить контекст и начать новую беседу");
-        out.println("  /clear     — очистить экран, не удаляя историю диалога");
+        out.println("  /clear     — удалить историю текущего диалога (подтверждение y/yes; статистика сессии сохраняется)");
         out.println("  /multiline — многострочный ввод (/send — отправить, /cancel — отмена)");
         out.println("  /paste     — вставка длинного текста одним сообщением (/send, /cancel)");
         out.println("  /demo      — режим измерения токенов: /demo tokens, /demo stats, /demo stop");
@@ -237,6 +237,27 @@ final class InteractiveTerminalUi implements TerminalUi {
                     : "Удалить историю текущей беседы? [y/N] ");
             String trimmed = answer == null ? "" : answer.trim().toLowerCase(Locale.ROOT);
             return trimmed.equals("y") || trimmed.equals("yes") || trimmed.equals("да");
+        } catch (UserInterruptException | EndOfFileException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Подтверждение удаления истории (/clear). Правила: только y или yes
+     * (без учёта регистра) подтверждают; пустой ввод, EOF и любой другой
+     * ответ отменяют операцию.
+     */
+    @Override
+    public boolean confirmHistoryClear(String subject) {
+        try {
+            PrintWriter out = terminal.writer();
+            out.println(dim("Удалить всю историю " + subject + "?"));
+            out.println(dim("Она будет очищена в памяти и в файле хранения."));
+            out.println(dim("Отменить удаление после подтверждения нельзя."));
+            out.flush();
+            String answer = reader.readLine(dim("Продолжить? [y/N] "));
+            String trimmed = answer == null ? "" : answer.trim().toLowerCase(Locale.ROOT);
+            return trimmed.equals("y") || trimmed.equals("yes");
         } catch (UserInterruptException | EndOfFileException e) {
             return false;
         }
