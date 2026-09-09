@@ -63,64 +63,173 @@ public final class Main {
     }
 
     /** Основной цикл чата: команды обрабатываются локально, сообщения уходят агенту.
-     *  Возвращает код завершения: 0 — обычное окончание, 1 — сбой сохранения контекста. */
+     *  Возвращает код завершения: 0 — обычное окончание, 1 — сбой сохранения контекста.
+     *  Пока активен демо-режим измерений (/demo tokens), сообщения и просмотр
+     *  статистики относятся к демонстрационной беседе, а не к основной. */
     static int runLoop(TerminalUi ui, LlmAgent agent, String model) {
-        ui.showWelcome(model);
-        ui.showSystem(describeMode(agent.currentSettings()));
-        ui.showSystem(describeSessionLimit(agent.currentSettings()));
-        if (agent.hasRestoredContext()) {
-            ui.showSystem("Контекст восстановлен: "
-                    + agent.getHistory().size() / 2 + " завершённых обменов.");
-        } else {
-            ui.showSystem("Начата новая беседа.");
-        }
-        while (true) {
-            TerminalUi.Input input = ui.nextInput();
-            switch (input.type()) {
-                case EOF -> {
-                    ui.showSystem("Работа завершена. История беседы сохранена.");
-                    return 0;
-                }
-                case COMMAND -> {
-                    if (handleCommand(ui, agent, model, input.text())) {
+        DemoRef demoRef = new DemoRef();
+        try {
+            ui.showWelcome(model);
+            ui.showSystem(describeMode(agent.currentSettings()));
+            ui.showSystem(describeSessionLimit(agent.currentSettings()));
+            if (agent.hasRestoredContext()) {
+                ui.showSystem("Контекст восстановлен: "
+                        + agent.getHistory().size() / 2 + " завершённых обменов.");
+            } else {
+                ui.showSystem("Начата новая беседа.");
+            }
+            while (true) {
+                TerminalUi.Input input = ui.nextInput();
+                switch (input.type()) {
+                    case EOF -> {
+                        ui.showSystem("Работа завершена. История беседы сохранена.");
                         return 0;
                     }
-                }
-                case MESSAGE -> {
-                    // Предупреждение о прогнозируемом превышении контекстного
-                    // бюджета (только политика warn; block блокирует внутри агента).
-                    String budgetWarning = agent.predictContextBudgetWarning(input.text());
-                    if (budgetWarning != null) {
-                        ui.showSystem(budgetWarning);
+                    case COMMAND -> {
+                        String normalized = input.text().toLowerCase(java.util.Locale.ROOT);
+                        if (normalized.equals("/demo") || normalized.startsWith("/demo ")) {
+                            handleDemoCommand(ui, agent, model, normalized, demoRef);
+                        } else {
+                            // Пока демо активно, команды относятся к демо-беседе.
+                            LlmAgent activeAgent = activeAgent(demoRef, agent);
+                            if (demoRef.demo != null && normalized.equals("/reset")) {
+                                demoRef.demo.clearLog(); // новая демонстрационная беседа
+                            }
+                            if (handleCommand(ui, activeAgent, model, input.text())) {
+                                return 0;
+                            }
+                        }
                     }
-                    try (TerminalUi.ProgressIndicator progress = ui.startProgress()) {
-                        String answer = agent.ask(input.text());
-                        ui.showMessage(answer);
-                        showAnswerNotes(ui, agent, model);
-                    } catch (ConversationSaveException e) {
-                        // Ответ уже получен и показывается; повторный платный
-                        // запрос не выполняется. Продолжать чат нельзя: контекст
-                        // остался бы неполным, поэтому завершаем с ошибкой.
-                        ui.showMessage(e.getAnswer());
-                        ui.showError(e.getMessage());
-                        // Расход по usage этого запроса учтён — проверяем лимит
-                        // даже при сбое записи, а не только после успешной пары.
-                        showSessionLimitNoticeIfAny(ui, agent);
-                        return 1;
-                    } catch (AgentException e) {
-                        // Обычную ошибку запроса показываем; чат можно продолжить.
-                        // При прерывании корректно завершаем работу.
-                        ui.showError(e.getMessage());
-                        // Пустой или обрезанный ответ с usage тоже учтён —
-                        // информационное сообщение о лимите показываем и здесь.
-                        showSessionLimitNoticeIfAny(ui, agent);
-                        if (Thread.currentThread().isInterrupted()) {
-                            ui.showSystem("Работа завершена. История беседы сохранена.");
-                            return 0;
+                    case MESSAGE -> {
+                        LlmAgent activeAgent = activeAgent(demoRef, agent);
+                        // Предупреждение о прогнозируемом превышении контекстного
+                        // бюджета (только политика warn; block блокирует внутри агента).
+                        String budgetWarning = activeAgent.predictContextBudgetWarning(input.text());
+                        if (budgetWarning != null) {
+                            ui.showSystem(budgetWarning);
+                        }
+                        try (TerminalUi.ProgressIndicator progress = ui.startProgress()) {
+                            String answer = activeAgent.ask(input.text());
+                            ui.showMessage(answer);
+                            if (demoRef.demo != null) {
+                                demoRef.demo.logSuccess();
+                                ui.showSystem(demoRef.demo.metricsAfterAnswer());
+                                showSessionLimitNoticeIfAny(ui, activeAgent);
+                            } else {
+                                showAnswerNotes(ui, agent, model);
+                            }
+                        } catch (ConversationSaveException e) {
+                            // Ответ уже получен и показывается; повторный платный
+                            // запрос не выполняется. Продолжать чат нельзя: контекст
+                            // остался бы неполным, поэтому завершаем с ошибкой.
+                            ui.showMessage(e.getAnswer());
+                            ui.showError(e.getMessage());
+                            // Расход по usage этого запроса учтён — проверяем лимит
+                            // даже при сбое записи, а не только после успешной пары.
+                            if (demoRef.demo != null) {
+                                demoRef.demo.logFailure(e);
+                                ui.showSystem(demoRef.demo.errorDetails(e));
+                            }
+                            showSessionLimitNoticeIfAny(ui, activeAgent);
+                            return 1;
+                        } catch (AgentException e) {
+                            // Обычную ошибку запроса показываем; чат можно продолжить.
+                            // При прерывании корректно завершаем работу.
+                            ui.showError(e.getMessage());
+                            if (demoRef.demo != null) {
+                                demoRef.demo.logFailure(e);
+                                ui.showSystem(demoRef.demo.errorDetails(e));
+                            }
+                            // Пустой или обрезанный ответ с usage тоже учтён —
+                            // информационное сообщение о лимите показываем и здесь.
+                            showSessionLimitNoticeIfAny(ui, activeAgent);
+                            if (Thread.currentThread().isInterrupted()) {
+                                ui.showSystem("Работа завершена. История беседы сохранена.");
+                                return 0;
+                            }
                         }
                     }
                 }
             }
+        } finally {
+            // Явный выход во время демо: временные файлы закрываются тихо,
+            // основная история и её счётчики не изменялись.
+            if (demoRef.demo != null) {
+                demoRef.demo.close();
+                ui.showSystem("Демонстрационная беседа закрыта; основная история не изменялась.");
+            }
+        }
+    }
+
+    /** Активный агент: демо-беседа, если режим включён, иначе основная. */
+    private static LlmAgent activeAgent(DemoRef demoRef, LlmAgent mainAgent) {
+        return demoRef.demo != null ? demoRef.demo.agent() : mainAgent;
+    }
+
+    /** Изменяемая ссылка на активный демо-режим (null — обычный режим). */
+    private static final class DemoRef {
+        TokenDemoSession demo;
+    }
+
+    /**
+     * Команды ручного режима измерения токенов: /demo tokens — включить,
+     * /demo stats — таблица попыток, /demo stop — завершить и вернуться
+     * к основной беседе. Команды не вызывают API.
+     */
+    private static void handleDemoCommand(TerminalUi ui, LlmAgent agent, String model,
+                                          String normalized, DemoRef demoRef) {
+        String prefix = "/demo";
+        String argument = normalized.length() > prefix.length()
+                ? normalized.substring(prefix.length()).trim()
+                : "";
+        switch (argument) {
+            case "tokens" -> {
+                if (demoRef.demo != null) {
+                    ui.showSystem("Режим измерения токенов уже включён. Таблица: /demo stats, "
+                            + "завершение: /demo stop.");
+                    return;
+                }
+                TokenDemoSession demo;
+                try {
+                    demo = TokenDemoSession.start(agent);
+                } catch (ConversationStoreException | java.io.IOException e) {
+                    ui.showError("Не удалось создать демонстрационную беседу: " + e.getMessage());
+                    return;
+                }
+                demoRef.demo = demo;
+                ui.setActiveModeLabel("демо");
+                ui.showSystem("""
+                                Режим измерения токенов включён.
+                                Вводите сообщения как обычно — каждый запрос отправляется настоящей модели.
+
+                                В этом режиме вся история демонстрационной беседы повторно отправляется \
+                                с каждым сообщением. Автоматическое сокращение контекста отключено.
+
+                                Большие запросы могут расходовать значительную квоту или средства. \
+                                Токены отображаются по данным API. Таблица результатов: /demo stats.
+                                Завершить и вернуться к основной беседе: /demo stop""");
+            }
+            case "stats" -> {
+                if (demoRef.demo == null) {
+                    ui.showSystem("Режим измерения токенов не включён. Введите /demo tokens.");
+                    return;
+                }
+                ui.showSystem(demoRef.demo.table());
+            }
+            case "stop" -> {
+                if (demoRef.demo == null) {
+                    ui.showSystem("Режим измерения токенов не включён. Введите /demo tokens.");
+                    return;
+                }
+                ui.showSystem(demoRef.demo.table());
+                demoRef.demo.close();
+                demoRef.demo = null;
+                ui.setActiveModeLabel(null);
+                ui.showSystem("Режим измерения токенов завершён. Возвращена основная беседа: "
+                        + "её история и счётчики не изменялись.");
+            }
+            default -> ui.showSystem("Использование: /demo tokens — включить измерения, "
+                    + "/demo stats — таблица попыток, /demo stop — завершить режим.");
         }
     }
 

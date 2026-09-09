@@ -24,6 +24,9 @@ final class PlainTerminalUi implements TerminalUi {
     private final PrintStream out;
     private final PrintStream err;
 
+    /** Метка активного режима в приглашении (null — обычный режим). */
+    private String activeModeLabel;
+
     /** Обычный режим: stdin/stdout/stderr процесса. */
     PlainTerminalUi() {
         this(new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8)),
@@ -44,9 +47,19 @@ final class PlainTerminalUi implements TerminalUi {
     }
 
     @Override
+    public void setActiveModeLabel(String label) {
+        this.activeModeLabel = label;
+    }
+
+    /** Приглашение обычного ввода с меткой активного режима, если она есть. */
+    private String inputPrompt() {
+        return activeModeLabel == null ? "> " : "[" + activeModeLabel + "] > ";
+    }
+
+    @Override
     public Input nextInput() {
         while (true) {
-            String line = readLine("> ");
+            String line = readLine(inputPrompt());
             if (line == null) {
                 return Input.eof();
             }
@@ -55,7 +68,8 @@ final class PlainTerminalUi implements TerminalUi {
                 continue;
             }
             if (trimmed.equalsIgnoreCase("/multiline")) {
-                Input composed = readMultiline();
+                Input composed = readMultiline("Многострочный режим: введите текст сообщения. "
+                        + "/send — отправить, /cancel — отмена.");
                 if (composed.type() == InputType.EOF) {
                     return composed;
                 }
@@ -63,6 +77,18 @@ final class PlainTerminalUi implements TerminalUi {
                     return composed;
                 }
                 continue; // /cancel — возвращаемся к обычному приглашению
+            }
+            if (trimmed.equalsIgnoreCase("/paste")) {
+                Input composed = readMultiline("Вставка длинного текста: вставьте текст построчно. "
+                        + "Весь текст уйдёт одним сообщением; отдельная строка /send — отправить, "
+                        + "отдельная строка /cancel — отменить ввод без запроса к API.");
+                if (composed.type() == InputType.EOF) {
+                    return composed;
+                }
+                if (composed.type() == InputType.MESSAGE) {
+                    return composed;
+                }
+                continue;
             }
             if (trimmed.startsWith("/")) {
                 return Input.command(trimmed);
@@ -75,12 +101,13 @@ final class PlainTerminalUi implements TerminalUi {
     }
 
     /**
-     * Многострочный режим: строки собираются до /send или /cancel.
-     * Все строки, кроме этих двух, — содержимое сообщения; API не вызывается,
-     * пока не пришёл /send. Пустой накопленный текст не отправляется.
+     * Многострочный режим (и /multiline, и /paste): строки собираются
+     * до /send или /cancel. Все строки, кроме этих двух, — содержимое
+     * сообщения; API не вызывается, пока не пришёл /send. Пустой накопленный
+     * текст не отправляется: вставленный текст не разбивается на запросы.
      */
-    private Input readMultiline() {
-        err.println("Многострочный режим: введите текст сообщения. /send — отправить, /cancel — отмена.");
+    private Input readMultiline(String intro) {
+        err.println(intro);
         List<String> lines = new ArrayList<>();
         while (true) {
             String line = readLine(MULTILINE_PROMPT);
@@ -133,6 +160,8 @@ final class PlainTerminalUi implements TerminalUi {
         err.println("  /reset     — очистить контекст и начать новую беседу");
         err.println("  /clear     — очистить экран, не удаляя историю диалога");
         err.println("  /multiline — многострочный ввод (/send — отправить, /cancel — отмена)");
+        err.println("  /paste     — вставка длинного текста одним сообщением (/send, /cancel)");
+        err.println("  /demo      — режим измерения токенов: /demo tokens, /demo stats, /demo stop");
         err.println("  /mode      — профиль ответа: /mode показать, /mode fast|balanced|detailed");
         err.println("  /exit      — завершение (также exit, quit)");
     }

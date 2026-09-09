@@ -1,5 +1,8 @@
 package com.example;
 
+import java.util.ArrayList;
+import java.util.List;
+
 /**
  * Накопленные фактические расходы токенов за текущую сессию приложения
  * (жизненный цикл — один запуск). При перезапуске счётчики сбрасываются,
@@ -24,6 +27,13 @@ public final class SessionTokenStats {
     private long totalPromptTokens;
     private long totalCompletionTokens;
 
+    /**
+     * Журнал учтённого расхода по попыткам: ровно одна запись на запрос,
+     * в порядке попыток. Значения те же, что уже учтены в суммах, — это
+     * детализация для таблиц /demo stats, а не отдельный счётчик.
+     */
+    private final List<AttemptUsage> attemptUsage = new ArrayList<>();
+
     /** Ещё одна попытка обращения к API; вызывается ровно один раз на запрос. */
     public void recordAttempt() {
         apiAttempts++;
@@ -35,6 +45,7 @@ public final class SessionTokenStats {
      * запрос помечается как частичный и делает итог неполным.
      */
     public void recordUsage(Integer promptTokens, Integer completionTokens) {
+        attemptUsage.add(new AttemptUsage(promptTokens, completionTokens));
         if (promptTokens == null && completionTokens == null) {
             requestsWithoutUsage++;
             return;
@@ -57,7 +68,21 @@ public final class SessionTokenStats {
      * Провайдер мог списать токены — в итог они не попадут.
      */
     public void recordUnknownUsage() {
+        attemptUsage.add(new AttemptUsage(null, null));
         requestsWithoutUsage++;
+    }
+
+    /**
+     * Неизменяемый журнал учтённого расхода по попыткам; запись с индексом i
+     * соответствует попытке i+1. Используется таблицами /demo stats: для
+     * неуспешных попыток с usage значения берутся отсюда, а не придумываются.
+     */
+    public List<AttemptUsage> attemptUsageLog() {
+        return List.copyOf(attemptUsage);
+    }
+
+    /** Учтённый расход одной попытки; null — «нет данных», а не ноль. */
+    public record AttemptUsage(Integer promptTokens, Integer completionTokens) {
     }
 
     /** Неизменяемый снимок для UI и тестов. */

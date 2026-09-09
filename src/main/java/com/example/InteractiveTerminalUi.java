@@ -38,13 +38,17 @@ final class InteractiveTerminalUi implements TerminalUi {
     private final String promptUser;
     private volatile ProgressSpinner activeSpinner;
 
+    /** Метка активного режима в приглашении (null — обычный режим). */
+    private volatile String activeModeLabel;
+
     InteractiveTerminalUi() throws Exception {
         this.terminal = TerminalBuilder.builder().system(true).build();
         this.reader = LineReaderBuilder.builder()
                 .terminal(terminal)
                 .completer(new StringsCompleter(
                         "/help", "/history", "/tokens", "/stats", "/limit", "/limit off",
-                        "/reset", "/clear", "/multiline", "/mode",
+                        "/demo", "/demo tokens", "/demo stats", "/demo stop",
+                        "/paste", "/reset", "/clear", "/multiline", "/mode",
                         "/mode fast", "/mode balanced", "/mode detailed",
                         "/exit", "exit", "quit"))
                 .build();
@@ -59,6 +63,20 @@ final class InteractiveTerminalUi implements TerminalUi {
                 spinner.close();
             }
         }, "agent-ui-cleanup"));
+    }
+
+    @Override
+    public void setActiveModeLabel(String label) {
+        this.activeModeLabel = label;
+    }
+
+    /** Приглашение обычного ввода с меткой активного режима, если она есть. */
+    private String inputPrompt() {
+        if (activeModeLabel == null) {
+            return promptUser;
+        }
+        String text = "Вы [" + activeModeLabel + "] ›";
+        return colors ? CYAN + text + RESET + " " : text + " ";
     }
 
     @Override
@@ -77,7 +95,7 @@ final class InteractiveTerminalUi implements TerminalUi {
         while (true) {
             String line;
             try {
-                line = reader.readLine(promptUser);
+                line = reader.readLine(inputPrompt());
             } catch (UserInterruptException e) {
                 // Ctrl+C на строке ввода: отменяем текущий ввод, показываем новое приглашение.
                 showSystem("Ввод отменён (Ctrl+C).");
@@ -91,11 +109,21 @@ final class InteractiveTerminalUi implements TerminalUi {
                 continue;
             }
             if (trimmed.equalsIgnoreCase("/multiline")) {
-                Input composed = readMultiline();
+                Input composed = readMultiline("Многострочный режим: введите текст сообщения. "
+                        + "/send — отправить, /cancel — отмена.");
                 if (composed.type() == InputType.MESSAGE || composed.type() == InputType.EOF) {
                     return composed;
                 }
                 continue; // /cancel — новое обычное приглашение
+            }
+            if (trimmed.equalsIgnoreCase("/paste")) {
+                Input composed = readMultiline("Вставка длинного текста: вставьте текст построчно. "
+                        + "Весь текст уйдёт одним сообщением; отдельная строка /send — отправить, "
+                        + "отдельная строка /cancel — отменить ввод без запроса к API.");
+                if (composed.type() == InputType.MESSAGE || composed.type() == InputType.EOF) {
+                    return composed;
+                }
+                continue;
             }
             if (trimmed.startsWith("/")) {
                 return Input.command(trimmed);
@@ -107,9 +135,9 @@ final class InteractiveTerminalUi implements TerminalUi {
         }
     }
 
-    /** Многострочный режим: подсказка видна постоянно, /send отправляет, /cancel отменяет. */
-    private Input readMultiline() {
-        showSystem("Многострочный режим: введите текст сообщения. /send — отправить, /cancel — отмена.");
+    /** Многострочный режим (/multiline и /paste): строки собираются до /send или /cancel. */
+    private Input readMultiline(String intro) {
+        showSystem(intro);
         StringBuilder text = new StringBuilder();
         String multilinePrompt = colors ? DIM + MULTILINE_PROMPT + RESET : MULTILINE_PROMPT;
         while (true) {
@@ -176,6 +204,8 @@ final class InteractiveTerminalUi implements TerminalUi {
         out.println("  /reset     — очистить контекст и начать новую беседу");
         out.println("  /clear     — очистить экран, не удаляя историю диалога");
         out.println("  /multiline — многострочный ввод (/send — отправить, /cancel — отмена)");
+        out.println("  /paste     — вставка длинного текста одним сообщением (/send, /cancel)");
+        out.println("  /demo      — режим измерения токенов: /demo tokens, /demo stats, /demo stop");
         out.println("  /mode      — профиль ответа: /mode показать, /mode fast|balanced|detailed");
         out.println("  /exit      — завершение (также exit, quit)");
         out.println("Стрелки вверх/вниз — предыдущие сообщения, Tab — автодополнение команд.");

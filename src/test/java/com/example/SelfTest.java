@@ -141,6 +141,10 @@ public final class SelfTest {
             checkOldHistoryCompatible();
             checkSessionTokenLimitSettings();
             checkSessionTokenLimitFeature();
+            checkDemoTokensMode();
+            checkDemoFailureClassifications();
+            checkDemoCommandsNoApi();
+            checkPasteInput();
             checkTwoProcessIntegration();
         } finally {
             deleteRecursively(baseTempDir);
@@ -2501,6 +2505,305 @@ public final class SelfTest {
             server.stop(0);
             Files.deleteIfExists(keyStore);
         }
+    }
+
+    // ---------- День 8+: ручной режим измерения токенов (/demo) ----------
+
+    /** Агент с заданным набором настроек из окружения. */
+    private static LlmAgent newEnvAgent(Config config, HttpClient client,
+                                        JsonConversationStore store, Map<String, String> env) {
+        return new LlmAgent(config, ModelSettings.from(env), client, store);
+    }
+
+    private static void checkDemoTokensMode() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        AtomicInteger hitCounter = new AtomicInteger();
+        List<String> bodies = new ArrayList<>();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            hitCounter.incrementAndGet();
+            bodies.add(requestBody);
+            return new Response(200, ("{\"choices\":[{\"finish_reason\":\"stop\","
+                    + "\"message\":{\"role\":\"assistant\",\"content\":\"Ответ "
+                    + hitCounter.get() + "\"}}],\"usage\":{\"prompt_tokens\":123,"
+                    + "\"completion_tokens\":45,\"total_tokens\":500}}")
+                    .getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort() + "/v1/chat/completions",
+                    "glm-5.3-flash");
+            HttpClient client = trustedHttpClient(keyStore);
+            Map<String, String> env = new java.util.HashMap<>();
+            env.put("LLM_CONTEXT_MAX_TURNS", "1");
+            env.put("LLM_INPUT_PRICE_PER_1M", "0.6");
+            env.put("LLM_OUTPUT_PRICE_PER_1M", "2.2");
+            JsonConversationStore mainStore = tempStore();
+            LlmAgent mainAgent = newEnvAgent(config, client, mainStore, env);
+
+            FakeUi ui = new FakeUi(
+                    TerminalUi.Input.command("/demo tokens"),
+                    TerminalUi.Input.message("вопрос демо один"),
+                    TerminalUi.Input.message("вопрос демо два"),
+                    TerminalUi.Input.command("/demo stats"),
+                    TerminalUi.Input.command("/demo stop"),
+                    TerminalUi.Input.message("вопрос основной беседы"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(ui, mainAgent, "glm-5.3-flash");
+
+            // Включение режима не вызывает API; ручной ввод — ровно по одному.
+            expect("в демо-режиме три ручных запроса по одному разу",
+                    hitCounter.get() == 3 && bodies.size() == 3);
+            expect("включение режима показывает вступление без запроса к API",
+                    ui.systems.stream().anyMatch(s -> s.contains("Режим измерения токенов включён"))
+                            && !ui.systems.stream().limit(1).anyMatch(s -> s.contains("Запрос №")));
+            expect("после ответа выводятся фактические метрики запроса",
+                    ui.systems.stream().anyMatch(s -> s.contains("Запрос №1")
+                            && s.contains("Вход: 123 токенов")
+                            && s.contains("Выход: 45 токенов")
+                            && s.contains("Расход этого запроса: 168 токенов")));
+            expect("накопленный расход и накопленная стоимость из usage",
+                    ui.systems.stream().anyMatch(s -> s.contains("Накопленный расход беседы: 336 токенов")
+                            && s.contains("Накопленная стоимость: ≈$0.000346")));
+            expect("стоимость подписана как расчётная по тарифу",
+                    ui.systems.stream().anyMatch(s ->
+                            s.contains("Расчётная стоимость по настроенному тарифу, "
+                                    + "не подтверждённое списание провайдера")));
+            expect("время HTTP и причина завершения показываются",
+                    ui.systems.stream().anyMatch(s -> s.contains("Время HTTP:")
+                            && s.contains("Завершение: stop")));
+
+            // В демо отправляется вся история без ограничения пар,
+            // хотя в основной беседе действует LLM_CONTEXT_MAX_TURNS=1.
+            JsonNode secondDemoBody = MAPPER.readTree(bodies.get(1));
+            expect("в демо вся история уходит без ограничения пар",
+                    secondDemoBody.path("messages").size() == 4
+                            && secondDemoBody.toString().contains("вопрос демо один"));
+
+            // /demo stats и /demo stop не вызывают API (3 хита — по числу сообщений).
+            expect("таблица демо содержит все попытки и сводку",
+                    ui.systems.stream().anyMatch(s -> s.contains("Таблица демонстрационной беседы")
+                            && s.contains("№ | Вход API | Выход API | Накоплено")
+                            && s.contains("1 | 123 | 45 | 168")
+                            && s.contains("2 | 123 | 45 | 336")
+                            && s.contains("вход первого успешного запроса: 123")
+                            && s.contains("вход последнего успешного запроса: 123")
+                            && s.contains("разница входа: +0")
+                            && s.contains("накопленный известный расход: 336 токенов")
+                            && s.contains("полные данные")));
+            expect("остановка режима возвращает основную беседу",
+                    ui.systems.stream().anyMatch(s ->
+                            s.contains("Режим измерения токенов завершён")));
+
+            // Основная беседа изолирована: только её собственное сообщение.
+            expect("основная история не изменялась демо-режимом",
+                    mainAgent.getHistory().equals(List.of(
+                            new ChatMessage("user", "вопрос основной беседы"),
+                            new ChatMessage("assistant", "Ответ 3"))));
+            expect("счётчики основной беседы считают только её запросы",
+                    mainAgent.sessionStats().apiAttempts() == 1
+                            && mainAgent.sessionStats().knownTotal() == 168);
+            mainStore.close();
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    private static void checkDemoFailureClassifications() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        AtomicInteger hitCounter = new AtomicInteger();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            hitCounter.incrementAndGet();
+            if (requestBody.contains("case=http-500")) {
+                return new Response(500, ("{\"error\":{\"code\":\"internal_error\","
+                        + "\"message\":\"internal\"}}").getBytes(StandardCharsets.UTF_8));
+            }
+            if (requestBody.contains("case=ctx-sizes")) {
+                return new Response(400, ("{\"error\":{\"code\":\"context_length_exceeded\","
+                        + "\"message\":\"This model's maximum context length is 4096 tokens. "
+                        + "However, you requested 5000 tokens\"}}")
+                        .getBytes(StandardCharsets.UTF_8));
+            }
+            if (requestBody.contains("case=other-400")) {
+                return new Response(400, ("{\"error\":{\"code\":\"invalid_request_error\","
+                        + "\"message\":\"Invalid parameter: temperature\"}}").getBytes(StandardCharsets.UTF_8));
+            }
+            return new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                    + "\"content\":\"Ответ\"}}],\"usage\":{\"prompt_tokens\":123,"
+                    + "\"completion_tokens\":45}}").getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort() + "/v1/chat/completions",
+                    "glm-5.3-flash");
+            HttpClient client = trustedHttpClient(keyStore);
+
+            // HTTP-ошибка без признаков переполнения: причина не подтверждается.
+            JsonConversationStore httpStore = tempStore();
+            LlmAgent httpAgent = newEnvAgent(config, client, httpStore, new java.util.HashMap<>());
+            FakeUi httpUi = new FakeUi(
+                    TerminalUi.Input.command("/demo tokens"),
+                    TerminalUi.Input.message("case=http-500"),
+                    TerminalUi.Input.message("вопрос после ошибки"),
+                    TerminalUi.Input.command("/demo stats"),
+                    TerminalUi.Input.command("/demo stop"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(httpUi, httpAgent, "glm-5.3-flash");
+            expect("ошибка API в демо получает номер и статус",
+                    httpUi.systems.stream().anyMatch(s -> s.contains("Запрос №1 не выполнен")
+                            && s.contains("HTTP-статус: 500")
+                            && s.contains("Код провайдера: internal_error")));
+            expect("прочий HTTP-статус не называется переполнением контекста",
+                    httpUi.systems.stream().anyMatch(s -> s.contains("причина не подтверждена"))
+                            && httpUi.messages.size() == 1);
+            expect("неуспешная попытка попадает в таблицу без выдуманного расхода",
+                    httpUi.systems.stream().anyMatch(s -> s.contains("Таблица демонстрационной беседы")
+                            && s.contains("1 | нет данных | нет данных | 0")
+                            && s.contains("HTTP 500 (internal_error)")
+                            && s.contains("2 | 123 | 45 | 168")));
+            expect("сводка помечает неполноту данных после неуспешной попытки",
+                    httpUi.systems.stream().anyMatch(s ->
+                            s.contains("накопленный известный расход: 168 токенов")
+                                    && s.contains("неполные данные")));
+            expect("основная история при демо с ошибкой остаётся пустой",
+                    httpAgent.getHistory().isEmpty()
+                            && httpAgent.sessionStats().apiAttempts() == 0);
+            httpStore.close();
+
+            // Подтверждённое переполнение: показываются слова режима и размеры
+            // провайдера, если он их сообщил.
+            JsonConversationStore overflowStore = tempStore();
+            LlmAgent overflowAgent = newEnvAgent(config, client, overflowStore, new java.util.HashMap<>());
+            FakeUi overflowUi = new FakeUi(
+                    TerminalUi.Input.command("/demo tokens"),
+                    TerminalUi.Input.message("case=ctx-sizes"),
+                    TerminalUi.Input.command("/demo stop"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(overflowUi, overflowAgent, "glm-5.3-flash");
+            expect("подтверждённое переполнение описывается отдельным текстом",
+                    overflowUi.systems.stream().anyMatch(s ->
+                            s.contains("API отклонил запрос: превышен допустимый контекст")
+                                    && s.contains("Ответ на это сообщение не получен")
+                                    && s.contains("Завершённая история сохранена")
+                                    && s.contains("переполнение контекста подтверждено ответом API")));
+            expect("размеры берутся из текста ошибки провайдера",
+                    overflowUi.systems.stream().anyMatch(s ->
+                            s.contains("лимит 4096 токенов, запрошено 5000 токенов")));
+            expect("после отклонённого запроса демо-история пуста",
+                    overflowAgent.getHistory().isEmpty());
+            overflowStore.close();
+
+            // Прочий HTTP 400 в демо не переполнение.
+            JsonConversationStore otherStore = tempStore();
+            LlmAgent otherAgent = newEnvAgent(config, client, otherStore, new java.util.HashMap<>());
+            FakeUi otherUi = new FakeUi(
+                    TerminalUi.Input.command("/demo tokens"),
+                    TerminalUi.Input.message("case=other-400"),
+                    TerminalUi.Input.command("/demo stop"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(otherUi, otherAgent, "glm-5.3-flash");
+            expect("HTTP 400 без признаков переполнения остаётся неопределённым",
+                    otherUi.systems.stream().anyMatch(s ->
+                            s.contains("HTTP-статус: 400")
+                                    && s.contains("причина не подтверждена"))
+                            && otherUi.systems.stream()
+                            .noneMatch(s -> s.contains("превышен допустимый контекст")));
+            otherStore.close();
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    private static void checkDemoCommandsNoApi() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        AtomicInteger hitCounter = new AtomicInteger();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            hitCounter.incrementAndGet();
+            return new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                    + "\"content\":\"Ответ\"}}],\"usage\":{\"prompt_tokens\":10,"
+                    + "\"completion_tokens\":5}}").getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort() + "/v1/chat/completions",
+                    "glm-5.3-flash");
+            HttpClient client = trustedHttpClient(keyStore);
+            JsonConversationStore store = tempStore();
+            LlmAgent agent = newEnvAgent(config, client, store, new java.util.HashMap<>());
+
+            // Команды без включённого режима и повторы — без API.
+            FakeUi hintsUi = new FakeUi(
+                    TerminalUi.Input.command("/demo stats"),
+                    TerminalUi.Input.command("/demo stop"),
+                    TerminalUi.Input.command("/demo"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(hintsUi, agent, "glm-5.3-flash");
+            expect("команды демо без включённого режима дают подсказки без API",
+                    hitCounter.get() == 0
+                            && hintsUi.systems.stream().anyMatch(s ->
+                            s.contains("Режим измерения токенов не включён")));
+
+            // Повторное включение и выход во время демо: тихая очистка.
+            FakeUi doubleUi = new FakeUi(
+                    TerminalUi.Input.command("/demo tokens"),
+                    TerminalUi.Input.command("/demo tokens"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(doubleUi, agent, "glm-5.3-flash");
+            expect("повторное включение режима не создаёт вторую беседу",
+                    doubleUi.systems.stream().anyMatch(s ->
+                            s.contains("Режим измерения токенов уже включён")));
+            expect("выход во время демо закрывает её без изменения основной истории",
+                    doubleUi.systems.stream().anyMatch(s ->
+                            s.contains("Демонстрационная беседа закрыта"))
+                            && agent.getHistory().isEmpty() && agent.sessionStats().apiAttempts() == 0);
+            store.close();
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    // ---------- День 8+: вставка длинного текста одним сообщением (/paste) ----------
+
+    private static void checkPasteInput() {
+        CapturedStream out = capturingStream();
+        CapturedStream err = capturingStream();
+        PlainTerminalUi pasteUi = new PlainTerminalUi(
+                reader("/paste\nпервая строка длинного текста\nвторая строка\n/send\n"),
+                out.stream, err.stream);
+        TerminalUi.Input composed = pasteUi.nextInput();
+        expect("/paste отправляет вставленный текст одним сообщением",
+                composed.type() == TerminalUi.InputType.MESSAGE
+                        && composed.text().equals("первая строка длинного текста\nвторая строка"));
+        expect("правила вставки показаны при входе в /paste",
+                err.text().contains("одним сообщением") && err.text().contains("/cancel"));
+
+        // /cancel отменяет вставку без запроса к API.
+        out = capturingStream();
+        err = capturingStream();
+        PlainTerminalUi cancelUi = new PlainTerminalUi(
+                reader("/paste\nчерновик\n/cancel\n/help\n"), out.stream, err.stream);
+        TerminalUi.Input afterCancel = cancelUi.nextInput();
+        expect("/paste /cancel отменяет ввод без отправки",
+                afterCancel.type() == TerminalUi.InputType.COMMAND
+                        && afterCancel.text().equals("/help"));
+
+        // Метка активного режима видна в приглашении.
+        out = capturingStream();
+        err = capturingStream();
+        PlainTerminalUi labelUi = new PlainTerminalUi(reader("exit\n"), out.stream, err.stream);
+        labelUi.setActiveModeLabel("демо");
+        labelUi.nextInput();
+        expect("приглашение показывает активный демо-режим",
+                err.text().contains("[демо]"));
+        labelUi.setActiveModeLabel(null);
+        out = capturingStream();
+        err = capturingStream();
+        PlainTerminalUi restoredUi = new PlainTerminalUi(reader("exit\n"), out.stream, err.stream);
+        restoredUi.nextInput();
+        expect("после выхода из режима приглашение обычное",
+                !err.text().contains("[демо]"));
     }
 
     // ---------- День 8: совместимость со старыми JSON-файлами ----------

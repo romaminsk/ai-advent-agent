@@ -116,6 +116,27 @@ public final class LlmAgent {
     private RequestDiagnostics lastDiagnostics;
 
     /**
+     * Сведения о последней HTTP-ошибке провайдера (для демо-режима измерений):
+     * статус, безопасный код, краткое обезвреженное описание и признак
+     * подтверждённого переполнения контекста. Сбрасывается в начале каждого
+     * запроса; для таймаутов и сетевых ошибок остаётся null — у них нет
+     * ответа провайдера.
+     */
+    private ApiErrorInfo lastApiError;
+
+    /**
+     * Демо-режим измерений (/demo tokens): история не ограничивается —
+     * все пары хранятся и отправляются целиком. В обычном режиме действуют
+     * MAX_HISTORY_TURNS и LLM_CONTEXT_MAX_TURNS.
+     */
+    private boolean historyUnlimited;
+
+    /** Сведения о последней ошибке HTTP-ответа провайдера. */
+    public record ApiErrorInfo(Integer httpStatus, String code, String message,
+                               boolean contextOverflow) {
+    }
+
+    /**
      * Порог лимита сессии, по которому уведомление уже показано. Используется,
      * чтобы одно превышение не повторялось на каждом запросе и повторная
      * установка того же числового лимита не создавала дублирующее сообщение.
@@ -197,6 +218,11 @@ public final class LlmAgent {
         return sessionStats.snapshot();
     }
 
+    /** Журнал учтённого расхода по попыткам (для таблиц демо-режима). */
+    public List<SessionTokenStats.AttemptUsage> attemptUsageLog() {
+        return sessionStats.attemptUsageLog();
+    }
+
     /**
      * Устанавливает лимит расхода токенов за сессию (команда /limit).
      * null — отключить уведомления. Лимит информационный: запросы не
@@ -265,6 +291,26 @@ public final class LlmAgent {
     /** Компонент подсчёта токенов: источник и тип подсчёта для /tokens. */
     public TokenCounter tokenCounter() {
         return tokenCounter;
+    }
+
+    /** Конфигурация агента (для создания демо-агента с тем же эндпоинтом). */
+    Config config() {
+        return config;
+    }
+
+    /** Переиспользуемый HTTP-клиент агента (демо-агент не создаёт свой клиент). */
+    HttpClient httpClient() {
+        return httpClient;
+    }
+
+    /** Включение неограниченной истории (демо-режим измерений). */
+    void setHistoryUnlimited(boolean unlimited) {
+        this.historyUnlimited = unlimited;
+    }
+
+    /** Сведения о последней ошибке HTTP-ответа; null — ошибок в этом запросе не было. */
+    public ApiErrorInfo getLastApiError() {
+        return lastApiError;
     }
 
     /**
@@ -348,6 +394,8 @@ public final class LlmAgent {
             throw new AgentException("Пустой запрос: нечего отправлять модели.");
         }
         long totalStart = System.nanoTime();
+        // Сведения об ошибке прошлого запроса не переносятся на новый.
+        lastApiError = null;
 
         // Локальные оценки (≈): новое сообщение и окончательный список messages
         // (system + выбранная история + новое сообщение) непосредственно перед HTTP.
@@ -441,12 +489,16 @@ public final class LlmAgent {
             pendingSessionLimitNotice = limitNotice;
         }
 
-        // Успех: новое состояние = текущая история + завершённая пара,
-        // с применением существующего лимита (только целые старые пары).
+        // Успех: новое состояние = текущая история + завершённая пара.
+        // В демо-режиме измерений архив не урезается (все пары хранятся
+        // и отправляются), в обычном — применяется существующий лимит
+        // (только целые старые пары).
         List<ChatMessage> updated = new ArrayList<>(history);
         updated.add(new ChatMessage("user", userMessage));
         updated.add(new ChatMessage("assistant", answer));
-        trimToLimit(updated);
+        if (!historyUnlimited) {
+            trimToLimit(updated);
+        }
         ConversationState newState = new ConversationState(sessionId, updated);
 
         long saveStart = System.nanoTime();
@@ -499,16 +551,18 @@ public final class LlmAgent {
     }
 
     /**
-     * HTTP-ошибка с безопасной классификацией. Переполнение контекста
-     * признаётся только при подтверждённом признаке в стандартной структуре
-     * ошибки OpenAI-совместимого ответа (HTTP 400 и error.code
-     * context_length_exceeded либо явное упоминание контекстной длины
-     * в error.message); тело ошибки пользователю не выводится. Остальные
+     * HTTP-ошибка с безопасной классификацией и сведениями для демо-режима.
+     * Переполнение контекста признаётся только при подтверждённом признаке
+     * в стандартной структуре ошибки OpenAI-совместимого ответа (HTTP 400
+     * и error.code context_length_exceeded либо явное упоминание контекстной
+     * длины в error.message); тело ошибки целиком не выводится. Остальные
      * HTTP-ошибки остаются общими: приписывать им причину нельзя.
      */
     private AgentException httpError(HttpResponse<String> response) {
         int status = response.statusCode();
-        if (status == 400 && looksLikeContextOverflow(response.body())) {
+        ErrorBody body = parseErrorBody(response.body());
+        lastApiError = new ApiErrorInfo(status, body.code(), body.message(), body.contextOverflow());
+        if (body.contextOverflow()) {
             return new AgentException(
                     "API отклонил запрос из-за размера контекста (подтверждённый отказ "
                             + "по признаку в стандартной структуре ошибки OpenAI-совместимого "
@@ -521,37 +575,44 @@ public final class LlmAgent {
                         + ". Запрос не выполнен (автоматические повторы отключены).");
     }
 
+    /** Безопасно разобранное тело ошибки провайдера (код и краткое описание). */
+    private record ErrorBody(String code, String message, boolean contextOverflow) {
+    }
+
     /**
-     * Консервативное распознавание отказа из-за контекста по стандартным полям
-     * error.code/error.message. Это сопоставление с типовыми значениями
-     * OpenAI-совместимых ответов, а не подтверждённый контракт провайдера;
-     * при любом сомнении возвращается false (останется общая ошибка).
+     * Разбирает error.code и error.message из тела ошибки: код сохраняется
+     * как есть, описание обезвреживается и сокращается; переполнение
+     * контекста — по тем же консервативным признакам, что и раньше.
+     * Сопоставление с типовыми значениями — не подтверждённый контракт
+     * провайдера; при любом сомнении переполнение не признаётся.
      */
-    private boolean looksLikeContextOverflow(String body) {
+    private ErrorBody parseErrorBody(String body) {
         if (body == null || body.isBlank()) {
-            return false;
+            return new ErrorBody(null, null, false);
         }
         try {
             JsonNode error = objectMapper.readTree(body).path("error");
             if (!error.isObject()) {
-                return false;
+                return new ErrorBody(null, null, false);
             }
-            JsonNode code = error.get("code");
-            if (code != null && code.isTextual()
-                    && "context_length_exceeded".equals(code.asText())) {
-                return true;
-            }
-            JsonNode message = error.get("message");
-            if (message != null && message.isTextual()) {
-                String lower = message.asText().toLowerCase(Locale.ROOT);
-                return lower.contains("maximum context length")
-                        || lower.contains("context length")
-                        || lower.contains("context_length_exceeded");
-            }
-            return false;
+            JsonNode codeNode = error.get("code");
+            String code = codeNode != null && codeNode.isTextual() ? codeNode.asText() : null;
+            JsonNode messageNode = error.get("message");
+            String message = messageNode != null && messageNode.isTextual()
+                    ? truncateSafe(messageNode.asText())
+                    : null;
+            boolean overflow = "context_length_exceeded".equals(code)
+                    || (message != null && message.toLowerCase(Locale.ROOT).contains("context length"));
+            return new ErrorBody(code, message, overflow);
         } catch (IOException | RuntimeException e) {
-            return false;
+            return new ErrorBody(null, null, false);
         }
+    }
+
+    /** Обезвреживание и сокращение описания ошибки до 200 символов. */
+    private static String truncateSafe(String text) {
+        String sanitized = AnsiSanitizer.sanitize(text).replaceAll("\\s+", " ").trim();
+        return sanitized.length() > 200 ? sanitized.substring(0, 200) + "…" : sanitized;
     }
 
     /** Понятная ошибка пустого видимого ответа (с подсказкой при лимите генерации). */
@@ -608,12 +669,18 @@ public final class LlmAgent {
     /**
      * Контекст без нового сообщения: system-инструкция для текущего профиля
      * плюс последние завершённые пары с учётом ограничения отправки.
-     * Используется и для формирования запроса, и для оценок /tokens.
+     * В демо-режиме измерений (historyUnlimited) отправляется вся история:
+     * ограничение пар отключено. Используется и для формирования запроса,
+     * и для оценок /tokens.
      */
     private List<ChatMessage> buildContextMessages() {
         List<ChatMessage> context = new ArrayList<>();
         context.add(new ChatMessage("system", systemPromptFor(settings.profile())));
 
+        if (historyUnlimited) {
+            context.addAll(history);
+            return context;
+        }
         int maxTurns = settings.effectiveContextMaxTurns(MAX_HISTORY_TURNS);
         int from = Math.max(0, history.size() - maxTurns * 2);
         context.addAll(history.subList(from, history.size()));
