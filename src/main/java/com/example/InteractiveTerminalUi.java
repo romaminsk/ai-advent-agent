@@ -38,12 +38,17 @@ final class InteractiveTerminalUi implements TerminalUi {
     private final String promptUser;
     private volatile ProgressSpinner activeSpinner;
 
+    /** Метка активного режима в приглашении (null — обычный режим). */
+    private volatile String activeModeLabel;
+
     InteractiveTerminalUi() throws Exception {
         this.terminal = TerminalBuilder.builder().system(true).build();
         this.reader = LineReaderBuilder.builder()
                 .terminal(terminal)
                 .completer(new StringsCompleter(
-                        "/help", "/history", "/reset", "/clear", "/multiline", "/mode",
+                        "/help", "/history", "/tokens", "/stats", "/limit", "/limit off",
+                        "/demo", "/demo tokens", "/demo stats", "/demo stop",
+                        "/paste", "/reset", "/clear", "/multiline", "/mode",
                         "/mode fast", "/mode balanced", "/mode detailed",
                         "/exit", "exit", "quit"))
                 .build();
@@ -58,6 +63,20 @@ final class InteractiveTerminalUi implements TerminalUi {
                 spinner.close();
             }
         }, "agent-ui-cleanup"));
+    }
+
+    @Override
+    public void setActiveModeLabel(String label) {
+        this.activeModeLabel = label;
+    }
+
+    /** Приглашение обычного ввода с меткой активного режима, если она есть. */
+    private String inputPrompt() {
+        if (activeModeLabel == null) {
+            return promptUser;
+        }
+        String text = "Вы [" + activeModeLabel + "] ›";
+        return colors ? CYAN + text + RESET + " " : text + " ";
     }
 
     @Override
@@ -76,7 +95,7 @@ final class InteractiveTerminalUi implements TerminalUi {
         while (true) {
             String line;
             try {
-                line = reader.readLine(promptUser);
+                line = reader.readLine(inputPrompt());
             } catch (UserInterruptException e) {
                 // Ctrl+C на строке ввода: отменяем текущий ввод, показываем новое приглашение.
                 showSystem("Ввод отменён (Ctrl+C).");
@@ -90,11 +109,21 @@ final class InteractiveTerminalUi implements TerminalUi {
                 continue;
             }
             if (trimmed.equalsIgnoreCase("/multiline")) {
-                Input composed = readMultiline();
+                Input composed = readMultiline("Многострочный режим: введите текст сообщения. "
+                        + "/send — отправить, /cancel — отмена.");
                 if (composed.type() == InputType.MESSAGE || composed.type() == InputType.EOF) {
                     return composed;
                 }
                 continue; // /cancel — новое обычное приглашение
+            }
+            if (trimmed.equalsIgnoreCase("/paste")) {
+                Input composed = readMultiline("Вставка длинного текста: вставьте текст построчно. "
+                        + "Весь текст уйдёт одним сообщением; отдельная строка /send — отправить, "
+                        + "отдельная строка /cancel — отменить ввод без запроса к API.");
+                if (composed.type() == InputType.MESSAGE || composed.type() == InputType.EOF) {
+                    return composed;
+                }
+                continue;
             }
             if (trimmed.startsWith("/")) {
                 return Input.command(trimmed);
@@ -106,9 +135,9 @@ final class InteractiveTerminalUi implements TerminalUi {
         }
     }
 
-    /** Многострочный режим: подсказка видна постоянно, /send отправляет, /cancel отменяет. */
-    private Input readMultiline() {
-        showSystem("Многострочный режим: введите текст сообщения. /send — отправить, /cancel — отмена.");
+    /** Многострочный режим (/multiline и /paste): строки собираются до /send или /cancel. */
+    private Input readMultiline(String intro) {
+        showSystem(intro);
         StringBuilder text = new StringBuilder();
         String multilinePrompt = colors ? DIM + MULTILINE_PROMPT + RESET : MULTILINE_PROMPT;
         while (true) {
@@ -169,9 +198,14 @@ final class InteractiveTerminalUi implements TerminalUi {
         out.println("Команды:");
         out.println("  /help      — справка");
         out.println("  /history   — история текущего диалога");
+        out.println("  /tokens    — оценка токенов истории, контекста и резервов (без вызова API)");
+        out.println("  /stats     — фактический расход токенов и стоимость за сессию (без вызова API)");
+        out.println("  /limit     — лимит расхода за сессию: /limit показать, /limit <число>, /limit off");
         out.println("  /reset     — очистить контекст и начать новую беседу");
-        out.println("  /clear     — очистить экран, не удаляя историю диалога");
+        out.println("  /clear     — удалить историю текущего диалога (подтверждение y/yes; статистика сессии сохраняется)");
         out.println("  /multiline — многострочный ввод (/send — отправить, /cancel — отмена)");
+        out.println("  /paste     — вставка длинного текста одним сообщением (/send, /cancel)");
+        out.println("  /demo      — режим измерения токенов: /demo tokens, /demo stats, /demo stop");
         out.println("  /mode      — профиль ответа: /mode показать, /mode fast|balanced|detailed");
         out.println("  /exit      — завершение (также exit, quit)");
         out.println("Стрелки вверх/вниз — предыдущие сообщения, Tab — автодополнение команд.");
@@ -203,6 +237,27 @@ final class InteractiveTerminalUi implements TerminalUi {
                     : "Удалить историю текущей беседы? [y/N] ");
             String trimmed = answer == null ? "" : answer.trim().toLowerCase(Locale.ROOT);
             return trimmed.equals("y") || trimmed.equals("yes") || trimmed.equals("да");
+        } catch (UserInterruptException | EndOfFileException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Подтверждение удаления истории (/clear). Правила: только y или yes
+     * (без учёта регистра) подтверждают; пустой ввод, EOF и любой другой
+     * ответ отменяют операцию.
+     */
+    @Override
+    public boolean confirmHistoryClear(String subject) {
+        try {
+            PrintWriter out = terminal.writer();
+            out.println(dim("Удалить всю историю " + subject + "?"));
+            out.println(dim("Она будет очищена в памяти и в файле хранения."));
+            out.println(dim("Отменить удаление после подтверждения нельзя."));
+            out.flush();
+            String answer = reader.readLine(dim("Продолжить? [y/N] "));
+            String trimmed = answer == null ? "" : answer.trim().toLowerCase(Locale.ROOT);
+            return trimmed.equals("y") || trimmed.equals("yes");
         } catch (UserInterruptException | EndOfFileException e) {
             return false;
         }

@@ -15,6 +15,7 @@ import java.net.http.HttpTimeoutException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.UUID;
 
@@ -40,6 +41,16 @@ import java.util.UUID;
  * наугад не добавляются. Для каждого запроса собираются метрики
  * {@link RequestDiagnostics}: время подготовки, HTTP до полного тела,
  * разбора и записи истории.
+ *
+ * Учёт токенов (День 8): перед HTTP локально ({@link TokenCounter},
+ * оценка ≈) считаются новое сообщение и окончательный список messages;
+ * после ответа — видимый текст ответа и полная сохранённая история.
+ * Фактические токены берутся только из usage ответа и накапливаются
+ * в {@link SessionTokenStats} за сессию (ровно один раз на запрос;
+ * запрос без usage помечается как неизвестный расход). При настроенном
+ * контекстном бюджете (LLM_CONTEXT_WINDOW_TOKENS) прогноз «вход + резерв
+ * выхода» сравнивается с бюджетом: warn — предупреждение и прежнее
+ * поведение, block — локальная блокировка без HTTP и без изменения истории.
  */
 public final class LlmAgent {
 
@@ -63,6 +74,16 @@ public final class LlmAgent {
     private final HttpClient httpClient;
     private final ObjectMapper objectMapper;
     private final ConversationStore store;
+
+    /**
+     * Локальный счётчик токенов (оценка ≈). Заменяемый: подтверждённый
+     * токенизатор модели не подключён, в тестах подставляется
+     * детерминированная реализация.
+     */
+    private TokenCounter tokenCounter = HeuristicTokenCounter.INSTANCE;
+
+    /** Накопленные фактические расходы токенов за текущую сессию приложения. */
+    private final SessionTokenStats sessionStats = new SessionTokenStats();
 
     /**
      * Текущие настройки модели. Заменяются только командой /mode
@@ -93,6 +114,37 @@ public final class LlmAgent {
 
     /** Метрики последнего выполненного запроса; null, пока запросов не было. */
     private RequestDiagnostics lastDiagnostics;
+
+    /**
+     * Сведения о последней HTTP-ошибке провайдера (для демо-режима измерений):
+     * статус, безопасный код, краткое обезвреженное описание и признак
+     * подтверждённого переполнения контекста. Сбрасывается в начале каждого
+     * запроса; для таймаутов и сетевых ошибок остаётся null — у них нет
+     * ответа провайдера.
+     */
+    private ApiErrorInfo lastApiError;
+
+    /**
+     * Демо-режим измерений (/demo tokens): история не ограничивается —
+     * все пары хранятся и отправляются целиком. В обычном режиме действуют
+     * MAX_HISTORY_TURNS и LLM_CONTEXT_MAX_TURNS.
+     */
+    private boolean historyUnlimited;
+
+    /** Сведения о последней ошибке HTTP-ответа провайдера. */
+    public record ApiErrorInfo(Integer httpStatus, String code, String message,
+                               boolean contextOverflow) {
+    }
+
+    /**
+     * Порог лимита сессии, по которому уведомление уже показано. Используется,
+     * чтобы одно превышение не повторялось на каждом запросе и повторная
+     * установка того же числового лимита не создавала дублирующее сообщение.
+     */
+    private Long sessionLimitNotified;
+
+    /** Отложенное информационное сообщение о превышении лимита сессии. */
+    private String pendingSessionLimitNotice;
 
     /** Создаёт агента с настройками по умолчанию и готовым хранилищем. */
     public LlmAgent(Config config, ConversationStore store) {
@@ -156,6 +208,162 @@ public final class LlmAgent {
         return lastDiagnostics;
     }
 
+    /** Замена счётчика токенов для локальных тестов (детерминированный подсчёт). */
+    void setTokenCounter(TokenCounter counter) {
+        this.tokenCounter = Objects.requireNonNull(counter, "counter");
+    }
+
+    /** Снимок накопленных фактических расходов токенов за текущую сессию. */
+    public SessionTokenStats.Snapshot sessionStats() {
+        return sessionStats.snapshot();
+    }
+
+    /** Журнал учтённого расхода по попыткам (для таблиц демо-режима). */
+    public List<SessionTokenStats.AttemptUsage> attemptUsageLog() {
+        return sessionStats.attemptUsageLog();
+    }
+
+    /**
+     * Устанавливает лимит расхода токенов за сессию (команда /limit).
+     * null — отключить уведомления. Лимит информационный: запросы не
+     * блокируются, история и накопленный расход не сбрасываются. Если новый
+     * лимит уже превышен учтённым расходом и уведомление по этому порогу
+     * ещё не показывалось, оно возвращается сразу; иначе — null.
+     */
+    public String setSessionTokenLimit(Long limit) {
+        settings = settings.withSessionTokenLimit(limit);
+        return limitNoticeIfExceeded();
+    }
+
+    /**
+     * Отложенное информационное сообщение о превышении лимита сессии;
+     * однократное чтение (после прочтения считается показанным).
+     */
+    public String consumeSessionLimitNotice() {
+        String notice = pendingSessionLimitNotice;
+        pendingSessionLimitNotice = null;
+        return notice;
+    }
+
+    /**
+     * Информационное сообщение о превышении лимита сессии, если учтённый
+     * расход строго больше лимита и по этому порогу ещё не сообщали.
+     * Равенство расхода и лимита — «достигнут», но не превышение.
+     * Один порог — одно уведомление: повторные вызовы возвращают null.
+     */
+    private String limitNoticeIfExceeded() {
+        Long limit = settings.sessionTokenLimit();
+        if (limit == null) {
+            return null;
+        }
+        long known = sessionStats.snapshot().knownTotal();
+        if (known <= limit) {
+            return null;
+        }
+        if (limit.equals(sessionLimitNotified)) {
+            return null;
+        }
+        sessionLimitNotified = limit;
+        return buildSessionLimitNotice(limit, known);
+    }
+
+    /** Текст информационного сообщения о превышении лимита сессии. */
+    private String buildSessionLimitNotice(long limit, long known) {
+        SessionTokenStats.Snapshot stats = sessionStats.snapshot();
+        StringBuilder text = new StringBuilder("Лимит токенов за сессию превышен.\n");
+        text.append("Установленный лимит: ").append(limit).append(".\n");
+        if (stats.complete()) {
+            text.append("Учтённый расход: ").append(known).append(".\n");
+            text.append("Превышение: ").append(known - limit).append(" токенов.\n");
+        } else {
+            // Данные неполные: превышение обозначается как минимум, точный
+            // остаток неизвестен — часть запросов могла не попасть в сумму.
+            text.append("Учтённый расход (неполные данные): не менее ").append(known).append(".\n");
+            text.append("Превышение: не менее ").append(known - limit).append(" токенов.\n");
+            text.append("Для части запросов usage неполный или отсутствует; ")
+                    .append("фактический расход может быть выше.\n");
+        }
+        text.append("Агент продолжает работу. Изменить лимит: /limit <число>, ")
+                .append("отключить уведомление: /limit off.");
+        return text.toString();
+    }
+
+    /** Компонент подсчёта токенов: источник и тип подсчёта для /tokens. */
+    public TokenCounter tokenCounter() {
+        return tokenCounter;
+    }
+
+    /** Конфигурация агента (для создания демо-агента с тем же эндпоинтом). */
+    Config config() {
+        return config;
+    }
+
+    /** Переиспользуемый HTTP-клиент агента (демо-агент не создаёт свой клиент). */
+    HttpClient httpClient() {
+        return httpClient;
+    }
+
+    /** Включение неограниченной истории (демо-режим измерений). */
+    void setHistoryUnlimited(boolean unlimited) {
+        this.historyUnlimited = unlimited;
+    }
+
+    /** Сведения о последней ошибке HTTP-ответа; null — ошибок в этом запросе не было. */
+    public ApiErrorInfo getLastApiError() {
+        return lastApiError;
+    }
+
+    /**
+     * Оценка (≈) полной сохранённой истории диалога. System-инструкция
+     * не входит: она не хранится в истории и добавляется к каждому запросу;
+     * метаданные JSON-файла (версия схемы, sessionId, форматирование) не
+     * учитываются по определению — считается только текст сообщений.
+     */
+    public int estimateHistoryTokens() {
+        return tokenCounter.countMessages(history);
+    }
+
+    /**
+     * Оценка (≈) контекста следующего запроса без ещё не введённого
+     * сообщения: system-инструкция плюс история с текущим ограничением
+     * отправки ({@link ModelSettings#effectiveContextMaxTurns}).
+     */
+    public int estimateNextContextTokens() {
+        return tokenCounter.countMessages(buildContextMessages());
+    }
+
+    /** Действующий лимит отправляемых пар (явная настройка или прежнее поведение). */
+    public int nextContextPairLimit() {
+        return settings.effectiveContextMaxTurns(MAX_HISTORY_TURNS);
+    }
+
+    /**
+     * Предупреждение о прогнозируемом превышении контекстного бюджета
+     * (локальная оценка входа + резерв выхода больше LLM_CONTEXT_WINDOW_TOKENS)
+     * для политики warn; null, если предупреждать не о чем. Оценка строится
+     * той же формулой, что и проверка block в {@link #ask(String)}.
+     */
+    public String predictContextBudgetWarning(String userMessage) {
+        if (settings.contextWindowTokens() == null
+                || settings.overflowPolicy() != ContextOverflowPolicy.WARN
+                || userMessage == null
+                || userMessage.isBlank()) {
+            return null;
+        }
+        int projected = projectedContextTokens(tokenCounter.countMessages(
+                buildOutgoingMessages(userMessage)));
+        if (projected <= settings.contextWindowTokens()) {
+            return null;
+        }
+        return "Предупреждение (локальная оценка, не ответ провайдера): оценка входа ≈"
+                + (projected - settings.maxOutputTokens()) + " токенов + резерв выхода "
+                + settings.maxOutputTokens() + " = ≈" + projected
+                + " превышает контекстный бюджет " + settings.contextWindowTokens()
+                + " (LLM_CONTEXT_WINDOW_TOKENS, источник: ручная настройка). Запрос будет "
+                + "отправлен (LLM_CONTEXT_OVERFLOW_POLICY=warn); особенности API могут "
+                + "менять правило бюджета. Запрос можно сократить или уменьшить историю (/reset).";
+    }
+
     /** Системная инструкция для профиля: общие правила, для fast — плюс краткость. */
     static String systemPromptFor(String profile) {
         return ModelSettings.FAST.equals(profile) ? SYSTEM_PROMPT + SHORT_ANSWER_SUFFIX : SYSTEM_PROMPT;
@@ -165,10 +373,14 @@ public final class LlmAgent {
      * Принимает сообщение пользователя и возвращает итоговый текст ответа модели
      * (choices[0].message.content).
      *
-     * Порядок работы: подготовка запроса с текущей историей → HTTP-запрос →
-     * проверка ответа → новое состояние с парой user/assistant (с лимитом) →
-     * сохранение в хранилище → обновление истории в памяти → возврат ответа.
-     * Запись выполняется сразу после успешного ответа, не откладывается до выхода.
+     * Порядок работы: локальная оценка токенов → проверка контекстного бюджета
+     * (block — локальная блокировка без HTTP) → подготовка запроса с текущей
+     * историей → HTTP-запрос (одна засчитанная попытка) → проверка ответа →
+     * учёт usage (ровно один раз на запрос; при пустом ответе с usage расход
+     * всё равно учитывается) → новое состояние с парой user/assistant
+     * (с лимитом) → сохранение в хранилище → обновление истории в памяти →
+     * возврат ответа. Запись выполняется сразу после успешного ответа,
+     * не откладывается до выхода.
      *
      * При таймауте, HTTP-ошибке, некорректном JSON, пустом ответе или прерывании
      * ни память, ни файл истории не изменяются, повторный ввод не создаёт
@@ -182,36 +394,111 @@ public final class LlmAgent {
             throw new AgentException("Пустой запрос: нечего отправлять модели.");
         }
         long totalStart = System.nanoTime();
+        // Сведения об ошибке прошлого запроса не переносятся на новый.
+        lastApiError = null;
 
-        // Временный список сообщений для этого запроса; историю ещё не трогаем.
+        // Локальные оценки (≈): новое сообщение и окончательный список messages
+        // (system + выбранная история + новое сообщение) непосредственно перед HTTP.
+        int userMessageTokens = tokenCounter.count(userMessage);
         List<ChatMessage> outgoing = buildOutgoingMessages(userMessage);
+        int requestTokens = tokenCounter.countMessages(outgoing);
+
+        // Локальная проверка контекстного бюджета: оценка входа + резерв выхода.
+        // Равенство бюджету не считается превышением; превышение — строго больше.
+        boolean budgetExceeded = false;
+        if (settings.contextWindowTokens() != null) {
+            int projected = projectedContextTokens(requestTokens);
+            budgetExceeded = projected > settings.contextWindowTokens();
+            if (budgetExceeded && settings.overflowPolicy() == ContextOverflowPolicy.BLOCK) {
+                // Локальная блокировка по оценке: HTTP не выполняется, история
+                // не изменяется, попытка к API не засчитывается.
+                throw new ContextBudgetBlockedException(
+                        "Запрос заблокирован локально (LLM_CONTEXT_OVERFLOW_POLICY=block): "
+                                + "оценка входа ≈" + requestTokens + " токенов + резерв выхода "
+                                + settings.maxOutputTokens() + " = ≈" + projected
+                                + " превышает контекстный бюджет " + settings.contextWindowTokens()
+                                + " (LLM_CONTEXT_WINDOW_TOKENS, источник: ручная настройка). "
+                                + "Это локальная оценка, а не отказ провайдера. HTTP-запрос "
+                                + "не выполнялся, история не изменена. Варианты: сократить "
+                                + "сообщение или историю (/reset), увеличить "
+                                + "LLM_CONTEXT_WINDOW_TOKENS или выбрать "
+                                + "LLM_CONTEXT_OVERFLOW_POLICY=warn.");
+            }
+        }
+
         HttpRequest request = buildRequest(outgoing);
         long prepareNanos = System.nanoTime() - totalStart;
 
+        // Попытка обращения к API засчитывается ровно один раз на запрос:
+        // и на успешный ответ, и на любую ошибку после фактической отправки.
+        sessionStats.recordAttempt();
         long httpStart = System.nanoTime();
-        HttpResponse<String> response = send(request);
+        HttpResponse<String> response;
+        try {
+            response = send(request);
+        } catch (AgentException e) {
+            // Ответ не получен (таймаут, сеть, прерывание): расход неизвестен.
+            sessionStats.recordUnknownUsage();
+            throw e;
+        }
         long httpNanos = System.nanoTime() - httpStart;
 
         // Время до получения полного тела ответа, не «время до первого токена»:
         // запрос непотоковый.
         long parseStart = System.nanoTime();
         if (response.statusCode() < 200 || response.statusCode() >= 300) {
-            // Статус и краткое описание; тело ответа и заголовки не выводим.
+            // Статус и безопасная классификация; тело ответа и заголовки не выводим.
             // Историю не очищаем и не дополняем: неудавшийся запрос в неё не попадает.
-            throw new AgentException(
-                    "Сервер вернул HTTP-статус " + response.statusCode()
-                            + ". Запрос не выполнен (автоматические повторы отключены).");
+            sessionStats.recordUnknownUsage();
+            throw httpError(response);
         }
-        ParsedAnswer parsed = parseAnswer(response.body());
+        ParsedAnswer parsed;
+        try {
+            parsed = parseAnswer(response.body());
+        } catch (AgentException e) {
+            // JSON или choices не разобраны: usage извлечь нельзя, расход неизвестен.
+            sessionStats.recordUnknownUsage();
+            throw e;
+        }
         long parseNanos = System.nanoTime() - parseStart;
+
+        if (parsed.content() == null) {
+            // Пустой видимый ответ: если usage присутствует, расход всё равно
+            // учитываем — такой запрос мог потребить токены (например, на
+            // внутренние рассуждения модели). Учёт ровно один раз на запрос.
+            sessionStats.recordUsage(
+                    parsed.usage() != null ? parsed.usage().promptTokens() : null,
+                    parsed.usage() != null ? parsed.usage().completionTokens() : null);
+            // Проверка лимита и после пустого ответа: расход уже учтён.
+            String notice = limitNoticeIfExceeded();
+            if (notice != null) {
+                pendingSessionLimitNotice = notice;
+            }
+            throw emptyAnswerError(parsed.finishReason());
+        }
         String answer = parsed.content();
 
-        // Успех: новое состояние = текущая история + завершённая пара,
-        // с применением существующего лимита (только целые старые пары).
+        // Учёт фактического расхода по usage: ровно один раз на успешный запрос.
+        sessionStats.recordUsage(
+                parsed.usage() != null ? parsed.usage().promptTokens() : null,
+                parsed.usage() != null ? parsed.usage().completionTokens() : null);
+        // Информационный лимит сессии: проверка ровно один раз на запрос,
+        // после учтённого usage; превышение не блокирует работу.
+        String limitNotice = limitNoticeIfExceeded();
+        if (limitNotice != null) {
+            pendingSessionLimitNotice = limitNotice;
+        }
+
+        // Успех: новое состояние = текущая история + завершённая пара.
+        // В демо-режиме измерений архив не урезается (все пары хранятся
+        // и отправляются), в обычном — применяется существующий лимит
+        // (только целые старые пары).
         List<ChatMessage> updated = new ArrayList<>(history);
         updated.add(new ChatMessage("user", userMessage));
         updated.add(new ChatMessage("assistant", answer));
-        trimToLimit(updated);
+        if (!historyUnlimited) {
+            trimToLimit(updated);
+        }
         ConversationState newState = new ConversationState(sessionId, updated);
 
         long saveStart = System.nanoTime();
@@ -246,9 +533,100 @@ public final class LlmAgent {
                 parsed.finishReason(),
                 parsed.usage() != null ? parsed.usage().promptTokens() : null,
                 parsed.usage() != null ? parsed.usage().completionTokens() : null,
-                parsed.usage() != null ? parsed.usage().totalTokens() : null);
+                parsed.usage() != null ? parsed.usage().totalTokens() : null,
+                userMessageTokens,
+                requestTokens,
+                tokenCounter.countOverhead(outgoing.size()),
+                tokenCounter.count(answer),
+                tokenCounter.countMessages(updated),
+                updated.size(),
+                budgetExceeded);
 
         return answer;
+    }
+
+    /** Прогноз контекстного бюджета: оценка входа плюс резерв выхода (max_tokens). */
+    private int projectedContextTokens(int estimatedRequestTokens) {
+        return estimatedRequestTokens + settings.maxOutputTokens();
+    }
+
+    /**
+     * HTTP-ошибка с безопасной классификацией и сведениями для демо-режима.
+     * Переполнение контекста признаётся только при подтверждённом признаке
+     * в стандартной структуре ошибки OpenAI-совместимого ответа (HTTP 400
+     * и error.code context_length_exceeded либо явное упоминание контекстной
+     * длины в error.message); тело ошибки целиком не выводится. Остальные
+     * HTTP-ошибки остаются общими: приписывать им причину нельзя.
+     */
+    private AgentException httpError(HttpResponse<String> response) {
+        int status = response.statusCode();
+        ErrorBody body = parseErrorBody(response.body());
+        lastApiError = new ApiErrorInfo(status, body.code(), body.message(), body.contextOverflow());
+        if (body.contextOverflow()) {
+            return new AgentException(
+                    "API отклонил запрос из-за размера контекста (подтверждённый отказ "
+                            + "по признаку в стандартной структуре ошибки OpenAI-совместимого "
+                            + "ответа; HTTP-статус 400). Тело ошибки не выводится. История "
+                            + "не изменена. Сократите запрос или историю (/reset) либо "
+                            + "настройте LLM_CONTEXT_MAX_TURNS.");
+        }
+        return new AgentException(
+                "Сервер вернул HTTP-статус " + status
+                        + ". Запрос не выполнен (автоматические повторы отключены).");
+    }
+
+    /** Безопасно разобранное тело ошибки провайдера (код и краткое описание). */
+    private record ErrorBody(String code, String message, boolean contextOverflow) {
+    }
+
+    /**
+     * Разбирает error.code и error.message из тела ошибки: код сохраняется
+     * как есть, описание обезвреживается и сокращается; переполнение
+     * контекста — по тем же консервативным признакам, что и раньше.
+     * Сопоставление с типовыми значениями — не подтверждённый контракт
+     * провайдера; при любом сомнении переполнение не признаётся.
+     */
+    private ErrorBody parseErrorBody(String body) {
+        if (body == null || body.isBlank()) {
+            return new ErrorBody(null, null, false);
+        }
+        try {
+            JsonNode error = objectMapper.readTree(body).path("error");
+            if (!error.isObject()) {
+                return new ErrorBody(null, null, false);
+            }
+            JsonNode codeNode = error.get("code");
+            String code = codeNode != null && codeNode.isTextual() ? codeNode.asText() : null;
+            JsonNode messageNode = error.get("message");
+            String message = messageNode != null && messageNode.isTextual()
+                    ? truncateSafe(messageNode.asText())
+                    : null;
+            boolean overflow = "context_length_exceeded".equals(code)
+                    || (message != null && message.toLowerCase(Locale.ROOT).contains("context length"));
+            return new ErrorBody(code, message, overflow);
+        } catch (IOException | RuntimeException e) {
+            return new ErrorBody(null, null, false);
+        }
+    }
+
+    /** Обезвреживание и сокращение описания ошибки до 200 символов. */
+    private static String truncateSafe(String text) {
+        String sanitized = AnsiSanitizer.sanitize(text).replaceAll("\\s+", " ").trim();
+        return sanitized.length() > 200 ? sanitized.substring(0, 200) + "…" : sanitized;
+    }
+
+    /** Понятная ошибка пустого видимого ответа (с подсказкой при лимите генерации). */
+    private AgentException emptyAnswerError(String finishReason) {
+        String message = "Модель вернула пустой итоговый ответ "
+                + "(choices[0].message.content отсутствует или пуст).";
+        if ("length".equals(finishReason)) {
+            // Лимит мог быть израсходован на внутренние рассуждения модели.
+            message += " Лимит генерации (max_tokens=" + settings.maxOutputTokens()
+                    + ") мог быть израсходован до видимого текста. Увеличьте лимит: "
+                    + "/mode detailed или переменная LLM_MAX_OUTPUT_TOKENS "
+                    + "(например, " + (settings.maxOutputTokens() * 2) + ").";
+        }
+        return new AgentException(message);
     }
 
     /**
@@ -283,15 +661,30 @@ public final class LlmAgent {
      * и память сохраняют всю существующую политику хранения.
      */
     private List<ChatMessage> buildOutgoingMessages(String userMessage) {
-        List<ChatMessage> outgoing = new ArrayList<>();
-        outgoing.add(new ChatMessage("system", systemPromptFor(settings.profile())));
-
-        int maxTurns = settings.effectiveContextMaxTurns(MAX_HISTORY_TURNS);
-        int from = Math.max(0, history.size() - maxTurns * 2);
-        outgoing.addAll(history.subList(from, history.size()));
-
+        List<ChatMessage> outgoing = buildContextMessages();
         outgoing.add(new ChatMessage("user", userMessage));
         return outgoing;
+    }
+
+    /**
+     * Контекст без нового сообщения: system-инструкция для текущего профиля
+     * плюс последние завершённые пары с учётом ограничения отправки.
+     * В демо-режиме измерений (historyUnlimited) отправляется вся история:
+     * ограничение пар отключено. Используется и для формирования запроса,
+     * и для оценок /tokens.
+     */
+    private List<ChatMessage> buildContextMessages() {
+        List<ChatMessage> context = new ArrayList<>();
+        context.add(new ChatMessage("system", systemPromptFor(settings.profile())));
+
+        if (historyUnlimited) {
+            context.addAll(history);
+            return context;
+        }
+        int maxTurns = settings.effectiveContextMaxTurns(MAX_HISTORY_TURNS);
+        int from = Math.max(0, history.size() - maxTurns * 2);
+        context.addAll(history.subList(from, history.size()));
+        return context;
     }
 
     /** Оставляет в списке не более MAX_HISTORY_TURNS последних целых пар. */
@@ -386,6 +779,13 @@ public final class LlmAgent {
      * Разбирает JSON-ответ: choices[0].message.content (итоговый видимый текст),
      * choices[0].finish_reason и корневой usage. reasoning_content и другие
      * служебные поля пользователю не подставляются и в историю не попадают.
+     * Вложенные детализации usage (если есть) повторно не суммируются —
+     * читается только корневой объект.
+     *
+     * Пустой или отсутствующий content не бросает исключение: возвращается
+     * content == null, чтобы вызывающий код успел учесть usage (пустой ответ
+     * тоже мог потребить токены). Ошибками остаются только некорректный JSON
+     * и отсутствие массива choices — в этих случаях usage извлечь нельзя.
      */
     private ParsedAnswer parseAnswer(String responseBody) {
         JsonNode root;
@@ -407,21 +807,11 @@ public final class LlmAgent {
                 : null;
 
         JsonNode contentNode = choice.path("message").path("content");
-        if (!contentNode.isTextual() || contentNode.asText().isBlank()) {
-            // Пустую пару в историю не записываем и запрос не повторяем автоматически.
-            String message = "Модель вернула пустой итоговый ответ "
-                    + "(choices[0].message.content отсутствует или пуст).";
-            if ("length".equals(finishReason)) {
-                // Лимит мог быть израсходован на внутренние рассуждения модели.
-                message += " Лимит генерации (max_tokens=" + settings.maxOutputTokens()
-                        + ") мог быть израсходован до видимого текста. Увеличьте лимит: "
-                        + "/mode detailed или переменная LLM_MAX_OUTPUT_TOKENS "
-                        + "(например, " + (settings.maxOutputTokens() * 2) + ").";
-            }
-            throw new AgentException(message);
-        }
+        String content = contentNode.isTextual() && !contentNode.asText().isBlank()
+                ? contentNode.asText().trim()
+                : null;
 
-        return new ParsedAnswer(contentNode.asText().trim(), finishReason, parseUsage(root.get("usage")));
+        return new ParsedAnswer(content, finishReason, parseUsage(root.get("usage")));
     }
 
     /** Разбирает usage по стандартным полям; отсутствующие поля — null. */
