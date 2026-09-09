@@ -26,6 +26,9 @@ import java.util.Map;
  *   бюджета: warn (предупредить и отправить) или block (локальная блокировка);
  * - LLM_INPUT_PRICE_PER_1M и LLM_OUTPUT_PRICE_PER_1M — необязательный тариф
  *   «USD за 1 000 000 входных/выходных токенов»; отсутствие значения не равно 0;
+ * - LLM_SESSION_TOKEN_LIMIT — необязательный информационный лимит расхода
+ *   токенов за сессию (сумма известных prompt_tokens и completion_tokens);
+ *   уведомление при превышении, не жёсткая квота;
  * - LLM_DIAGNOSTICS — краткие метрики запроса (true/false).
  *
  * Лимиты профилей — экспериментальные начальные значения,
@@ -44,6 +47,7 @@ public record ModelSettings(
         ContextOverflowPolicy overflowPolicy,
         BigDecimal inputPricePer1M,
         BigDecimal outputPricePer1M,
+        Long sessionTokenLimit,
         boolean diagnostics) {
 
     public static final String FAST = "fast";
@@ -76,7 +80,7 @@ public record ModelSettings(
     public static ModelSettings defaults() {
         return new ModelSettings(DEFAULT_PROFILE, PROFILE_LIMITS.get(DEFAULT_PROFILE),
                 false, null, DEFAULT_REQUEST_TIMEOUT_SECONDS, null,
-                null, ContextOverflowPolicy.DEFAULT, null, null, false);
+                null, ContextOverflowPolicy.DEFAULT, null, null, null, false);
     }
 
     /** Читает настройки из переменных окружения. */
@@ -97,6 +101,7 @@ public record ModelSettings(
                         "LLM_CONTEXT_OVERFLOW_POLICY");
         BigDecimal inputPrice = readOptionalPrice(env, "LLM_INPUT_PRICE_PER_1M");
         BigDecimal outputPrice = readOptionalPrice(env, "LLM_OUTPUT_PRICE_PER_1M");
+        Long sessionTokenLimit = readOptionalPositiveLong(env, "LLM_SESSION_TOKEN_LIMIT");
         boolean diagnostics = readBoolean(env, "LLM_DIAGNOSTICS");
         return new ModelSettings(
                 profile,
@@ -109,6 +114,7 @@ public record ModelSettings(
                 overflowPolicy,
                 inputPrice,
                 outputPrice,
+                sessionTokenLimit,
                 diagnostics);
     }
 
@@ -128,7 +134,19 @@ public record ModelSettings(
         return new ModelSettings(normalized, limit, limitOverridden,
                 temperature, requestTimeoutSeconds, contextMaxTurns,
                 contextWindowTokens, overflowPolicy, inputPricePer1M, outputPricePer1M,
-                diagnostics);
+                sessionTokenLimit, diagnostics);
+    }
+
+    /**
+     * Тот же экземпляр с другим лимитом расхода токенов за сессию (команда
+     * /limit). Запись неизменяема: метод возвращает копию. null — лимит
+     * отключён; накопленный расход и счётчики при смене не сбрасываются.
+     */
+    public ModelSettings withSessionTokenLimit(Long newLimit) {
+        return new ModelSettings(profile, maxOutputTokens, limitOverridden,
+                temperature, requestTimeoutSeconds, contextMaxTurns,
+                contextWindowTokens, overflowPolicy, inputPricePer1M, outputPricePer1M,
+                newLimit, diagnostics);
     }
 
     /** Лимит отправляемых в API пар: явная настройка или прежнее поведение. */
@@ -213,6 +231,32 @@ public record ModelSettings(
         if (parsed.signum() < 0) {
             throw new AgentException(name + " не может быть отрицательной, получено: "
                     + value.trim() + ".");
+        }
+        return parsed;
+    }
+
+    /**
+     * Необязательный положительный целый лимит расхода токенов за сессию.
+     * Отсутствие значения — лимит отключён. 0, отрицательные, дробные числа,
+     * текст и переполнение диапазона long дают понятную ошибку конфигурации.
+     */
+    private static Long readOptionalPositiveLong(Map<String, String> env, String name) {
+        String value = env.get(name);
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        long parsed;
+        try {
+            parsed = Long.parseLong(value.trim());
+        } catch (NumberFormatException e) {
+            // Включая переполнение допустимого диапазона.
+            throw new AgentException(name + " должна быть положительным целым числом "
+                    + "(без дробной части, в пределах " + Long.MAX_VALUE + "), получено: "
+                    + value.trim() + ".", e);
+        }
+        if (parsed <= 0) {
+            throw new AgentException(name + " должна быть положительным целым числом, "
+                    + "получено: " + parsed + ".");
         }
         return parsed;
     }

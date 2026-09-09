@@ -115,6 +115,16 @@ public final class LlmAgent {
     /** Метрики последнего выполненного запроса; null, пока запросов не было. */
     private RequestDiagnostics lastDiagnostics;
 
+    /**
+     * Порог лимита сессии, по которому уведомление уже показано. Используется,
+     * чтобы одно превышение не повторялось на каждом запросе и повторная
+     * установка того же числового лимита не создавала дублирующее сообщение.
+     */
+    private Long sessionLimitNotified;
+
+    /** Отложенное информационное сообщение о превышении лимита сессии. */
+    private String pendingSessionLimitNotice;
+
     /** Создаёт агента с настройками по умолчанию и готовым хранилищем. */
     public LlmAgent(Config config, ConversationStore store) {
         this(config, ModelSettings.defaults(), store);
@@ -185,6 +195,71 @@ public final class LlmAgent {
     /** Снимок накопленных фактических расходов токенов за текущую сессию. */
     public SessionTokenStats.Snapshot sessionStats() {
         return sessionStats.snapshot();
+    }
+
+    /**
+     * Устанавливает лимит расхода токенов за сессию (команда /limit).
+     * null — отключить уведомления. Лимит информационный: запросы не
+     * блокируются, история и накопленный расход не сбрасываются. Если новый
+     * лимит уже превышен учтённым расходом и уведомление по этому порогу
+     * ещё не показывалось, оно возвращается сразу; иначе — null.
+     */
+    public String setSessionTokenLimit(Long limit) {
+        settings = settings.withSessionTokenLimit(limit);
+        return limitNoticeIfExceeded();
+    }
+
+    /**
+     * Отложенное информационное сообщение о превышении лимита сессии;
+     * однократное чтение (после прочтения считается показанным).
+     */
+    public String consumeSessionLimitNotice() {
+        String notice = pendingSessionLimitNotice;
+        pendingSessionLimitNotice = null;
+        return notice;
+    }
+
+    /**
+     * Информационное сообщение о превышении лимита сессии, если учтённый
+     * расход строго больше лимита и по этому порогу ещё не сообщали.
+     * Равенство расхода и лимита — «достигнут», но не превышение.
+     * Один порог — одно уведомление: повторные вызовы возвращают null.
+     */
+    private String limitNoticeIfExceeded() {
+        Long limit = settings.sessionTokenLimit();
+        if (limit == null) {
+            return null;
+        }
+        long known = sessionStats.snapshot().knownTotal();
+        if (known <= limit) {
+            return null;
+        }
+        if (limit.equals(sessionLimitNotified)) {
+            return null;
+        }
+        sessionLimitNotified = limit;
+        return buildSessionLimitNotice(limit, known);
+    }
+
+    /** Текст информационного сообщения о превышении лимита сессии. */
+    private String buildSessionLimitNotice(long limit, long known) {
+        SessionTokenStats.Snapshot stats = sessionStats.snapshot();
+        StringBuilder text = new StringBuilder("Лимит токенов за сессию превышен.\n");
+        text.append("Установленный лимит: ").append(limit).append(".\n");
+        if (stats.complete()) {
+            text.append("Учтённый расход: ").append(known).append(".\n");
+            text.append("Превышение: ").append(known - limit).append(" токенов.\n");
+        } else {
+            // Данные неполные: превышение обозначается как минимум, точный
+            // остаток неизвестен — часть запросов могла не попасть в сумму.
+            text.append("Учтённый расход (неполные данные): не менее ").append(known).append(".\n");
+            text.append("Превышение: не менее ").append(known - limit).append(" токенов.\n");
+            text.append("Для части запросов usage неполный или отсутствует; ")
+                    .append("фактический расход может быть выше.\n");
+        }
+        text.append("Агент продолжает работу. Изменить лимит: /limit <число>, ")
+                .append("отключить уведомление: /limit off.");
+        return text.toString();
     }
 
     /** Компонент подсчёта токенов: источник и тип подсчёта для /tokens. */
@@ -346,6 +421,11 @@ public final class LlmAgent {
             sessionStats.recordUsage(
                     parsed.usage() != null ? parsed.usage().promptTokens() : null,
                     parsed.usage() != null ? parsed.usage().completionTokens() : null);
+            // Проверка лимита и после пустого ответа: расход уже учтён.
+            String notice = limitNoticeIfExceeded();
+            if (notice != null) {
+                pendingSessionLimitNotice = notice;
+            }
             throw emptyAnswerError(parsed.finishReason());
         }
         String answer = parsed.content();
@@ -354,6 +434,12 @@ public final class LlmAgent {
         sessionStats.recordUsage(
                 parsed.usage() != null ? parsed.usage().promptTokens() : null,
                 parsed.usage() != null ? parsed.usage().completionTokens() : null);
+        // Информационный лимит сессии: проверка ровно один раз на запрос,
+        // после учтённого usage; превышение не блокирует работу.
+        String limitNotice = limitNoticeIfExceeded();
+        if (limitNotice != null) {
+            pendingSessionLimitNotice = limitNotice;
+        }
 
         // Успех: новое состояние = текущая история + завершённая пара,
         // с применением существующего лимита (только целые старые пары).

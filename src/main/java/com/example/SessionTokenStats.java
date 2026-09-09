@@ -82,5 +82,20 @@ public final class SessionTokenStats {
             long totalPromptTokens,
             long totalCompletionTokens,
             boolean complete) {
+
+        /**
+         * Учтённый расход сессии: сумма известных prompt_tokens и
+         * completion_tokens. total_tokens повторно не прибавляется —
+         * это привело бы к двойному учёту. Переполнение суммы (практически
+         * недостижимо) трактуется безопасно: расход считается максимальным,
+         * то есть не меньше любого лимита.
+         */
+        public long knownTotal() {
+            try {
+                return Math.addExact(totalPromptTokens, totalCompletionTokens);
+            } catch (ArithmeticException e) {
+                return Long.MAX_VALUE;
+            }
+        }
     }
 }

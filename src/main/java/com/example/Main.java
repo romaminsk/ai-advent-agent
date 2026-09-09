@@ -67,6 +67,7 @@ public final class Main {
     static int runLoop(TerminalUi ui, LlmAgent agent, String model) {
         ui.showWelcome(model);
         ui.showSystem(describeMode(agent.currentSettings()));
+        ui.showSystem(describeSessionLimit(agent.currentSettings()));
         if (agent.hasRestoredContext()) {
             ui.showSystem("Контекст восстановлен: "
                     + agent.getHistory().size() / 2 + " завершённых обменов.");
@@ -102,11 +103,17 @@ public final class Main {
                         // остался бы неполным, поэтому завершаем с ошибкой.
                         ui.showMessage(e.getAnswer());
                         ui.showError(e.getMessage());
+                        // Расход по usage этого запроса учтён — проверяем лимит
+                        // даже при сбое записи, а не только после успешной пары.
+                        showSessionLimitNoticeIfAny(ui, agent);
                         return 1;
                     } catch (AgentException e) {
                         // Обычную ошибку запроса показываем; чат можно продолжить.
                         // При прерывании корректно завершаем работу.
                         ui.showError(e.getMessage());
+                        // Пустой или обрезанный ответ с usage тоже учтён —
+                        // информационное сообщение о лимите показываем и здесь.
+                        showSessionLimitNoticeIfAny(ui, agent);
                         if (Thread.currentThread().isInterrupted()) {
                             ui.showSystem("Работа завершена. История беседы сохранена.");
                             return 0;
@@ -130,9 +137,20 @@ public final class Main {
         return summary;
     }
 
+    /** Краткое описание лимита расхода за сессию при запуске. */
+    static String describeSessionLimit(ModelSettings settings) {
+        Long limit = settings.sessionTokenLimit();
+        if (limit == null) {
+            return "Лимит расхода токенов за сессию: не задан (LLM_SESSION_TOKEN_LIMIT).";
+        }
+        return "Лимит расхода токенов за сессию: " + limit
+                + " (LLM_SESSION_TOKEN_LIMIT) — информационное уведомление при превышении.";
+    }
+
     /**
      * Краткие заметки после ответа: предупреждение об урезанном контексте,
-     * о возможном обрезании по лимиту и диагностика (если включена).
+     * о возможном обрезании по лимиту, информационное сообщение о превышении
+     * лимита сессии (независимо от LLM_DIAGNOSTICS) и диагностика.
      * Не содержит текстов переписки и секретов — только счётчики и метрики.
      */
     private static void showAnswerNotes(TerminalUi ui, LlmAgent agent, String model) {
@@ -151,9 +169,19 @@ public final class Main {
                     + "Для более подробного ответа переключите профиль: /mode detailed, "
                     + "или задайте LLM_MAX_OUTPUT_TOKENS.");
         }
+        // Информационный лимит сессии: показывается независимо от диагностики.
+        showSessionLimitNoticeIfAny(ui, agent);
         if (agent.currentSettings().diagnostics()) {
             ui.showSystem(formatDiagnostics(diagnostics, model, agent.sessionStats(),
                     agent.currentSettings()));
+        }
+    }
+
+    /** Показ отложенного уведомления о лимите сессии, если оно есть. */
+    private static void showSessionLimitNoticeIfAny(TerminalUi ui, LlmAgent agent) {
+        String notice = agent.consumeSessionLimitNotice();
+        if (notice != null) {
+            ui.showSystem(notice);
         }
     }
 
@@ -315,8 +343,142 @@ public final class Main {
             text.append("\n  итог: НЕПОЛНЫЙ (есть запросы без usage или с частичным usage; ")
                     .append("расход таких запросов не учтён)");
         }
+        text.append("\n  ").append(limitStatsLine(agent));
         text.append("\n  ").append(costLine(settings, stats, anyUsage));
         return text.toString();
+    }
+
+    /**
+     * Строка лимита сессии для /stats: включён/отключён, значение,
+     * учтённый расход, полнота данных и статус.
+     */
+    private static String limitStatsLine(LlmAgent agent) {
+        Long limit = agent.currentSettings().sessionTokenLimit();
+        SessionTokenStats.Snapshot stats = agent.sessionStats();
+        long known = stats.knownTotal();
+        if (limit == null) {
+            return "лимит сессии: отключён (LLM_SESSION_TOKEN_LIMIT не задана)"
+                    + " · учтённый расход: " + known;
+        }
+        String line = "лимит сессии: " + limit + " · учтённый расход: " + known
+                + " · статус: " + limitStatus(stats, limit);
+        if (stats.complete()) {
+            if (known < limit) {
+                line += " · остаток до лимита: " + (limit - known);
+            } else if (known > limit) {
+                line += " · превышение: " + (known - limit);
+            }
+        } else if (known <= limit) {
+            // Неполные данные: не утверждаем, что фактический расход в пределах.
+            line += " · учтено не менее " + known
+                    + " токенов; фактический расход может быть выше";
+        }
+        return line;
+    }
+
+    /** Статус лимита: не превышен / достигнут / превышен / неопределён из-за неполных данных. */
+    private static String limitStatus(SessionTokenStats.Snapshot stats, long limit) {
+        long known = stats.knownTotal();
+        if (!stats.complete()) {
+            if (known > limit) {
+                return "превышен как минимум (данные неполные)";
+            }
+            return "нельзя достоверно определить из-за неполных данных";
+        }
+        if (known > limit) {
+            return "превышен";
+        }
+        if (known == limit) {
+            return "достигнут";
+        }
+        return "не превышен";
+    }
+
+    /**
+     * /limit — текущий лимит сессии: значение, учтённый расход, статус
+     * и напоминание, что это уведомление, а не жёсткая квота.
+     */
+    static String formatLimit(LlmAgent agent) {
+        Long limit = agent.currentSettings().sessionTokenLimit();
+        SessionTokenStats.Snapshot stats = agent.sessionStats();
+        long known = stats.knownTotal();
+        StringBuilder text = new StringBuilder();
+        if (limit == null) {
+            text.append("Лимит расхода токенов за сессию: отключён ")
+                    .append("(LLM_SESSION_TOKEN_LIMIT не задана).");
+        } else {
+            text.append("Лимит расхода токенов за сессию: ").append(limit)
+                    .append(" (LLM_SESSION_TOKEN_LIMIT).");
+        }
+        if (stats.complete()) {
+            text.append("\n  учтённый расход: ").append(known)
+                    .append(" (полные данные, запросов с usage: ")
+                    .append(stats.requestsWithUsage()).append(")");
+        } else {
+            text.append("\n  учтённый расход (неполные данные): не менее ").append(known)
+                    .append(" — для части запросов usage неполный или отсутствует; ")
+                    .append("фактический расход может быть выше");
+        }
+        if (limit != null) {
+            text.append("\n  статус: ").append(limitStatus(stats, limit));
+            if (stats.complete()) {
+                if (known < limit) {
+                    text.append(" · остаток до лимита: ").append(limit - known);
+                } else if (known > limit) {
+                    text.append(" · превышение: ").append(known - limit).append(" токенов");
+                }
+            }
+            text.append("\n  это уведомление о расходе, а не жёсткая квота; изменить: /limit <число>,")
+                    .append(" отключить: /limit off");
+        }
+        return text.toString();
+    }
+
+    /**
+     * /limit — показать статус; /limit <число> — установить информационный
+     * лимит расхода за сессию до конца текущего запуска; /limit off —
+     * отключить уведомления. Команды не вызывают API, не меняют историю,
+     * не сбрасывают накопленный расход и не изменяют .env. При некорректном
+     * вводе — подсказка, прежняя настройка сохраняется.
+     */
+    private static void handleLimitCommand(TerminalUi ui, LlmAgent agent, String normalized) {
+        String prefix = "/limit";
+        String argument = normalized.length() > prefix.length()
+                ? normalized.substring(prefix.length()).trim()
+                : "";
+        if (argument.isEmpty()) {
+            ui.showSystem(formatLimit(agent));
+            return;
+        }
+        if ("off".equals(argument)) {
+            agent.setSessionTokenLimit(null);
+            ui.showSystem("Уведомление по лимиту сессии отключено. "
+                    + "Накопленный расход сохранён: "
+                    + agent.sessionStats().knownTotal() + ".");
+            return;
+        }
+        long value;
+        try {
+            value = Long.parseLong(argument);
+        } catch (NumberFormatException e) {
+            // В том числе переполнение диапазона.
+            ui.showError("Лимит должен быть положительным целым числом или off. "
+                    + "Примеры: /limit 5000, /limit off. Прежняя настройка сохранена.");
+            return;
+        }
+        if (value <= 0) {
+            ui.showError("Лимит должен быть положительным целым числом или off. "
+                    + "Примеры: /limit 5000, /limit off. Прежняя настройка сохранена.");
+            return;
+        }
+        // Установка лимита не сбрасывает расход. Если учтённый расход уже
+        // превышает новый порог и об этом ещё не сообщали — сообщение сразу.
+        String immediateNotice = agent.setSessionTokenLimit(value);
+        ui.showSystem("Лимит сессии установлен: " + value
+                + ". Действует до конца текущего запуска; накопленный расход сохранён.");
+        if (immediateNotice != null) {
+            ui.showSystem(immediateNotice);
+        }
     }
 
     /** Полная строка стоимости для /stats; без тарифа — «нет данных», не 0. */
@@ -379,6 +541,7 @@ public final class Main {
             case "/history" -> ui.showHistory(agent.getHistory());
             case "/tokens" -> ui.showSystem(formatTokens(agent, model));
             case "/stats" -> ui.showSystem(formatStats(agent));
+            case "/limit" -> handleLimitCommand(ui, agent, "/limit");
             case "/reset" -> {
                 if (agent.getHistory().isEmpty() || ui.confirmReset()) {
                     try {
@@ -402,6 +565,8 @@ public final class Main {
             default -> {
                 if (normalized.equals("/mode") || normalized.startsWith("/mode ")) {
                     handleModeCommand(ui, agent, normalized);
+                } else if (normalized.equals("/limit") || normalized.startsWith("/limit ")) {
+                    handleLimitCommand(ui, agent, normalized);
                 } else {
                     ui.showSystem("Неизвестная команда. Введите /help для справки.");
                 }
@@ -445,6 +610,7 @@ public final class Main {
         out.println("LLM_TEMPERATURE, LLM_REQUEST_TIMEOUT_SECONDS, LLM_CONTEXT_MAX_TURNS,");
         out.println("LLM_CONTEXT_WINDOW_TOKENS, LLM_CONTEXT_OVERFLOW_POLICY (warn/block),");
         out.println("LLM_INPUT_PRICE_PER_1M, LLM_OUTPUT_PRICE_PER_1M (USD за 1M токенов),");
+        out.println("LLM_SESSION_TOKEN_LIMIT (информационный лимит сессии),");
         out.println("LLM_DIAGNOSTICS, LLM_HISTORY_FILE");
         out.println("(при запуске через launcher загружаются из локального .env проекта).");
         out.println();
@@ -452,8 +618,8 @@ public final class Main {
         out.println("по умолчанию) и восстанавливается при следующем запуске;");
         out.println("переменная LLM_HISTORY_FILE задаёт другой абсолютный путь.");
         out.println();
-        out.println("Команды чата: /help, /history, /tokens, /stats, /reset, /clear, /multiline,");
-        out.println("/exit (также exit, quit).");
+        out.println("Команды чата: /help, /history, /tokens, /stats, /limit, /reset, /clear,");
+        out.println("/multiline, /exit (также exit, quit).");
     }
 
     private Main() {

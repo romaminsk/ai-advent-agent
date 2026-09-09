@@ -129,6 +129,7 @@ final class PlainTerminalUi implements TerminalUi {
         err.println("  /history   — история текущего диалога");
         err.println("  /tokens    — оценка токенов истории, контекста и резервов (без вызова API)");
         err.println("  /stats     — фактический расход токенов и стоимость за сессию (без вызова API)");
+        err.println("  /limit     — лимит расхода за сессию: /limit показать, /limit <число>, /limit off");
         err.println("  /reset     — очистить контекст и начать новую беседу");
         err.println("  /clear     — очистить экран, не удаляя историю диалога");
         err.println("  /multiline — многострочный ввод (/send — отправить, /cancel — отмена)");

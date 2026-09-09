@@ -139,6 +139,8 @@ public final class SelfTest {
             checkErrorClassification();
             checkTokensStatsCommandsNoApi();
             checkOldHistoryCompatible();
+            checkSessionTokenLimitSettings();
+            checkSessionTokenLimitFeature();
             checkTwoProcessIntegration();
         } finally {
             deleteRecursively(baseTempDir);
@@ -2213,6 +2215,288 @@ public final class SelfTest {
             expect("справка plain-режима содержит /tokens и /stats",
                     err.text().contains("/tokens") && err.text().contains("/stats"));
             store.close();
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    // ---------- День 8+: лимит расхода токенов за сессию ----------
+
+    /** Агент с информационным лимитом сессии из окружения. */
+    private static LlmAgent newAgentLimit(Config config, HttpClient client,
+                                          JsonConversationStore store, long limit) {
+        Map<String, String> env = new java.util.HashMap<>();
+        env.put("LLM_SESSION_TOKEN_LIMIT", String.valueOf(limit));
+        return new LlmAgent(config, ModelSettings.from(env), client, store);
+    }
+
+    private static void checkSessionTokenLimitSettings() {
+        Map<String, String> env = new java.util.HashMap<>();
+        expect("без переменной лимит сессии отключён",
+                ModelSettings.from(env).sessionTokenLimit() == null);
+        env.put("LLM_SESSION_TOKEN_LIMIT", "5000");
+        expect("положительное значение читается как long",
+                ModelSettings.from(env).sessionTokenLimit() == 5000L);
+        expectSettingsError(env, "LLM_SESSION_TOKEN_LIMIT", "0");
+        expectSettingsError(env, "LLM_SESSION_TOKEN_LIMIT", "-1");
+        expectSettingsError(env, "LLM_SESSION_TOKEN_LIMIT", "5.5");
+        expectSettingsError(env, "LLM_SESSION_TOKEN_LIMIT", "abc");
+        expectSettingsError(env, "LLM_SESSION_TOKEN_LIMIT", "99999999999999999999999");
+    }
+
+    private static void checkSessionTokenLimitFeature() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        AtomicInteger hitCounter = new AtomicInteger();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            hitCounter.incrementAndGet();
+            // Маркер более длинного сценария проверяется первым: после первого
+            // запроса маркеры попадают в историю и уходят в следующих телах.
+            if (requestBody.contains("case=partial-big")) {
+                return new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                        + "\"content\":\"Ответ P2\"}}],\"usage\":{\"prompt_tokens\":600}}")
+                        .getBytes(StandardCharsets.UTF_8));
+            }
+            if (requestBody.contains("case=partial-small")) {
+                return new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                        + "\"content\":\"Ответ P1\"}}],\"usage\":{\"prompt_tokens\":10}}")
+                        .getBytes(StandardCharsets.UTF_8));
+            }
+            if (requestBody.contains("case=no-usage")) {
+                return new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                        + "\"content\":\"Ответ U\"}}]}").getBytes(StandardCharsets.UTF_8));
+            }
+            if (requestBody.contains("case=empty-with-usage")) {
+                return new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                        + "\"content\":\"\"}}],\"usage\":{\"prompt_tokens\":1000,"
+                        + "\"completion_tokens\":2000,\"total_tokens\":9000}}")
+                        .getBytes(StandardCharsets.UTF_8));
+            }
+            return new Response(200, ("{\"choices\":[{\"finish_reason\":\"stop\","
+                    + "\"message\":{\"role\":\"assistant\",\"content\":\"Ответ "
+                    + hitCounter.get() + "\"}}],\"usage\":{\"prompt_tokens\":100,"
+                    + "\"completion_tokens\":50,\"total_tokens\":500}}")
+                    .getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort() + "/v1/chat/completions",
+                    "glm-5.3-flash");
+            HttpClient client = trustedHttpClient(keyStore);
+
+            // Расход меньше лимита: уведомления нет, показывается остаток.
+            JsonConversationStore underStore = tempStore();
+            LlmAgent underAgent = newAgentLimit(config, client, underStore, 400);
+            underAgent.ask("вопрос до лимита");
+            expect("расход меньше лимита: уведомления нет",
+                    underAgent.consumeSessionLimitNotice() == null);
+            String underStatus = Main.formatLimit(underAgent);
+            expect("статус «не превышен» с остатком до лимита",
+                    underStatus.contains("не превышен")
+                            && underStatus.contains("остаток до лимита: 250"));
+            underStore.close();
+
+            // Расход равен лимиту: «достигнут», уведомление о превышении не выводится.
+            JsonConversationStore equalStore = tempStore();
+            LlmAgent equalAgent = newAgentLimit(config, client, equalStore, 150);
+            equalAgent.ask("вопрос на границе лимита");
+            expect("расход равен лимиту: уведомления о превышении нет",
+                    equalAgent.consumeSessionLimitNotice() == null);
+            String equalStatus = Main.formatLimit(equalAgent);
+            expect("при равенстве статус «достигнут» без превышения",
+                    equalStatus.contains("достигнут")
+                            && !equalStatus.contains("превышен")
+                            && !equalStatus.contains("превышение"));
+            equalStore.close();
+
+            // Пересечение: уведомление один раз, не повторяется на следующих
+            // запросах; после превышения запросы по-прежнему разрешены;
+            // total_tokens не суммируется повторно.
+            JsonConversationStore crossStore = tempStore();
+            LlmAgent crossAgent = newAgentLimit(config, client, crossStore, 200);
+            crossAgent.ask("первый вопрос с лимитом");
+            expect("до пересечения уведомления нет",
+                    crossAgent.consumeSessionLimitNotice() == null);
+            crossAgent.ask("второй вопрос с лимитом");
+            String firstNotice = crossAgent.consumeSessionLimitNotice();
+            expect("при пересечении показывается уведомление с деталями",
+                    firstNotice != null
+                            && firstNotice.contains("Лимит токенов за сессию превышен")
+                            && firstNotice.contains("Установленный лимит: 200")
+                            && firstNotice.contains("Учтённый расход: 300")
+                            && firstNotice.contains("Превышение: 100 токенов")
+                            && firstNotice.contains("Агент продолжает работу")
+                            && firstNotice.contains("/limit off"));
+            expect("уведомление однократное: повторное чтение пусто",
+                    crossAgent.consumeSessionLimitNotice() == null);
+            String thirdAnswer = crossAgent.ask("третий вопрос с лимитом");
+            expect("после превышения следующий запрос разрешён",
+                    thirdAnswer.contains("Ответ") && crossAgent.consumeSessionLimitNotice() == null);
+            SessionTokenStats.Snapshot crossStats = crossAgent.sessionStats();
+            expect("total_tokens не учитывается повторно (450, а не 1500)",
+                    crossStats.totalPromptTokens() == 300
+                            && crossStats.totalCompletionTokens() == 150
+                            && crossStats.knownTotal() == 450);
+            crossStore.close();
+
+            // Команды /limit через диспетчер Main: установка, off, повторы,
+            // понижение/повышение и некорректные значения.
+            JsonConversationStore cmdStore = tempStore();
+            LlmAgent cmdAgent = newAgentLimit(config, client, cmdStore, 200);
+            cmdAgent.ask("командный вопрос 1");
+            cmdAgent.ask("командный вопрос 2");
+            expect("первое превышение по порогу из окружения зафиксировано",
+                    cmdAgent.consumeSessionLimitNotice() != null);
+            int hitsBeforeCommands = hitCounter.get();
+            int historyBeforeCommands = cmdAgent.getHistory().size();
+            FakeUi limitUi = new FakeUi(
+                    TerminalUi.Input.command("/limit"),
+                    TerminalUi.Input.command("/limit 200"),
+                    TerminalUi.Input.command("/limit 500"),
+                    TerminalUi.Input.command("/limit 100"),
+                    TerminalUi.Input.command("/limit off"),
+                    TerminalUi.Input.command("/limit"),
+                    TerminalUi.Input.message("вопрос после отключения лимита"),
+                    TerminalUi.Input.command("/limit 100"),
+                    TerminalUi.Input.command("/limit 90"),
+                    TerminalUi.Input.command("/limit zero"),
+                    TerminalUi.Input.command("/limit 0"),
+                    TerminalUi.Input.command("/limit -5"),
+                    TerminalUi.Input.command("/limit 5.5"),
+                    TerminalUi.Input.command("/limit 99999999999999999999999"),
+                    TerminalUi.Input.command("/limit"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(limitUi, cmdAgent, "glm-5.3-flash");
+            expect("при запуске сообщается, включён ли лимит сессии",
+                    limitUi.systems.stream().anyMatch(s ->
+                            s.contains("Лимит расхода токенов за сессию: 200")));
+            expect("/limit показывает статус превышенного лимита",
+                    limitUi.systems.stream().anyMatch(s ->
+                            s.contains("Лимит расхода токенов за сессию: 200")
+                                    && s.contains("статус: превышен")));
+            expect("повторная установка того же лимита без дублирующего уведомления",
+                    limitUi.systems.stream().noneMatch(s ->
+                            s.contains("Установленный лимит: 200")));
+            expect("повышение лимита выше расхода не создаёт уведомления",
+                    limitUi.systems.stream().noneMatch(s ->
+                            s.contains("Установленный лимит: 500")));
+            expect("установка порога ниже расхода даёт сообщение сразу",
+                    limitUi.systems.stream().filter(s ->
+                            s.contains("Установленный лимит: 100")).count() == 1);
+            expect("/limit off отключает уведомления и сохраняет расход",
+                    limitUi.systems.stream().anyMatch(s ->
+                            s.contains("Уведомление по лимиту сессии отключено")
+                                    && s.contains("Накопленный расход сохранён: 300")));
+            expect("после отключения статус «отключён»",
+                    limitUi.systems.stream().anyMatch(s ->
+                            s.contains("Лимит расхода токенов за сессию: отключён")));
+            expect("после превышения запрос по-прежнему выполнен",
+                    limitUi.messages.size() == 1);
+            expect("повторное включение того же порога не дублирует уведомление",
+                    limitUi.systems.stream().filter(s ->
+                            s.contains("Установленный лимит: 100")).count() == 1);
+            expect("понижение до нового порога даёт уведомление сразу",
+                    limitUi.systems.stream().filter(s ->
+                            s.contains("Установленный лимит: 90")).count() == 1);
+            expect("некорректные значения отклоняются с подсказкой (5 попыток)",
+                    limitUi.errors.stream().filter(s ->
+                            s.contains("положительным целым числом")).count() == 5);
+            expect("после некорректного ввода прежняя настройка сохранена",
+                    limitUi.systems.stream().anyMatch(s ->
+                            s.contains("Лимит расхода токенов за сессию: 90")));
+            expect("уведомления по лимиту не привязаны к диагностике",
+                    limitUi.systems.stream().noneMatch(s -> s.contains("Диагностика:")));
+            expect("команды лимита не вызывают API",
+                    hitCounter.get() == hitsBeforeCommands + 1);
+            expect("команды лимита не меняют историю",
+                    cmdAgent.getHistory().size() == historyBeforeCommands + 2);
+            expect("изменение лимита не сбрасывает накопленный расход",
+                    cmdAgent.sessionStats().knownTotal() == 450);
+            cmdStore.close();
+
+            // Неполный usage: расход «не менее», статус неопределён.
+            JsonConversationStore partialStore = tempStore();
+            LlmAgent partialAgent = newAgentLimit(config, client, partialStore, 50);
+            partialAgent.ask("case=partial-small");
+            expect("частичный usage ниже лимита: уведомления нет",
+                    partialAgent.consumeSessionLimitNotice() == null);
+            String partialStatus = Main.formatLimit(partialAgent);
+            expect("неполные данные: расход «не менее» и статус неопределён",
+                    partialStatus.contains("не менее 10")
+                            && partialStatus.contains("нельзя достоверно определить")
+                            && partialStatus.contains("фактический расход может быть выше"));
+            partialAgent.ask("case=partial-big");
+            String partialNotice = partialAgent.consumeSessionLimitNotice();
+            expect("превышение при неполном usage обозначается как минимум",
+                    partialNotice != null
+                            && partialNotice.contains("не менее 610")
+                            && partialNotice.contains("Превышение: не менее 560 токенов")
+                            && partialNotice.contains("фактический расход может быть выше"));
+            partialStore.close();
+
+            // Отсутствие usage: расход неизвестен, уведомления нет.
+            JsonConversationStore noUsageStore = tempStore();
+            LlmAgent noUsageAgent = newAgentLimit(config, client, noUsageStore, 50);
+            noUsageAgent.ask("case=no-usage");
+            expect("без usage расход неизвестен и уведомления нет",
+                    noUsageAgent.consumeSessionLimitNotice() == null);
+            expect("статус с отсутствующим usage — «нельзя достоверно определить»",
+                    Main.formatLimit(noUsageAgent).contains("нельзя достоверно определить"));
+            noUsageStore.close();
+
+            // Пустой ответ с usage через Main: уведомление показывается
+            // при выключенной диагностике; история не меняется; далее чат жив.
+            JsonConversationStore emptyStore = tempStore();
+            Map<String, String> emptyEnv = new java.util.HashMap<>();
+            emptyEnv.put("LLM_SESSION_TOKEN_LIMIT", "50");
+            LlmAgent emptyAgent = new LlmAgent(config, ModelSettings.from(emptyEnv), client, emptyStore);
+            FakeUi emptyUi = new FakeUi(
+                    TerminalUi.Input.message("case=empty-with-usage"),
+                    TerminalUi.Input.message("обычный вопрос после пустого"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(emptyUi, emptyAgent, "glm-5.3-flash");
+            expect("пустой ответ распознаётся ошибкой",
+                    emptyUi.errors.stream().anyMatch(s -> s.contains("пустой итоговый ответ")));
+            expect("уведомление о лимите показано при пустом ответе с usage",
+                    emptyUi.systems.stream().anyMatch(s ->
+                            s.contains("Лимит токенов за сессию превышен")
+                                    && s.contains("Установленный лимит: 50")
+                                    && s.contains("Учтённый расход: 3000")));
+            expect("уведомление показывается при выключенной диагностике",
+                    emptyUi.systems.stream().noneMatch(s -> s.contains("Диагностика:")));
+            expect("после пустого ответа история не изменилась",
+                    emptyAgent.getHistory().size() == 2);
+            expect("после превышения следующим сообщением получен ответ",
+                    emptyUi.messages.size() == 1);
+            emptyStore.close();
+
+            // Перезапуск: расход сессии сбрасывается, история сохраняется.
+            Path restartFile = Files.createTempDirectory(baseTempDir, "limit-restart-")
+                    .resolve("conversation.json");
+            Map<String, String> restartEnv = new java.util.HashMap<>();
+            restartEnv.put("LLM_SESSION_TOKEN_LIMIT", "200");
+            int historyBeforeRestart;
+            try (JsonConversationStore restartStore = new JsonConversationStore(restartFile)) {
+                LlmAgent first = new LlmAgent(config, ModelSettings.from(restartEnv),
+                        client, restartStore);
+                first.ask("вопрос до перезапуска");
+                first.ask("второй вопрос до перезапуска");
+                expect("перед перезапуском расход учтён",
+                        first.sessionStats().knownTotal() == 300);
+                historyBeforeRestart = first.getHistory().size();
+            }
+            try (JsonConversationStore reopened = new JsonConversationStore(restartFile)) {
+                LlmAgent second = new LlmAgent(config, ModelSettings.from(restartEnv),
+                        client, reopened);
+                expect("перезапуск сбрасывает расход сессии",
+                        second.sessionStats().apiAttempts() == 0
+                                && second.sessionStats().knownTotal() == 0);
+                expect("перезапуск сохраняет историю",
+                        second.hasRestoredContext()
+                                && second.getHistory().size() == historyBeforeRestart);
+                expect("после перезапуска уведомлений нет",
+                        second.consumeSessionLimitNotice() == null);
+            }
         } finally {
             server.stop(0);
             Files.deleteIfExists(keyStore);
