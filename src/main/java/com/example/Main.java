@@ -70,7 +70,10 @@ public final class Main {
         DemoRef demoRef = new DemoRef();
         try {
             ui.showWelcome(model);
+            // Ход долгих операций (суммаризация) — в терминал во время запроса.
+            agent.setProgressListener(ui::showSystem);
             ui.showSystem(describeMode(agent.currentSettings()));
+            ui.showSystem(describeContextMode(agent));
             ui.showSystem(describeSessionLimit(agent.currentSettings()));
             if (agent.hasRestoredContext()) {
                 ui.showSystem("Контекст восстановлен: "
@@ -89,6 +92,12 @@ public final class Main {
                         String normalized = input.text().toLowerCase(java.util.Locale.ROOT);
                         if (normalized.equals("/demo") || normalized.startsWith("/demo ")) {
                             handleDemoCommand(ui, agent, model, normalized, demoRef);
+                        } else if (normalized.equals("/context") || normalized.startsWith("/context ")
+                                || normalized.equals("/summary")
+                                || normalized.startsWith("/summary ")) {
+                            // Пока демо активно, команды относятся к демо-беседе.
+                            LlmAgent activeAgent = activeAgent(demoRef, agent);
+                            handleContextCommand(ui, activeAgent, input.text(), normalized, demoRef);
                         } else {
                             // Пока демо активно, команды относятся к демо-беседе.
                             LlmAgent activeAgent = activeAgent(demoRef, agent);
@@ -117,11 +126,13 @@ public final class Main {
                                 showSessionLimitNoticeIfAny(ui, activeAgent);
                             } else {
                                 showAnswerNotes(ui, agent, model);
-                            }
-                        } catch (ConversationSaveException e) {
+                            }                        } catch (ConversationSaveException e) {
                             // Ответ уже получен и показывается; повторный платный
                             // запрос не выполняется. Продолжать чат нельзя: контекст
                             // остался бы неполным, поэтому завершаем с ошибкой.
+                            for (String note : activeAgent.consumeContextNotes()) {
+                                ui.showSystem(note);
+                            }
                             ui.showMessage(e.getAnswer());
                             ui.showError(e.getMessage());
                             // Расход по usage этого запроса учтён — проверяем лимит
@@ -135,6 +146,9 @@ public final class Main {
                         } catch (AgentException e) {
                             // Обычную ошибку запроса показываем; чат можно продолжить.
                             // При прерывании корректно завершаем работу.
+                            for (String note : activeAgent.consumeContextNotes()) {
+                                ui.showSystem(note);
+                            }
                             ui.showError(e.getMessage());
                             if (demoRef.demo != null) {
                                 demoRef.demo.logFailure(e);
@@ -197,6 +211,7 @@ public final class Main {
                     return;
                 }
                 demoRef.demo = demo;
+                demo.agent().setProgressListener(ui::showSystem);
                 ui.setActiveModeLabel("демо");
                 ui.showSystem("""
                                 Режим измерения токенов включён.
@@ -238,6 +253,22 @@ public final class Main {
         return "Профиль: " + modeSummary(settings);
     }
 
+    /** Описание режима контекста и параметров сжатия (День 9). */
+    static String describeContextMode(LlmAgent agent) {
+        ModelSettings s = agent.currentSettings();
+        StringBuilder text = new StringBuilder("Режим контекста: ").append(s.contextMode().title())
+                .append(" · последние ").append(s.keepLastMessages())
+                .append(" сообщений сохраняются дословно")
+                .append(" · порог обновления резюме: ").append(s.summaryBatchMessages())
+                .append(" сообщений")
+                .append(" · лимит генерации резюме: ").append(s.summaryMaxOutputTokens());
+        if (agent.contextMaxTurnsConfigured()) {
+            text.append("\n  LLM_CONTEXT_MAX_TURNS задана, но в режимах контекста full/summary ")
+                    .append("(День 9) не применяется — отмечается и в /tokens");
+        }
+        return text.toString();
+    }
+
     private static String modeSummary(ModelSettings settings) {
         String summary = settings.profile() + " · лимит генерации: " + settings.maxOutputTokens();
         if (settings.limitOverridden()) {
@@ -263,6 +294,12 @@ public final class Main {
      * Не содержит текстов переписки и секретов — только счётчики и метрики.
      */
     private static void showAnswerNotes(TerminalUi ui, LlmAgent agent, String model) {
+        // Заметки о сжатии (обновление summary в обычном запросе) и Day-9
+        // блок с режимом контекста и расходом — независимо от диагностики.
+        for (String note : agent.consumeContextNotes()) {
+            ui.showSystem(note);
+        }
+        ui.showSystem(formatContextNotes(agent));
         RequestDiagnostics diagnostics = agent.getLastDiagnostics();
         if (diagnostics == null) {
             return;
@@ -284,6 +321,55 @@ public final class Main {
             ui.showSystem(formatDiagnostics(diagnostics, model, agent.sessionStats(),
                     agent.currentSettings()));
         }
+    }
+
+    /**
+     * Компактный блок после обычного ответа (День 9): режим контекста,
+     * покрытие резюме, дословные сообщения, фактический расход обычного
+     * запроса, отдельный расход суммаризации за сессию и общий расход.
+     * Показывается независимо от LLM_DIAGNOSTICS.
+     */
+    static String formatContextNotes(LlmAgent agent) {
+        ModelSettings settings = agent.currentSettings();
+        SessionTokenStats.Snapshot stats = agent.sessionStats();
+        RequestDiagnostics d = agent.getLastDiagnostics();
+        ConversationSummary summary = agent.summary();
+        StringBuilder text = new StringBuilder("Режим контекста: ")
+                .append(settings.contextMode().title());
+        if (settings.contextMode() == ContextMode.SUMMARY) {
+            if (summary == null) {
+                text.append(" · резюме: нет (или устарело)")
+                        .append(" · дословно: ").append(d == null ? "нет данных" : d.sentMessages() - 2)
+                        .append(" сообщений");
+            } else {
+                text.append(" · покрыто резюме: ").append(summary.coveredMessages())
+                        .append(" сообщений");
+                if (d != null) {
+                    text.append(" · дословно: ").append(d.includedPairs() * 2).append(" сообщений");
+                }
+            }
+        }
+        if (d != null) {
+            text.append("\n  вход обычного запроса: ").append(orNoData(d.promptTokens()))
+                    .append(" · выход: ").append(orNoData(d.completionTokens()));
+        }
+        if (stats.summaryAttempts() > 0) {
+            text.append("\n  расход суммаризации (за сессию): вход ")
+                    .append(usageTotals(stats.summaryPromptTokens(), stats))
+                    .append(" · выход ").append(usageTotals(stats.summaryCompletionTokens(), stats))
+                    .append(" · попыток ").append(stats.summaryAttempts());
+            if (agent.lastSummaryCallNanos() != null) {
+                text.append(" · последний вызов ").append(agent.lastSummaryCallNanos() / 1_000_000)
+                        .append(" мс");
+            }
+        }
+        text.append("\n  накопленный общий расход сессии (обычные ответы, суммаризация")
+                .append(" и сравнение): ").append(stats.knownTotal());
+        if (stats.apiAttempts() > 0 && !stats.complete()) {
+            text.append(" (неполные данные)");
+        }
+        text.append("\n  ").append(costSummaryLine(settings, stats));
+        return text.toString();
     }
 
     /** Показ отложенного уведомления о лимите сессии, если оно есть. */
@@ -378,39 +464,45 @@ public final class Main {
     // ---------- Токены и статистика сессии (команды без вызова API) ----------
 
     /**
-     * /tokens — локальная оценка (≈) без вызова API: сохранённая история,
-     * контекст следующего запроса с текущим ограничением отправки (без ещё
+     * /tokens — локальная оценка (≈) без вызова API: сохранённый архив,
+     * отправляемый контекст следующего запроса в режиме контекста (без ещё
      * не введённого сообщения), резерв выхода и контекстное окно.
      * Прогноз не выдаётся за измеренный запрос.
      */
     static String formatTokens(LlmAgent agent, String model) {
         ModelSettings settings = agent.currentSettings();
         List<ChatMessage> history = agent.getHistory();
-        int pairLimit = agent.nextContextPairLimit();
-        int includedPairs = Math.min(history.size() / 2, pairLimit);
-        int omittedPairs = history.size() / 2 - includedPairs;
+        ConversationSummary summary = agent.summary();
+        int covered = summary != null ? summary.coveredMessages() : 0;
+        int sent = history.size() - covered;
 
         StringBuilder text = new StringBuilder("Токены (без вызова API); источник подсчёта: ")
                 .append(agent.tokenCounter().description());
         text.append("\n  модель ").append(model)
                 .append(" · профиль ").append(settings.profile())
+                .append(" · режим контекста ").append(settings.contextMode().title())
                 .append(" · резерв выхода (max_tokens): ").append(settings.maxOutputTokens());
-        text.append("\n  сохранённая история: ").append(history.size()).append(" сообщений (")
+        text.append("\n  сохранённый архив: ").append(history.size()).append(" сообщений (")
                 .append(history.size() / 2).append(" пар) · ≈")
                 .append(agent.estimateHistoryTokens())
                 .append(" токенов — system-инструкция не входит (не хранится в истории), ")
                 .append("метаданные JSON-файла не учитываются");
-        text.append("\n  контекст следующего запроса (без нового сообщения): system + ")
-                .append(includedPairs).append(" пар · ≈")
-                .append(agent.estimateNextContextTokens()).append(" токенов");
-        if (omittedPairs > 0) {
-            text.append(" · без ").append(omittedPairs)
-                    .append(" более ранних пар (ограничение LLM_CONTEXT_MAX_TURNS=")
-                    .append(pairLimit).append(")");
-        } else if (settings.contextMaxTurns() != null) {
-            text.append(" · ограничение LLM_CONTEXT_MAX_TURNS=").append(pairLimit);
-        } else {
-            text.append(" · лимит пар не задан (по умолчанию ").append(pairLimit).append(")");
+        text.append("\n  отправляемый контекст следующего запроса (без нового сообщения): ")
+                .append("system + ").append(sent).append(" сообщений дословно");
+        if (settings.contextMode() == ContextMode.SUMMARY) {
+            if (summary == null) {
+                text.append(" · резюме ещё не создано (или устарело)");
+            } else {
+                text.append(" + справочное резюме: покрыто ").append(covered)
+                        .append(" сообщений, текст ≈")
+                        .append(agent.tokenCounter().count(summary.text())).append(" токенов");
+            }
+        }
+        text.append(" · ≈").append(agent.estimateNextContextTokens()).append(" токенов");
+        if (agent.contextMaxTurnsConfigured()) {
+            text.append("\n  LLM_CONTEXT_MAX_TURNS задана, но в режимах контекста full/summary ")
+                    .append("(День 9) не применяется: full отправляет весь архив, summary — ")
+                    .append("резюме и весь несжатый хвост");
         }
         if (settings.contextWindowTokens() != null) {
             text.append("\n  контекстное окно: ").append(settings.contextWindowTokens())
@@ -444,6 +536,17 @@ public final class Main {
                 .append(usageTotals(stats.totalPromptTokens(), stats))
                 .append("\n  выходные токены (фактические, сумма completion_tokens): ")
                 .append(usageTotals(stats.totalCompletionTokens(), stats));
+        // День 9: разбивка по назначениям API-вызовов (без двойного учёта):
+        // сумма групп равна общим суммам выше.
+        text.append("\n  из них обычные ответы: попыток ").append(stats.regularAttempts())
+                .append(" · вход ").append(usageTotals(stats.regularPromptTokens(), stats))
+                .append(" · выход ").append(usageTotals(stats.regularCompletionTokens(), stats));
+        text.append("\n  суммаризация: попыток ").append(stats.summaryAttempts())
+                .append(" · вход ").append(usageTotals(stats.summaryPromptTokens(), stats))
+                .append(" · выход ").append(usageTotals(stats.summaryCompletionTokens(), stats));
+        text.append("\n  сравнение /context compare: попыток ").append(stats.compareAttempts())
+                .append(" · вход ").append(usageTotals(stats.comparePromptTokens(), stats))
+                .append(" · выход ").append(usageTotals(stats.compareCompletionTokens(), stats));
         if (stats.apiAttempts() == 0) {
             text.append("\n  итог: запросов ещё не было");
         } else if (stats.complete()) {
@@ -635,6 +738,266 @@ public final class Main {
         return "стоимость: ≈" + TokenCost.formatUsd(total) + " (расчётная, не списание)";
     }
 
+    // ================= День 9: /context и /summary =================
+
+    /**
+     * День 9: команды /context (показ, full, summary, compare) и /summary
+     * (показ, refresh). Переключение режима API не вызывает; сравнение —
+     * единственная команда, выполняющая API-запросы, и только после явного
+     * подтверждения. Команды в историю не попадают. Вопрос сравнения
+     * передаётся с сохранением регистра (без приведения к нижнему регистру).
+     */
+    private static void handleContextCommand(TerminalUi ui, LlmAgent agent, String raw,
+                                             String normalized, DemoRef demoRef) {
+        String contextArg = normalized.startsWith("/context ")
+                ? normalized.substring("/context ".length()).trim()
+                : normalized.equals("/context") ? "" : null;
+        if (contextArg != null) {
+            switch (contextArg) {
+                case "" -> ui.showSystem(describeContextMode(agent));
+                case "full" -> switchContextMode(ui, agent, "full");
+                case "summary" -> switchContextMode(ui, agent, "summary");
+                default -> {
+                    if (contextArg.startsWith("compare ")) {
+                        String question = raw.substring(raw.toLowerCase(java.util.Locale.ROOT)
+                                .indexOf("compare ") + "compare ".length()).trim();
+                        handleCompareCommand(ui, agent, question, demoRef);
+                    } else {
+                        ui.showSystem("Использование: /context [full|summary], "
+                                + "/context compare <вопрос>.");
+                    }
+                }
+            }
+            return;
+        }
+        if (normalized.equals("/summary")) {
+            ui.showSystem(formatSummary(agent));
+            return;
+        }
+        if (normalized.equals("/summary refresh")) {
+            if (demoRef.demo != null) {
+                ui.showSystem("В демонстрационном режиме сжатие отключено. "
+                        + "Выключите его (/demo stop) и повторите.");
+                return;
+            }
+            ui.showSystem(agent.refreshSummary());
+        }
+    }
+
+    /**
+     * /context full|summary: смена режима без вызова API, без изменений
+     * истории и резюме. При первом включении summary — предупреждение
+     * о расходе служебных запросов; резюме создаётся при следующем обычном
+     * запросе или по /summary refresh.
+     */
+    private static void switchContextMode(TerminalUi ui, LlmAgent agent, String mode) {
+        ContextMode before = agent.currentSettings().contextMode();
+        try {
+            ModelSettings settings = agent.setContextMode(mode);
+            ui.showSystem("Режим контекста изменён: " + settings.contextMode().title()
+                    + ". Действует до конца текущего запуска; история и резюме не изменены. "
+                    + "Summary создаётся при следующем обычном запросе, когда накопится "
+                    + "порог, либо по /summary refresh.");
+            if (settings.contextMode() == ContextMode.SUMMARY
+                    && before != ContextMode.SUMMARY) {
+                ui.showSystem("Обновление summary выполняет дополнительные запросы "
+                        + "к текущей модели и расходует токены.");
+            }
+        } catch (AgentException e) {
+            ui.showError(e.getMessage());
+        }
+    }
+
+    /** /summary без вызова API: резюме, граница покрытия и дословный хвост. */
+    static String formatSummary(LlmAgent agent) {
+        ModelSettings s = agent.currentSettings();
+        StringBuilder text = new StringBuilder("Резюме покрытой истории (Day-9 сжатие · без вызова API):");
+        ContextMode mode = s.contextMode();
+        ConversationSummary summary = agent.summary();
+        text.append("\n  режим контекста: ").append(mode.title());
+        if (summary == null) {
+            text.append("\n  резюме: нет")
+                    .append("\n  покрыто сообщений: 0")
+                    .append("\n  дословно сохранено: ").append(agent.getHistory().size())
+                    .append(" сообщений из архива");
+        } else {
+            text.append("\n  покрыто сообщений: ").append(summary.coveredMessages())
+                    .append(" · дословно сохранено: ")
+                    .append(agent.getHistory().size() - summary.coveredMessages())
+                    .append(" сообщений")
+                    .append("\n  отпечаток покрытого префикса: ")
+                    .append(summary.coveredFingerprint());
+            text.append("\n  текст резюме:\n").append(AnsiSanitizer.sanitize(summary.text()));
+        }
+        int uncovered = agent.uncoveredOldMessagesCount();
+        text.append("\n  не покрытых резюме старых сообщений вне последних ")
+                .append(s.keepLastMessages()).append(": ").append(uncovered)
+                .append(uncovered > 0 ? " (обновление: /summary refresh или накопление порога "
+                + s.summaryBatchMessages() + ")" : "");
+        return text.toString();
+    }
+
+    /**
+     * /context compare <вопрос>: два последовательных запроса на одном
+     * снимке истории (без сжатия и со сжатием) после явного подтверждения.
+     * Экспериментальные ответы в историю не попадают; расход учитывается
+     * с отдельными назначениями.
+     */
+    private static void handleCompareCommand(TerminalUi ui, LlmAgent agent, String question,
+                                             DemoRef demoRef) {
+        if (question.isBlank()) {
+            ui.showSystem("Использование: /context compare <вопрос>.");
+            return;
+        }
+        if (agent.getHistory().isEmpty()) {
+            ui.showSystem("История пока пуста: сравнивать не на чем. Введите несколько "
+                    + "сообщений с проверяемыми фактами и повторите.");
+            return;
+        }
+        if (!agent.hasCompressibleOldMessages()) {
+            ui.showSystem("История пока слишком короткая: старых сообщений вне последних "
+                    + agent.currentSettings().keepLastMessages() + " для сжатия нет, "
+                    + "оба варианта запросов были бы одинаковыми.");
+            return;
+        }
+        if (demoRef.demo != null) {
+            ui.showSystem("В демонстрационном режиме сжатие отключено. "
+                    + "Выключите его (/demo stop) и повторите сравнение.");
+            return;
+        }
+        if (!ui.confirmCompare()) {
+            ui.showSystem("Сравнение отменено. API не вызывался, история сохранена.");
+            return;
+        }
+        ui.showSystem("Снимок истории зафиксирован. Выполняются два запроса "
+                + "последовательно…");
+        try (TerminalUi.ProgressIndicator progress = ui.startProgress()) {
+            LlmAgent.CompareResult result = agent.compare(question);
+            showCompareResult(ui, agent, result);
+        }
+        ui.showSystem("Сравнение завершено. Экспериментальные ответы в историю не "
+                + "добавлялись; расход учтён в статистике сессии.");
+    }
+
+    /** Полный вывод сравнения: оба ответа, usage и таблица расхода. */
+    private static void showCompareResult(TerminalUi ui, LlmAgent agent,
+                                          LlmAgent.CompareResult r) {
+        ModelSettings settings = agent.currentSettings();
+        boolean prices = settings.inputPricePer1M() != null
+                && settings.outputPricePer1M() != null;
+
+        ui.showMessage("БЕЗ СЖАТИЯ\n" + (r.fullError() != null
+                ? "(ошибка: " + r.fullError() + ")" : r.fullAnswer()));
+        if (r.fullError() == null) {
+            ui.showSystem("  usage: вход " + orNoData(r.fullPromptTokens())
+                    + " · выход " + orNoData(r.fullCompletionTokens())
+                    + " · время " + ms(r.fullNanos()) + " мс· finish_reason: "
+                    + orNoDataText(r.fullFinishReason()));
+        }
+
+        ui.showMessage("СО СЖАТИЕМ\n" + (r.summaryError() != null
+                ? "(ошибка: " + r.summaryError() + ")" : r.summaryAnswer()));
+        if (r.summaryError() == null) {
+            ui.showSystem("  usage: вход " + orNoData(r.summaryPromptTokens())
+                    + " · выход " + orNoData(r.summaryCompletionTokens())
+                    + " · время " + ms(r.summaryNanos()) + " мс · finish_reason: "
+                    + orNoDataText(r.summaryFinishReason()));
+        }
+
+        boolean fullOk = r.fullError() == null;
+        boolean summaryOk = r.summaryError() == null;
+        boolean previewFailed = !fullOk || !summaryOk
+                || (r.prepPerformed() && r.prepError() != null);
+        if (previewFailed) {
+            ui.showSystem("Внимание: сравнение НЕ полностью успешное — см. ошибки выше.");
+        }
+
+        StringBuilder table = new StringBuilder("Таблица сравнения (фактические значения usage):");
+        table.append("\n  показатель | без сжатия | со сжатием");
+        table.append("\n  вход (prompt_tokens) | ")
+                .append(orNoData(r.fullPromptTokens())).append(" | ")
+                .append(orNoData(r.summaryPromptTokens()));
+        table.append("\n  выход (completion_tokens) | ")
+                .append(orNoData(r.fullCompletionTokens())).append(" | ")
+                .append(orNoData(r.summaryCompletionTokens()));
+        long fullSpend = spend(r.fullPromptTokens(), r.fullCompletionTokens());
+        long summarySpend = spend(r.summaryPromptTokens(), r.summaryCompletionTokens());
+        long prepSpend = spend(r.prepPromptTokens(), r.prepCompletionTokens());
+        table.append("\n  расход запроса | ").append(formatSpend(fullSpend, fullOk))
+                .append(" | ").append(formatSpend(summarySpend, summaryOk));
+        if (r.prepPerformed()) {
+            table.append("\n  подготовка резюме в этом сравнении: ")
+                    .append(r.prepError() != null
+                            ? "не удалась: " + r.prepError()
+                            : formatSpend(prepSpend, true) + " (вход "
+                            + orNoData(r.prepPromptTokens()) + " · выход "
+                            + orNoData(r.prepCompletionTokens()) + ")");
+        } else {
+            table.append("\n  подготовка резюме в этом сравнении: 0 вызовов (переиспользовано ")
+                    .append("ранее созданное резюме; его возможные прошлые затраты отдельно ")
+                    .append("не бесплатны и уже учтены в расходе сессии)");
+        }
+        table.append("\n  общий расход сравнения | ")
+                .append(formatSpend(fullSpend, fullOk))
+                .append(" | ")
+                .append(formatSpend(summarySpend + (r.prepPerformed()
+                        && r.prepError() == null ? prepSpend : 0), summaryOk));
+        table.append("\n  времена: без сжатия ").append(ms(r.fullNanos()))
+                .append(" мс · со сжатием ").append(ms(r.summaryNanos()))
+                .append(" мс · подготовка резюме ")
+                .append(r.prepPerformed() ? ms(r.prepNanos()) + " мс" : "не выполнялась");
+        if (prices) {
+            table.append("\n  стоимость (расчётная по тарифу, не списание): без сжатия ")
+                    .append(TokenCost.formatUsd(TokenCost.total(
+                            TokenCost.perMillion(settings.inputPricePer1M(),
+                                    fullSpendKnown(r)),
+                            TokenCost.perMillion(settings.outputPricePer1M(),
+                                    0))));
+            table.append("\n  (стоимость каждого варианта считайте по входу/выходу выше; ")
+                    .append("кэширование и reasoning-тарифы простой расчёт не учитывает)");
+        } else {
+            table.append("\n  стоимость: нет данных — тариф не настроен");
+        }
+        table.append("\n  экономия входа одного запроса ≠ экономия всего диалога: ")
+                .append("подготовка резюме расходует отдельные токены");
+        table.append("\n  генерации могут различаться даже при одинаковых настройках; ")
+                .append("качество сравнивает пользователь, а не автоматическая оценка");
+        ui.showSystem(table.toString());
+    }
+
+    private static long fullSpendKnown(LlmAgent.CompareResult r) {
+        return spend(r.fullPromptTokens(), r.fullCompletionTokens());
+    }
+
+    private static long spend(Integer promptTokens, Integer completionTokens) {
+        long known = 0;
+        if (promptTokens != null) {
+            known += promptTokens;
+        }
+        if (completionTokens != null) {
+            known += completionTokens;
+        }
+        return known;
+    }
+
+    private static String formatSpend(long known, boolean complete) {
+        if (complete && known > 0) {
+            return String.valueOf(known);
+        }
+        if (known > 0) {
+            return "не менее " + known + " (usage неполный)";
+        }
+        return "нет данных";
+    }
+
+    private static String ms(long nanos) {
+        return String.valueOf(nanos / 1_000_000);
+    }
+
+    private static String orNoDataText(String value) {
+        return value == null ? "нет данных" : value;
+    }
+
     /**
      * Выполняет служебную команду; возвращает true, если приложение должно завершиться.
      * Служебные команды не вызывают API.
@@ -707,7 +1070,8 @@ public final class Main {
                 ui.showSystem("История демонстрационного диалога удалена.\n"
                         + "Расход и таблица демонстрационного режима сохранены.");
             } else {
-                ui.showSystem("История текущего диалога удалена. Можно начать новую беседу.\n"
+                ui.showSystem("История текущего диалога удалена (вместе с резюме, "
+                        + "если оно было). Можно начать новую беседу.\n"
                         + "Статистика расхода токенов за сессию сохранена.");
             }
         } catch (ConversationStoreException e) {
@@ -751,6 +1115,8 @@ public final class Main {
         out.println("LLM_CONTEXT_WINDOW_TOKENS, LLM_CONTEXT_OVERFLOW_POLICY (warn/block),");
         out.println("LLM_INPUT_PRICE_PER_1M, LLM_OUTPUT_PRICE_PER_1M (USD за 1M токенов),");
         out.println("LLM_SESSION_TOKEN_LIMIT (информационный лимит сессии),");
+        out.println("LLM_CONTEXT_MODE (full/summary), LLM_CONTEXT_KEEP_LAST_MESSAGES,");
+        out.println("LLM_SUMMARY_BATCH_MESSAGES, LLM_SUMMARY_MAX_OUTPUT_TOKENS,");
         out.println("LLM_DIAGNOSTICS, LLM_HISTORY_FILE");
         out.println("(при запуске через launcher загружаются из локального .env проекта).");
         out.println();
@@ -759,6 +1125,7 @@ public final class Main {
         out.println("переменная LLM_HISTORY_FILE задаёт другой абсолютный путь.");
         out.println();
         out.println("Команды чата: /help, /history, /tokens, /stats, /limit, /reset, /clear,");
+        out.println("/context [full|summary], /context compare <вопрос>, /summary [refresh],");
         out.println("/multiline, /exit (также exit, quit).");
     }
 

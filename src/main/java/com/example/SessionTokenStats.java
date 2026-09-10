@@ -14,11 +14,27 @@ import java.util.List;
  * текущей истории: это разные показатели (история отправляется повторно,
  * поэтому сумма входов за сессию обычно больше размера истории).
  *
- * Счётчики обновляются ровно один раз на запрос; total_tokens из ответа
- * повторно не суммируется — накопление ведётся по prompt_tokens и
- * completion_tokens раздельно.
+ * С День 9 каждый вызов помечается назначением ({@link Purpose}): обычный
+ * ответ, создание/обновление summary, запросы ручного сравнения (full и
+ * со сжатием, включая подготовку summary в сравнении). Общий расход
+ * считает все назначения ровно один раз: каждый запрос учитывается в одной
+ * категории, total_tokens поверх суммы не прибавляется.
  */
 public final class SessionTokenStats {
+
+    /** Назначение API-вызова: определяет, к какой группе расхода он относится. */
+    public enum Purpose {
+        /** Обычный ответ пользователю. */
+        REGULAR,
+        /** Создание или обновление резюме истории (в том числе /summary refresh). */
+        SUMMARY,
+        /** Ручное сравнение: запрос без сжатия. */
+        COMPARE_FULL,
+        /** Ручное сравнение: запрос со сжатым контекстом. */
+        COMPARE_SUMMARY,
+        /** Ручное сравнение: подготовка резюме внутри сравнения. */
+        COMPARE_SUMMARY_PREP
+    }
 
     private long apiAttempts;
     private long requestsWithUsage;
@@ -26,6 +42,18 @@ public final class SessionTokenStats {
     private long requestsWithPartialUsage;
     private long totalPromptTokens;
     private long totalCompletionTokens;
+
+    private long regularAttempts;
+    private long regularPromptTokens;
+    private long regularCompletionTokens;
+
+    private long summaryAttempts;
+    private long summaryPromptTokens;
+    private long summaryCompletionTokens;
+
+    private long compareAttempts;
+    private long comparePromptTokens;
+    private long compareCompletionTokens;
 
     /**
      * Журнал учтённого расхода по попыткам: ровно одна запись на запрос,
@@ -36,16 +64,35 @@ public final class SessionTokenStats {
 
     /** Ещё одна попытка обращения к API; вызывается ровно один раз на запрос. */
     public void recordAttempt() {
+        recordAttempt(Purpose.REGULAR);
+    }
+
+    /** Попытка с назначением; ровно одна запись на запрос. */
+    public void recordAttempt(Purpose purpose) {
         apiAttempts++;
+        switch (purpose) {
+            case REGULAR -> regularAttempts++;
+            case SUMMARY -> summaryAttempts++;
+            case COMPARE_FULL, COMPARE_SUMMARY, COMPARE_SUMMARY_PREP -> compareAttempts++;
+        }
     }
 
     /**
-     * Учитывает usage одного ответа; вызывается ровно один раз на запрос.
-     * null-поля означают «нет данных» (частичный usage), а не ноль: такой
-     * запрос помечается как частичный и делает итог неполным.
+     * Учитывает usage одного обычного ответа; вызывается ровно один раз
+     * на запрос.
      */
     public void recordUsage(Integer promptTokens, Integer completionTokens) {
-        attemptUsage.add(new AttemptUsage(promptTokens, completionTokens));
+        recordUsage(Purpose.REGULAR, promptTokens, completionTokens);
+    }
+
+    /**
+     * Учитывает usage одного ответа с назначением; вызывается ровно один
+     * раз на запрос. null-поля означают «нет данных» (частичный usage),
+     * а не ноль: такой запрос помечается как частичный и делает итог
+     * неполным.
+     */
+    public void recordUsage(Purpose purpose, Integer promptTokens, Integer completionTokens) {
+        attemptUsage.add(new AttemptUsage(promptTokens, completionTokens, purpose));
         if (promptTokens == null && completionTokens == null) {
             requestsWithoutUsage++;
             return;
@@ -60,15 +107,46 @@ public final class SessionTokenStats {
         if (completionTokens != null) {
             totalCompletionTokens += completionTokens;
         }
+        switch (purpose) {
+            case REGULAR -> {
+                if (promptTokens != null) {
+                    regularPromptTokens += promptTokens;
+                }
+                if (completionTokens != null) {
+                    regularCompletionTokens += completionTokens;
+                }
+            }
+            case SUMMARY -> {
+                if (promptTokens != null) {
+                    summaryPromptTokens += promptTokens;
+                }
+                if (completionTokens != null) {
+                    summaryCompletionTokens += completionTokens;
+                }
+            }
+            case COMPARE_FULL, COMPARE_SUMMARY, COMPARE_SUMMARY_PREP -> {
+                if (promptTokens != null) {
+                    comparePromptTokens += promptTokens;
+                }
+                if (completionTokens != null) {
+                    compareCompletionTokens += completionTokens;
+                }
+            }
+        }
     }
 
     /**
-     * Запрос к API выполнен, но расход неизвестен: ответ не получен
+     * Обычный запрос к API выполнен, но расход неизвестен: ответ не получен
      * (таймаут, сеть, HTTP-ошибка) либо usage разобрать не удалось.
      * Провайдер мог списать токены — в итог они не попадут.
      */
     public void recordUnknownUsage() {
-        attemptUsage.add(new AttemptUsage(null, null));
+        recordUnknownUsage(Purpose.REGULAR);
+    }
+
+    /** То же для запроса с назначением (суммаризация, сравнение). */
+    public void recordUnknownUsage(Purpose purpose) {
+        attemptUsage.add(new AttemptUsage(null, null, purpose));
         requestsWithoutUsage++;
     }
 
@@ -82,7 +160,13 @@ public final class SessionTokenStats {
     }
 
     /** Учтённый расход одной попытки; null — «нет данных», а не ноль. */
-    public record AttemptUsage(Integer promptTokens, Integer completionTokens) {
+    public record AttemptUsage(Integer promptTokens, Integer completionTokens,
+                               Purpose purpose) {
+
+        /** Совместимый конструктор: назначение считается обычным ответом. */
+        public AttemptUsage(Integer promptTokens, Integer completionTokens) {
+            this(promptTokens, completionTokens, Purpose.REGULAR);
+        }
     }
 
     /** Неизменяемый снимок для UI и тестов. */
@@ -91,13 +175,18 @@ public final class SessionTokenStats {
                 && requestsWithoutUsage == 0
                 && requestsWithPartialUsage == 0;
         return new Snapshot(apiAttempts, requestsWithUsage, requestsWithoutUsage,
-                requestsWithPartialUsage, totalPromptTokens, totalCompletionTokens, complete);
+                requestsWithPartialUsage, totalPromptTokens, totalCompletionTokens, complete,
+                regularAttempts, regularPromptTokens, regularCompletionTokens,
+                summaryAttempts, summaryPromptTokens, summaryCompletionTokens,
+                compareAttempts, comparePromptTokens, compareCompletionTokens);
     }
 
     /**
      * Снимок накопленных фактических расходов сессии. totalPromptTokens и
-     * totalCompletionTokens — суммы только по запросам с доступным usage;
-     * complete — признак полноты итога (все запросы дали полный usage).
+     * totalCompletionTokens — суммы только по запросам с доступным usage по
+     * всем назначениям; группы — детализация тех же запросов (двойного учёта
+     * нет: сумма групп равна общим суммам); complete — признак полноты итога
+     * (все запросы дали полный usage).
      */
     public record Snapshot(
             long apiAttempts,
@@ -106,14 +195,25 @@ public final class SessionTokenStats {
             long requestsWithPartialUsage,
             long totalPromptTokens,
             long totalCompletionTokens,
-            boolean complete) {
+            boolean complete,
+            long regularAttempts,
+            long regularPromptTokens,
+            long regularCompletionTokens,
+            long summaryAttempts,
+            long summaryPromptTokens,
+            long summaryCompletionTokens,
+            long compareAttempts,
+            long comparePromptTokens,
+            long compareCompletionTokens) {
 
         /**
          * Учтённый расход сессии: сумма известных prompt_tokens и
-         * completion_tokens. total_tokens повторно не прибавляется —
-         * это привело бы к двойному учёту. Переполнение суммы (практически
-         * недостижимо) трактуется безопасно: расход считается максимальным,
-         * то есть не меньше любого лимита.
+         * completion_tokens всех запросов (обычные ответы, суммаризация
+         * и сравнение; лимит сессии учитывает все назначения).
+         * total_tokens повторно не прибавляется — это привело бы к двойному
+         * учёту. Переполнение суммы (практически недостижимо) трактуется
+         * безопасно: расход считается максимальным, то есть не меньше
+         * любого лимита.
          */
         public long knownTotal() {
             try {

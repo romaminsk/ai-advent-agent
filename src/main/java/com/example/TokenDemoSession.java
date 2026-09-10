@@ -73,7 +73,9 @@ final class TokenDemoSession {
                 s.profile(), s.maxOutputTokens(), s.limitOverridden(), s.temperature(),
                 s.requestTimeoutSeconds(), null, s.contextWindowTokens(),
                 ContextOverflowPolicy.WARN, s.inputPricePer1M(), s.outputPricePer1M(),
-                s.sessionTokenLimit(), false);
+                s.sessionTokenLimit(), false,
+                s.contextMode(), s.keepLastMessages(),
+                s.summaryBatchMessages(), s.summaryMaxOutputTokens());
         Path file = Files.createTempFile("ai-advent-agent-demo-", ".json");
         Files.deleteIfExists(file);
         JsonConversationStore store = new JsonConversationStore(file);

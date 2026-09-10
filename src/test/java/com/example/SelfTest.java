@@ -149,6 +149,15 @@ public final class SelfTest {
             checkDemoFailureClassifications();
             checkDemoCommandsNoApi();
             checkPasteInput();
+            checkDay9SettingsValidation();
+            checkDay9SummaryThresholds();
+            checkDay9IncrementalSummary();
+            checkDay9PersistenceAndStale();
+            checkDay9FailureKeepsHistory();
+            checkDay9ClearRemovesSummary();
+            checkDay9ContextCommandsNoApi();
+            checkDay9Compare();
+            checkDay9CompareGuards();
             checkTwoProcessIntegration();
         } finally {
             deleteRecursively(baseTempDir);
@@ -466,6 +475,8 @@ public final class SelfTest {
         int progressCount = 0;
         int confirmCount = 0;
         boolean confirmAnswer = false;
+        int confirmCompareCount = 0;
+        boolean confirmCompareAnswer = false;
 
         FakeUi(TerminalUi.Input... inputs) {
             this.script = List.of(inputs);
@@ -519,6 +530,12 @@ public final class SelfTest {
             confirmClearCount++;
             confirmClearSubject = subject;
             return confirmClearAnswer;
+        }
+
+        @Override
+        public boolean confirmCompare() {
+            confirmCompareCount++;
+            return confirmCompareAnswer;
         }
 
         @Override
@@ -1465,14 +1482,15 @@ public final class SelfTest {
             agent.ask("вопрос с урезанным контекстом");
 
             JsonNode messages = MAPPER.readTree(lastBody.get()).path("messages");
-            // system + 2 последние пары + новый запрос.
-            expect("в запрос уходят только последние целые пары по лимиту контекста",
-                    messages.size() == 6
+            // День 9: LLM_CONTEXT_MAX_TURNS в режимах контекста не применяется —
+            // full действительно отправляет весь архив: system + 4 пары + новый запрос.
+            expect("LLM_CONTEXT_MAX_TURNS не применяется: full отправляет весь архив",
+                    messages.size() == 10
                             && "system".equals(messages.get(0).path("role").asText())
-                            && "вопрос 3".equals(messages.get(1).path("content").asText())
-                            && "вопрос 4".equals(messages.get(3).path("content").asText())
+                            && "вопрос 1".equals(messages.get(1).path("content").asText())
+                            && "вопрос 4".equals(messages.get(7).path("content").asText())
                             && "вопрос с урезанным контекстом".equals(
-                            messages.get(5).path("content").asText()));
+                            messages.get(9).path("content").asText()));
 
             JsonNode saved = MAPPER.readTree(Files.readString(historyFile, StandardCharsets.UTF_8));
             expect("лимит отправки не удаляет архив: в файле все пары",
@@ -1736,7 +1754,8 @@ public final class SelfTest {
             String question2 = "второй вопрос";
             agent.ask(question2);
             RequestDiagnostics d2 = agent.getLastDiagnostics();
-            // Лимит LLM_CONTEXT_MAX_TURNS=1: system + последняя пара + новое сообщение.
+            // День 9: LLM_CONTEXT_MAX_TURNS больше не ограничивает —
+            // контекст включает system + все пары + новое сообщение.
             List<ChatMessage> expectedOutgoing2 = List.of(
                     new ChatMessage("system", LlmAgent.systemPromptFor(ModelSettings.BALANCED)),
                     new ChatMessage("user", question1),
@@ -1750,17 +1769,19 @@ public final class SelfTest {
                             == LEN_COUNTER.countMessages(List.of(
                                     new ChatMessage("system",
                                             LlmAgent.systemPromptFor(ModelSettings.BALANCED)),
+                                    new ChatMessage("user", question1),
+                                    new ChatMessage("assistant", "Ответ 1"),
                                     new ChatMessage("user", question2),
                                     new ChatMessage("assistant", "Ответ 2"))));
 
-            // Ограничение отправки: архив растёт, отправляемый контекст — нет
-            // (при одинаковой длине реплик).
+            // День 9: архив и отправляемый контекст растут вместе (нет ограничения
+            // отправки для контекстного запроса).
             int historyBeforeThird = agent.estimateHistoryTokens();
             int contextBeforeThird = agent.estimateNextContextTokens();
             agent.ask(question2);
-            expect("архив растёт, а отправляемый контекст остаётся ограниченным",
+            expect("архив и отправляемый контекст согласованно растут",
                     agent.estimateHistoryTokens() > historyBeforeThird
-                            && agent.estimateNextContextTokens() == contextBeforeThird);
+                            && agent.estimateNextContextTokens() > contextBeforeThird);
 
             int contextBalanced = agent.estimateNextContextTokens();
             agent.setProfile(ModelSettings.FAST);
@@ -2214,7 +2235,7 @@ public final class SelfTest {
                     ui.systems.stream().anyMatch(s -> s.contains("Токены")
                             && s.contains("источник подсчёта")
                             && s.contains("оценка")
-                            && s.contains("сохранённая история")));
+                            && s.contains("сохранённый архив")));
             expect("/stats показывает фактические суммы usage",
                     ui.systems.stream().anyMatch(s -> s.contains("Статистика сессии")
                             && s.contains("попыток обращения к API: 1")
@@ -2581,8 +2602,7 @@ public final class SelfTest {
             expect("лимит сессии сохранён после очистки",
                     agent.currentSettings().sessionTokenLimit() == 5000L);
             expect("/tokens показывает пустую историю",
-                    Main.formatTokens(agent, "glm-5.3-flash").contains("0 сообщений (0 пар)"));
-            expect("/stats продолжает показывать прежний расход",
+                    Main.formatTokens(agent, "glm-5.3-flash").contains("0 сообщений (0 пар)"));            expect("/stats продолжает показывать прежний расход",
                     Main.formatStats(agent).contains(
                             "входные токены (фактические, сумма prompt_tokens): 10"));
 
@@ -3092,6 +3112,571 @@ public final class SelfTest {
             }
         } finally {
             server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    // ---------- День 9: сжатие истории ----------
+
+    /** Маркер служебного запроса суммаризации в теле запроса. */
+    private static final String SUMMARY_MARKER = "Ты сжимаешь историю диалога";
+
+    private static Map<String, String> day9Env(String keep, String batch) {
+        Map<String, String> env = new java.util.HashMap<>();
+        env.put("LLM_CONTEXT_MODE", "summary");
+        env.put("LLM_CONTEXT_KEEP_LAST_MESSAGES", keep);
+        env.put("LLM_SUMMARY_BATCH_MESSAGES", batch);
+        return env;
+    }
+
+    /** Проверка валидации настроек сжатия: чётность, положительность, режим. */
+    private static void checkDay9SettingsValidation() {
+        Map<String, String> env = day9Env("10", "10");
+        ModelSettings settings = ModelSettings.from(env);
+        expect("LLM_CONTEXT_MODE=summary принимается", settings.contextMode() == ContextMode.SUMMARY);
+        expect("значения сжатия по умолчанию соответствуют константам",
+                settings.keepLastMessages() == ModelSettings.DEFAULT_KEEP_LAST_MESSAGES
+                        && settings.summaryBatchMessages()
+                        == ModelSettings.DEFAULT_SUMMARY_BATCH_MESSAGES
+                        && settings.summaryMaxOutputTokens()
+                        == ModelSettings.DEFAULT_SUMMARY_MAX_OUTPUT_TOKENS);
+
+        for (String invalid : new String[]{"0", "3", "11", "abc", "-2"}) {
+            Map<String, String> badKeep = day9Env(invalid, "10");
+            try {
+                ModelSettings.from(badKeep);
+                expect("LLM_CONTEXT_KEEP_LAST_MESSAGES=" + invalid + " отклоняется", false);
+            } catch (AgentException e) {
+                expect("LLM_CONTEXT_KEEP_LAST_MESSAGES=" + invalid + " отклоняется с понятной "
+                        + "ошибкой", e.getMessage().contains("LLM_CONTEXT_KEEP_LAST_MESSAGES"));
+            }
+            Map<String, String> badBatch = day9Env("10", invalid);
+            try {
+                ModelSettings.from(badBatch);
+                expect("LLM_SUMMARY_BATCH_MESSAGES=" + invalid + " отклоняется", false);
+            } catch (AgentException e) {
+                expect("LLM_SUMMARY_BATCH_MESSAGES=" + invalid + " отклоняется", e.getMessage()
+                        .contains("LLM_SUMMARY_BATCH_MESSAGES"));
+            }
+        }
+        Map<String, String> badSummaryTokenLimit = day9Env("10", "10");
+        badSummaryTokenLimit.put("LLM_SUMMARY_MAX_OUTPUT_TOKENS", "-5");
+        try {
+            ModelSettings.from(badSummaryTokenLimit);
+            expect("LLM_SUMMARY_MAX_OUTPUT_TOKENS=-5 отклоняется", false);
+        } catch (AgentException e) {
+            expect("LLM_SUMMARY_MAX_OUTPUT_TOKENS=-5 отклоняется",
+                    e.getMessage().contains("LLM_SUMMARY_MAX_OUTPUT_TOKENS"));
+        }
+        Map<String, String> badMode = day9Env("10", "10");
+        badMode.put("LLM_CONTEXT_MODE", "gip");
+        try {
+            ModelSettings.from(badMode);
+            expect("LLM_CONTEXT_MODE=gip отклоняется", false);
+        } catch (AgentException e) {
+            expect("LLM_CONTEXT_MODE=gip отклоняется",
+                    e.getMessage().contains("LLM_CONTEXT_MODE"));
+        }
+    }
+
+    /**
+     * Общий сервер Day-9: ответы на обычные вопросы — «Ответ N» с usage
+     * 10/20, на суммаризацию — «Резюме: <факты>» с usage 50/5. Возвращается
+     * сервер-контекст со счётчиками и списком последних тел запросов.
+     */
+    private record Day9Server(HttpsServer server, AtomicInteger regularHits,
+                              AtomicInteger summaryHits, List<String> bodies) {
+    }
+
+    private static Day9Server startDay9Server(Path keyStore) throws Exception {
+        AtomicInteger regularHits = new AtomicInteger();
+        AtomicInteger answerNumber = new AtomicInteger();
+        AtomicInteger summaryHits = new AtomicInteger();
+        List<String> bodies = new ArrayList<>();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            bodies.add(requestBody);
+            if (requestBody.contains(SUMMARY_MARKER)) {
+                summaryHits.incrementAndGet();
+                return new Response(200, ("{\"choices\":[{\"finish_reason\":\"stop\","
+                        + "\"message\":{\"role\":\"assistant\",\"content\":\""
+                        + "Резюме: кодовое слово ЯКОРЬ-42 и запрет цитрусовых\"}}],"
+                        + "\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":5,"
+                        + "\"total_tokens\":55}}").getBytes(StandardCharsets.UTF_8));
+            }
+            regularHits.incrementAndGet();
+            return new Response(200, ("{\"choices\":[{\"finish_reason\":\"stop\",\"message\":"
+                    + "{\"role\":\"assistant\",\"content\":\"Ответ "
+                    + answerNumber.incrementAndGet() + "\"}}],"
+                    + "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20,"
+                    + "\"total_tokens\":30}}").getBytes(StandardCharsets.UTF_8));
+        });
+        return new Day9Server(server, regularHits, summaryHits, bodies);
+    }
+
+    private static String day9Url(Day9Server s) {
+        return "https://127.0.0.1:" + s.server().getAddress().getPort() + "/v1/chat/completions";
+    }
+
+    private static Path day9KeyStore() throws Exception {
+        return createSelfSignedKeyStore();
+    }
+
+    /**
+     * Границы сжатия: ниже порога — без API; на пороге — резюме покрывает
+     * ровно первые сообщения вне последних KEEP; последние N дословны.
+     */
+    private static void checkDay9SummaryThresholds() throws Exception {
+        Path keyStore = day9KeyStore();
+        Day9Server s = startDay9Server(keyStore);
+        try {
+            Config config = new Config("test-key", day9Url(s), "glm-5.3-flash");
+            JsonConversationStore store = tempStore();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.from(day9Env("2", "4")),
+                    trustedHttpClient(keyStore), store);
+            Path historyFile = store.file();
+
+            agent.ask("вопрос 1");  // 2 сообщений: сжимать нечего
+            agent.ask("вопрос 2");  // 4 сообщения: uncovered = 0..2 < BATCH=4
+            agent.ask("вопрос 3");  // 6 сообщений: uncovered = 2 < BATCH=4
+            expect("ниже порога суммаризация не запускается",
+                    s.summaryHits().get() == 0 && agent.summary() == null);
+
+            int hitsBefore = s.regularHits().get();
+            agent.ask("вопрос 4");  // 8 сообщений: uncovered = 4 >= BATCH → резюме
+            expect("на пороге суммаризация выполняется ровно один раз",
+                    s.summaryHits().get() == 1 && agent.summary() != null);
+            ConversationSummary summary = agent.summary();
+            expect("резюме покрывает первые сообщения вне последних KEEP",
+                    summary.coveredMessages() == 4 && agent.getHistory().size() == 8
+                            && agent.getHistory().size() - summary.coveredMessages() == 4);
+            expect("резюме соответствует текущему архиву",
+                    summary.matchesArchive(agent.sessionIdAfterAskForTest(), agent.getHistory()));
+
+            // Регулярный запрос после сжатия: system со справкой + хвост дословно.
+            expect("обычный запрос выполнен после суммаризации",
+                    s.regularHits().get() == hitsBefore + 1);
+            String lastRegularBody = null;
+            for (int i = s.bodies().size() - 1; i >= 0; i--) {
+                String body = s.bodies().get(i);
+                if (body.contains("system") && !body.contains(SUMMARY_MARKER)
+                        && body.contains("вопрос 4")) {
+                    lastRegularBody = body;
+                    break;
+                }
+            }
+            JsonNode regularMessages = MAPPER.readTree(lastRegularBody).path("messages");
+            expect("system содержит справочное резюме, отделённое от инструкций",
+                    regularMessages.get(0).path("content").asText()
+                            .contains("<<<РЕЗЮМЕ")
+                            && regularMessages.get(0).path("content").asText()
+                            .contains("Резюме: кодовое слово ЯКОРЬ-42")
+                            && regularMessages.get(0).path("content").asText()
+                            .contains("исторические"));
+            expect("несжатый хвост отправляется дословно, без дублирования покрытых",
+                    regularMessages.size() == 4 // system + tail (2 сообщения) + новый вопрос
+                            && "вопрос 3".equals(regularMessages.get(1).path("content").asText())
+                            && "Ответ 3".equals(regularMessages.get(2).path("content").asText())
+                            && "вопрос 4".equals(regularMessages.get(3).path("content").asText()));
+
+            // Полный архив сохранён, резюме хранится отдельно, как сущность.
+            JsonNode saved = MAPPER.readTree(
+                    Files.readString(historyFile, StandardCharsets.UTF_8));
+            expect("архив не обрезается сжатием: все сообщения в файле",
+                    saved.path("messages").size() == 8);
+            expect("резюме сохранено отдельным объектом с отпечатком и версией",
+                    saved.path("summary").path("coveredMessages").asInt(-1) == 4
+                            && saved.path("summary").path("coveredFingerprint").asText().length()
+                            == 64
+                            && saved.path("summary").path("formatVersion").asInt(-1) == 1
+                            && saved.path("summary").path("text").asText()
+                            .contains("ЯКОРЬ-42"));
+            store.close();
+        } finally {
+            s.server().stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /**
+     * Инкрементальное обновление: в следующий служебный запрос уходят
+     * предыдущее резюме и только новый кусок, без повторной отправки
+     * уже сжатых сообщений.
+     */
+    private static void checkDay9IncrementalSummary() throws Exception {
+        Path keyStore = day9KeyStore();
+        Day9Server s = startDay9Server(keyStore);
+        try {
+            Config config = new Config("test-key", day9Url(s), "glm-5.3-flash");
+            JsonConversationStore store = tempStore();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.from(day9Env("2", "4")),
+                    trustedHttpClient(keyStore), store);
+
+            for (int i = 1; i <= 4; i++) {
+                agent.ask("уникальный вопрос " + i);
+            }
+            expect("первое резюме создано", agent.summary() != null);
+            String firstSummaryText = agent.summary().text();
+
+            // Ещё две пары: первое прихранённое резюме не сдвигается, затем
+            // обновление на новую границу (инкрементально).
+            agent.ask("запоздалый вопрос 4");
+            agent.ask("запоздалый вопрос 4 задача");
+            expect("резюме обновлено на новую границу",
+                    agent.summary() != null && agent.summary().coveredMessages() == 8);
+            String lastSummaryBody = null;
+            for (int i = s.bodies().size() - 1; i >= 0; i--) {
+                String body = s.bodies().get(i);
+                if (body.contains(SUMMARY_MARKER)) {
+                    lastSummaryBody = body;
+                    break;
+                }
+            }
+            JsonNode summaryMessages = MAPPER.readTree(lastSummaryBody).path("messages");
+            String userContent = summaryMessages.get(1).path("content").asText();
+            expect("в инкрементальный запрос включено предыдущее резюме",
+                    userContent.contains("Резюме: кодовое слово ЯКОРЬ-42")
+                            && userContent.contains("уникальный вопрос 3")
+                            && userContent.contains("уникальный вопрос 4"));
+            expect("уже сжатые сообщения повторно не отправляются на суммаризацию",
+                    !userContent.contains("уникальный вопрос 1")
+                            && !userContent.contains("уникальный вопрос 2")
+                            && !userContent.contains("запоздалый")
+                            && firstSummaryText.equals(summaryMessages.get(0)
+                            .path("content").asText()) == false);
+            expect("инструкция суммаризации не подменяется краткостью профиля",
+                    summaryMessages.get(0).path("content").asText().contains(SUMMARY_MARKER)
+                            && !summaryMessages.get(0).path("content").asText()
+                            .contains("кратко и по существу"));
+            store.close();
+        } finally {
+            s.server().stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Перезапуск: резюме восстанавливается; повреждённый кусок не применяется. */
+    private static void checkDay9PersistenceAndStale() throws Exception {
+        Path keyStore = day9KeyStore();
+        Day9Server s = startDay9Server(keyStore);
+        try {
+            Config config = new Config("test-key", day9Url(s), "glm-5.3-flash");
+            JsonConversationStore store = tempStore();
+            Path historyFile = store.file();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.from(day9Env("2", "4")),
+                    trustedHttpClient(keyStore), store);
+            for (int i = 1; i <= 4; i++) {
+                agent.ask("вопрос персистентности " + i);
+            }
+            ConversationSummary summaryBefore = agent.summary();
+            expect("резюме создано перед перезапуском", summaryBefore != null);
+            List<ChatMessage> archiveBefore = agent.getHistory();
+            int summaryAttemptsBefore = s.summaryHits().get();
+            store.close();
+
+            // Перезапуск: архив и резюме восстанавливаются, API не вызывается.
+            try (JsonConversationStore reopened = new JsonConversationStore(historyFile)) {
+                LlmAgent restored = new LlmAgent(config,
+                        ModelSettings.from(day9Env("2", "4")), trustedHttpClient(keyStore),
+                        reopened);
+                expect("архив восстанавливается полностью",
+                        restored.getHistory().equals(archiveBefore));
+                ConversationSummary restoredSummary = restored.summary();
+                expect("резюме восстанавливается с той же границей",
+                        restoredSummary != null && restoredSummary.text()
+                                .equals(summaryBefore.text())
+                                && restoredSummary.coveredMessages()
+                                == summaryBefore.coveredMessages());
+                // Новый запрос: резюме идёт в system, суммаризация не вызывается.
+                int summariesBefore2 = s.summaryHits().get();
+                restored.ask("вопрос после перезапуска");
+                expect("устойчивое резюме не требует повторной суммаризации",
+                        s.summaryHits().get() == summariesBefore2);
+                expect("после перезапуска в system уходит справка-резюме",
+                        s.bodies().get(s.bodies().size() - 1).contains("<<<РЕЗЮМЕ"));
+            }
+
+            // Устаревшее резюме: изменить сообщение внутри покрытого куска
+            // вручную (как это сделал бы другой процесс или редактирование).
+            byte[] raw = Files.readAllBytes(historyFile);
+            String json = new String(raw, StandardCharsets.UTF_8)
+                    .replace("вопрос персистентности 1", "вопрос персистентности 1 ИЗМЕНЁН");
+            Files.write(historyFile, json.getBytes(StandardCharsets.UTF_8));
+            try (JsonConversationStore stale = new JsonConversationStore(historyFile)) {
+                LlmAgent staleAgent = new LlmAgent(config,
+                        ModelSettings.from(day9Env("2", "4")), trustedHttpClient(keyStore), stale);
+                expect("устаревшее резюме не применяется, архив остаётся",
+                        staleAgent.summary() == null
+                                && staleAgent.getHistory().size() == 10);
+                // Новый обычный запрос после устаревшего резюме создаёт новое
+                // резюме (безопасное поведение без потери архива).
+                staleAgent.ask("новый запрос после устаревшего резюме");
+                expect("после устаревшего резюме создаётся новое резюме",
+                        staleAgent.summary() != null);
+            }
+        } finally {
+            s.server().stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /**
+     * Ошибки суммаризации (HTTP 500, пустой ответ, finish_reason=length)
+     * не переносят границу резюме и не теряют историю; расход учитывается.
+     */
+    private static void checkDay9FailureKeepsHistory() throws Exception {
+        Path keyStore = day9KeyStore();
+        AtomicInteger successCounter = new AtomicInteger();
+        AtomicInteger summaryScenarios = new AtomicInteger();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            if (requestBody.contains(SUMMARY_MARKER)) {
+                int scenario = summaryScenarios.incrementAndGet();
+                if (scenario == 1) {
+                    return new Response(500, "{\"error\":{\"message\":\"internal\"}}"
+                            .getBytes(StandardCharsets.UTF_8));
+                }
+                if (scenario == 2) {
+                    return new Response(200, ("{\"choices\":[{\"finish_reason\":\"stop\","
+                            + "\"message\":{\"role\":\"assistant\",\"content\":\"\"}}],"
+                            + "\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":5}}")
+                            .getBytes(StandardCharsets.UTF_8));
+                }
+                if (scenario == 3) {
+                    // Обрезанный по лимиту ответ с usage: не выдаётся за резюме.
+                    return new Response(200, ("{\"choices\":[{\"finish_reason\":\"length\","
+                            + "\"message\":{\"role\":\"assistant\",\"content\":\"частичный\""
+                            + "}}],\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":500}}")
+                            .getBytes(StandardCharsets.UTF_8));
+                }
+                return new Response(200, ("{\"choices\":[{\"finish_reason\":\"stop\",\"message\":"
+                        + "{\"role\":\"assistant\",\"content\":\"Резюме: ок\"}}]}")
+                        .getBytes(StandardCharsets.UTF_8));
+            }
+            return new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                    + "\"content\":\"Ответ " + successCounter.incrementAndGet() + "\"}}],"
+                    + "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20}}")
+                    .getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort() + "/v1/chat/completions",
+                    "glm-5.3-flash");
+
+            for (int scenario = 1; scenario <= 3; scenario++) {
+                JsonConversationStore store = tempStore();
+                LlmAgent agent = new LlmAgent(config, ModelSettings.from(day9Env("2", "4")),
+                        trustedHttpClient(keyStore), store);
+                // Три подготовленных пары: следующий запрос достигает порога
+                // и сначала выполняет реальную попытку суммаризации.
+                for (int i = 1; i <= 3; i++) {
+                    agent.ask("подготовка " + i);
+                }
+                String answer = agent.ask("вопрос для сбоя резюме " + scenario);
+                expect("ошибка суммаризации не мешает обычному ответу",
+                        answer != null && !answer.isBlank());
+                expect("после сбоя суммаризации история сохранена и дополнена парой",
+                        agent.getHistory().size() == 8
+                                && agent.summary() == null);
+                expect("после сбоя суммаризации архив не потерян и повторов нет",
+                        agent.getHistory().size() == 8);
+                SessionTokenStats.Snapshot stats = agent.sessionStats();
+                // Попытки: обычные ответы + одна попытка суммаризации.
+                expect("попытки API учитываются: обычные запросы и суммаризация",
+                        stats.apiAttempts() == 5 && stats.regularAttempts() == 4
+                                && stats.summaryAttempts() == 1
+                                && (scenario >= 2 ? stats.summaryPromptTokens() == 50
+                                : stats.summaryPromptTokens() == 0));
+                if (scenario == 3) {
+                    // length: completion учтён, резюме не принято.
+                    expect("ограниченный по length ответ не принят за резюме, но учтён",
+                            stats.summaryCompletionTokens() == 500);
+                }
+                // Разрыв пар нет, служебные запросы в историю не попали.
+                expect("служебный запрос суммаризации не попадает в диалог",
+                        agent.getHistory().stream()
+                                .noneMatch(m -> m.content().contains("Резюме")));
+                store.close();
+            }
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** /clear и resetConversation сбрасывают резюме, но не статистику сессии. */
+    private static void checkDay9ClearRemovesSummary() throws Exception {
+        Path keyStore = day9KeyStore();
+        Day9Server s = startDay9Server(keyStore);
+        try {
+            Config config = new Config("test-key", day9Url(s), "glm-5.3-flash");
+            JsonConversationStore store = tempStore();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.from(day9Env("2", "4")),
+                    trustedHttpClient(keyStore), store);
+            for (int i = 1; i <= 4; i++) {
+                agent.ask("вопрос для очистки " + i);
+            }
+            expect("перед очисткой резюме существует", agent.summary() != null);
+            long spendBefore = agent.sessionStats().knownTotal();
+            boolean spendTracked = agent.sessionStats().summaryAttempts() > 0;
+
+            agent.resetConversation();
+            expect("resetConversation сбрасывает резюме", agent.summary() == null);
+            JsonNode saved = MAPPER.readTree(
+                    Files.readString(store.file(), StandardCharsets.UTF_8));
+            expect("файл после очистки пуст и без объекта summary",
+                    !saved.has("summary") && saved.path("messages").isEmpty());
+            expect("расход сессии не сбрасывается очисткой",
+                    agent.sessionStats().knownTotal() >= spendBefore);
+            expect("расход суммаризации был учтён в сессии",
+                    spendTracked && agent.sessionStats().summaryAttempts() >= 1);
+            store.close();
+        } finally {
+            s.server().stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /**
+     * Переключение /context и показ /summary не вызывают API; обе операции
+     * без истории работают; недоступный режим даёт ошибку.
+     */
+    private static void checkDay9ContextCommandsNoApi() throws Exception {
+        Path keyStore = day9KeyStore();
+        Day9Server s = startDay9Server(keyStore);
+        try {
+            Config config = new Config("test-key", day9Url(s), "glm-5.3-flash");
+            JsonConversationStore store = tempStore();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.defaults(),
+                    trustedHttpClient(keyStore), store);
+            int hitsBefore = s.regularHits().get() + s.summaryHits().get();
+            FakeUi ui = new FakeUi(
+                    TerminalUi.Input.command("/context"),
+                    TerminalUi.Input.command("/context summary"),
+                    TerminalUi.Input.command("/summary"),
+                    TerminalUi.Input.command("/context full"),
+                    TerminalUi.Input.command("/summary refresh"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(ui, agent, "glm-5.3-flash");
+            expect("команды /context и /summary не вызывают API",
+                    s.regularHits().get() + s.summaryHits().get() == hitsBefore);
+            expect("/context показывает текущий режим и параметры",
+                    ui.systems.stream().anyMatch(t -> t.contains("Режим контекста")
+                            && t.contains("дословно")));
+            expect("/context summary сообщает о расходе служебных запросов",
+                    ui.systems.stream().anyMatch(t ->
+                            t.contains("дополнительные запросы")));
+            expect("переключённый режим отражается моделью настроек",
+                    agent.currentSettings().contextMode() == ContextMode.FULL);
+            expect("/summary refresh без истории объясняет без API",
+                    ui.systems.stream().anyMatch(t -> t.contains("Сжимать пока нечего")));
+            store.close();
+        } finally {
+            s.server().stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Сравнение: один снимок, изоляция, учёт расхода, история не затронута. */
+    private static void checkDay9Compare() throws Exception {
+        Path keyStore = day9KeyStore();
+        Day9Server s = startDay9Server(keyStore);
+        try {
+            Config config = new Config("test-key", day9Url(s), "glm-5.3-flash");
+            JsonConversationStore store = tempStore();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.from(day9Env("2", "4")),
+                    trustedHttpClient(keyStore), store);
+            for (int i = 1; i <= 4; i++) {
+                agent.ask("факт " + i);
+            }
+            expect("резюме есть перед сравнением", agent.summary() != null);
+            List<ChatMessage> historyBefore = agent.getHistory();
+            ConversationSummary summaryBefore = agent.summary();
+            long knownBefore = agent.sessionStats().knownTotal();
+            long attemptsBefore = agent.sessionStats().apiAttempts();
+
+            FakeUi ui = new FakeUi(
+                    TerminalUi.Input.command("/context compare Какой факт был первым?"),
+                    TerminalUi.Input.command("/exit"));
+            ui.confirmCompareAnswer = true;
+            Main.runLoop(ui, agent, "glm-5.3-flash");
+
+            expect("сравнение не изменяет историю",
+                    agent.getHistory().equals(historyBefore));
+            expect("сравнение не продвигает резюме",
+                    agent.summary().coveredMessages() == summaryBefore.coveredMessages()
+                            && agent.summary().text().equals(summaryBefore.text()));
+            expect("показаны оба ответа",
+                    ui.messages.stream().anyMatch(m -> m.contains("БЕЗ СЖАТИЯ"))
+                            && ui.messages.stream().anyMatch(m -> m.contains("СО СЖАТИЕМ")));
+            expect("сравнение делало ровно два запроса API (резюме переиспользовано)",
+                    agent.sessionStats().apiAttempts() == attemptsBefore + 2);
+            expect("расход сравнения учтён в сессии",
+                    agent.sessionStats().knownTotal() > knownBefore);
+            SessionTokenStats.Snapshot stats = agent.sessionStats();
+            expect("расход сравнения помечается отдельными назначениями",
+                    stats.compareAttempts() == 2 && stats.regularAttempts() >= 3
+                            && stats.summaryAttempts() == 1);
+            store.close();
+        } finally {
+            s.server().stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Защиты сравнения: короткая история, отказ подтверждения, демо-изоляция. */
+    private static void checkDay9CompareGuards() throws Exception {
+        Path keyStore = day9KeyStore();
+        Day9Server s = startDay9Server(keyStore);
+        try {
+            Config config = new Config("test-key", day9Url(s), "glm-5.3-flash");
+
+            // Короткая история: нет смысла сравнивать два одинаковых запроса.
+            JsonConversationStore shortStore = tempStore();
+            LlmAgent shortAgent = new LlmAgent(config, ModelSettings.from(day9Env("2", "4")),
+                    trustedHttpClient(keyStore), shortStore);
+            shortAgent.ask("единственный вопрос");
+            int hitsBefore = s.regularHits().get() + s.summaryHits().get();
+            FakeUi shortUi = new FakeUi(
+                    TerminalUi.Input.command("/context compare любой"),
+                    TerminalUi.Input.command("/exit"));
+            shortUi.confirmCompareAnswer = true;
+            Main.runLoop(shortUi, shortAgent, "glm-5.3-flash");
+            expect("на короткой истории сравнение не выполняется без API",
+                    s.regularHits().get() + s.summaryHits().get() == hitsBefore
+                            && shortUi.confirmCompareCount == 0);
+            shortStore.close();
+
+            // Отказ подтверждения: API не вызывается.
+            JsonConversationStore store = tempStore();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.from(day9Env("2", "4")),
+                    trustedHttpClient(keyStore), store);
+            for (int i = 1; i <= 3; i++) {
+                agent.ask("вопрос для отмены " + i);
+            }
+            hitsBefore = s.regularHits().get() + s.summaryHits().get();
+            FakeUi cancelUi = new FakeUi(
+                    TerminalUi.Input.command("/context compare любой"),
+                    TerminalUi.Input.command("/exit"));
+            cancelUi.confirmCompareAnswer = false;
+            Main.runLoop(cancelUi, agent, "glm-5.3-flash");
+            expect("отказ подтверждения не выполняет API",
+                    s.regularHits().get() + s.summaryHits().get() == hitsBefore
+                            && cancelUi.messages.isEmpty());
+            store.close();
+
+            // Демо-беседа: сравнение отказывается (изоляция режимов).
+            FakeUi demoUi = new FakeUi(
+                    TerminalUi.Input.command("/demo tokens"),
+                    TerminalUi.Input.command("/context compare любой"),
+                    TerminalUi.Input.command("/demo stop"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(demoUi, agent, "glm-5.3-flash");
+            expect("в демо-режиме сравнение не выполняется без API",
+                    s.regularHits().get() + s.summaryHits().get() == hitsBefore
+                            && demoUi.systems.stream().anyMatch(
+                                    t -> t.contains("демонстрационном")
+                                            || t.contains("сравнивать не на чем")));
+        } finally {
+            s.server().stop(0);
             Files.deleteIfExists(keyStore);
         }
     }
