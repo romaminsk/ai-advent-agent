@@ -29,7 +29,20 @@ import java.util.Map;
  * - LLM_SESSION_TOKEN_LIMIT — необязательный информационный лимит расхода
  *   токенов за сессию (сумма известных prompt_tokens и completion_tokens);
  *   уведомление при превышении, не жёсткая квота;
+ * - LLM_CONTEXT_MODE — режим контекста (День 9): full (полная история,
+ *   по умолчанию) или summary (резюме старой части + несжатый хвост);
+ * - LLM_CONTEXT_KEEP_LAST_MESSAGES — положительное чётное число последних
+ *   сообщений, всегда сохраняемых дословно (по умолчанию 10);
+ * - LLM_SUMMARY_BATCH_MESSAGES — положительное чётное число новых старых
+ *   сообщений, после которого обновляется резюме (по умолчанию 10);
+ * - LLM_SUMMARY_MAX_OUTPUT_TOKENS — положительный отдельный лимит генерации
+ *   для запроса суммаризации (по умолчанию 512); обычный лимит ответа
+ *   не меняет;
  * - LLM_DIAGNOSTICS — краткие метрики запроса (true/false).
+ * 
+ * Примечание (День 9): LLM_CONTEXT_MAX_TURNS в режимах контекста
+ * full/summary больше не ограничивает отправку (см. README); о заданной
+ * переменной приложение сообщает явно.
  *
  * Лимиты профилей — экспериментальные начальные значения,
  * а не проверенные оптимумы для glm-5.3-flash. max_tokens — верхний предел
@@ -48,7 +61,11 @@ public record ModelSettings(
         BigDecimal inputPricePer1M,
         BigDecimal outputPricePer1M,
         Long sessionTokenLimit,
-        boolean diagnostics) {
+        boolean diagnostics,
+        ContextMode contextMode,
+        int keepLastMessages,
+        int summaryBatchMessages,
+        int summaryMaxOutputTokens) {
 
     public static final String FAST = "fast";
     public static final String BALANCED = "balanced";
@@ -73,6 +90,11 @@ public record ModelSettings(
 
     public static final int DEFAULT_REQUEST_TIMEOUT_SECONDS = 180;
 
+    /** День 9: настройки сжатия по умолчанию. */
+    public static final int DEFAULT_KEEP_LAST_MESSAGES = 10;
+    public static final int DEFAULT_SUMMARY_BATCH_MESSAGES = 10;
+    public static final int DEFAULT_SUMMARY_MAX_OUTPUT_TOKENS = 512;
+
     /** Максимум temperature по контракту OpenAI-совместимых эндпоинтов. */
     public static final double MAX_TEMPERATURE = 2.0;
 
@@ -80,7 +102,9 @@ public record ModelSettings(
     public static ModelSettings defaults() {
         return new ModelSettings(DEFAULT_PROFILE, PROFILE_LIMITS.get(DEFAULT_PROFILE),
                 false, null, DEFAULT_REQUEST_TIMEOUT_SECONDS, null,
-                null, ContextOverflowPolicy.DEFAULT, null, null, null, false);
+                null, ContextOverflowPolicy.DEFAULT, null, null, null, false,
+                ContextMode.DEFAULT, DEFAULT_KEEP_LAST_MESSAGES,
+                DEFAULT_SUMMARY_BATCH_MESSAGES, DEFAULT_SUMMARY_MAX_OUTPUT_TOKENS);
     }
 
     /** Читает настройки из переменных окружения. */
@@ -103,6 +127,16 @@ public record ModelSettings(
         BigDecimal outputPrice = readOptionalPrice(env, "LLM_OUTPUT_PRICE_PER_1M");
         Long sessionTokenLimit = readOptionalPositiveLong(env, "LLM_SESSION_TOKEN_LIMIT");
         boolean diagnostics = readBoolean(env, "LLM_DIAGNOSTICS");
+        ContextMode contextMode = ContextMode.parse(env.get("LLM_CONTEXT_MODE"),
+                "LLM_CONTEXT_MODE");
+        int keepLastMessages = readOptionalEvenPositiveInt(env, "LLM_CONTEXT_KEEP_LAST_MESSAGES",
+                DEFAULT_KEEP_LAST_MESSAGES);
+        int summaryBatchMessages = readOptionalEvenPositiveInt(env, "LLM_SUMMARY_BATCH_MESSAGES",
+                DEFAULT_SUMMARY_BATCH_MESSAGES);
+        Integer summaryMaxOverride = readOptionalPositiveInt(env, "LLM_SUMMARY_MAX_OUTPUT_TOKENS");
+        int summaryMaxOutputTokens = summaryMaxOverride != null
+                ? summaryMaxOverride
+                : DEFAULT_SUMMARY_MAX_OUTPUT_TOKENS;
         return new ModelSettings(
                 profile,
                 limitOverride != null ? limitOverride : PROFILE_LIMITS.get(profile),
@@ -115,7 +149,11 @@ public record ModelSettings(
                 inputPrice,
                 outputPrice,
                 sessionTokenLimit,
-                diagnostics);
+                diagnostics,
+                contextMode,
+                keepLastMessages,
+                summaryBatchMessages,
+                summaryMaxOutputTokens);
     }
 
     /**
@@ -134,7 +172,8 @@ public record ModelSettings(
         return new ModelSettings(normalized, limit, limitOverridden,
                 temperature, requestTimeoutSeconds, contextMaxTurns,
                 contextWindowTokens, overflowPolicy, inputPricePer1M, outputPricePer1M,
-                sessionTokenLimit, diagnostics);
+                sessionTokenLimit, diagnostics, contextMode,
+                keepLastMessages, summaryBatchMessages, summaryMaxOutputTokens);
     }
 
     /**
@@ -146,7 +185,20 @@ public record ModelSettings(
         return new ModelSettings(profile, maxOutputTokens, limitOverridden,
                 temperature, requestTimeoutSeconds, contextMaxTurns,
                 contextWindowTokens, overflowPolicy, inputPricePer1M, outputPricePer1M,
-                newLimit, diagnostics);
+                newLimit, diagnostics, contextMode,
+                keepLastMessages, summaryBatchMessages, summaryMaxOutputTokens);
+    }
+
+    /**
+     * Тот же экземпляр с другим режимом контекста (/context full|summary).
+     * Настройки сжатия и прочие значения не меняются; API команда не вызывает.
+     */
+    public ModelSettings withContextMode(ContextMode newMode) {
+        return new ModelSettings(profile, maxOutputTokens, limitOverridden,
+                temperature, requestTimeoutSeconds, contextMaxTurns,
+                contextWindowTokens, overflowPolicy, inputPricePer1M, outputPricePer1M,
+                sessionTokenLimit, diagnostics, newMode,
+                keepLastMessages, summaryBatchMessages, summaryMaxOutputTokens);
     }
 
     /** Лимит отправляемых в API пар: явная настройка или прежнее поведение. */
@@ -256,6 +308,31 @@ public record ModelSettings(
         }
         if (parsed <= 0) {
             throw new AgentException(name + " должна быть положительным целым числом, "
+                    + "получено: " + parsed + ".");
+        }
+        return parsed;
+    }
+
+    /**
+     * Необязательное положительное чётное число (День 9: параметры сжатия).
+     * Отсутствие значения — переданное значение по умолчанию. Ноль,
+     * нечётные, текст и прочие ошибки дают понятное сообщение.
+     */
+    private static int readOptionalEvenPositiveInt(Map<String, String> env, String name,
+                                                   int defaultValue) {
+        String value = env.get(name);
+        if (value == null || value.isBlank()) {
+            return defaultValue;
+        }
+        int parsed;
+        try {
+            parsed = Integer.parseInt(value.trim());
+        } catch (NumberFormatException e) {
+            throw new AgentException(name + " должна быть положительным чётным числом, "
+                    + "получено: " + value.trim() + ".", e);
+        }
+        if (parsed <= 0 || parsed % 2 != 0) {
+            throw new AgentException(name + " должна быть положительным чётным числом, "
                     + "получено: " + parsed + ".");
         }
         return parsed;

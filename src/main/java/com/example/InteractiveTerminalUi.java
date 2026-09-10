@@ -50,6 +50,8 @@ final class InteractiveTerminalUi implements TerminalUi {
                         "/demo", "/demo tokens", "/demo stats", "/demo stop",
                         "/paste", "/reset", "/clear", "/multiline", "/mode",
                         "/mode fast", "/mode balanced", "/mode detailed",
+                        "/context", "/context full", "/context summary",
+                        "/context compare ", "/summary", "/summary refresh",
                         "/exit", "exit", "quit"))
                 .build();
         // История ввода хранится только в памяти: файл истории не подключается.
@@ -207,6 +209,9 @@ final class InteractiveTerminalUi implements TerminalUi {
         out.println("  /paste     — вставка длинного текста одним сообщением (/send, /cancel)");
         out.println("  /demo      — режим измерения токенов: /demo tokens, /demo stats, /demo stop");
         out.println("  /mode      — профиль ответа: /mode показать, /mode fast|balanced|detailed");
+        out.println("  /context   — режим контекста: /context показать, /context full|summary,");
+        out.println("             /context compare <вопрос> — сравнение двух запросов (API, с подтверждением)");
+        out.println("  /summary   — резюме сжатия: /summary показать, /summary refresh — обновить (API)");
         out.println("  /exit      — завершение (также exit, quit)");
         out.println("Стрелки вверх/вниз — предыдущие сообщения, Tab — автодополнение команд.");
         out.flush();
@@ -256,6 +261,25 @@ final class InteractiveTerminalUi implements TerminalUi {
             out.println(dim("Отменить удаление после подтверждения нельзя."));
             out.flush();
             String answer = reader.readLine(dim("Продолжить? [y/N] "));
+            String trimmed = answer == null ? "" : answer.trim().toLowerCase(Locale.ROOT);
+            return trimmed.equals("y") || trimmed.equals("yes");
+        } catch (UserInterruptException | EndOfFileException e) {
+            return false;
+        }
+    }
+
+    /** Подтверждение сравнения (/context compare); только y или yes. */
+    @Override
+    public boolean confirmCompare() {
+        PrintWriter out = terminal.writer();
+        out.println(dim("Будут выполнены два запроса на одной истории: "
+                + "без сжатия и со сжатием."));
+        out.println(dim("Если резюме ещё не подготовлено, понадобится дополнительный "
+                + "запрос для его создания."));
+        out.println(dim("Это расходует средства или квоту."));
+        out.flush();
+        try {
+            String answer = reader.readLine("Продолжить? [y/N] ");
             String trimmed = answer == null ? "" : answer.trim().toLowerCase(Locale.ROOT);
             return trimmed.equals("y") || trimmed.equals("yes");
         } catch (UserInterruptException | EndOfFileException e) {

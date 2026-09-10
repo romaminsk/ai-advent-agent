@@ -163,6 +163,9 @@ final class PlainTerminalUi implements TerminalUi {
         err.println("  /paste     — вставка длинного текста одним сообщением (/send, /cancel)");
         err.println("  /demo      — режим измерения токенов: /demo tokens, /demo stats, /demo stop");
         err.println("  /mode      — профиль ответа: /mode показать, /mode fast|balanced|detailed");
+        err.println("  /context   — режим контекста: /context показать, /context full|summary,");
+        err.println("             /context compare <вопрос> — сравнение двух запросов (API, с подтверждением)");
+        err.println("  /summary   — резюме сжатия: /summary показать, /summary refresh — обновить (API)");
         err.println("  /exit      — завершение (также exit, quit)");
     }
 
@@ -195,6 +198,18 @@ final class PlainTerminalUi implements TerminalUi {
         err.println("Удалить всю историю " + subject + "?");
         err.println("Она будет очищена в памяти и в файле хранения.");
         err.println("Отменить удаление после подтверждения нельзя.");
+        String answer = readLine("Продолжить? [y/N] ");
+        String trimmed = answer == null ? "" : answer.trim().toLowerCase(java.util.Locale.ROOT);
+        return trimmed.equals("y") || trimmed.equals("yes");
+    }
+
+    /** Подтверждение сравнения (/context compare); только y или yes. */
+    @Override
+    public boolean confirmCompare() {
+        err.println("Будут выполнены два запроса на одной истории: без сжатия и со сжатием.");
+        err.println("Если резюме ещё не подготовлено, понадобится дополнительный запрос "
+                + "для его создания.");
+        err.println("Это расходует средства или квоту.");
         String answer = readLine("Продолжить? [y/N] ");
         String trimmed = answer == null ? "" : answer.trim().toLowerCase(java.util.Locale.ROOT);
         return trimmed.equals("y") || trimmed.equals("yes");

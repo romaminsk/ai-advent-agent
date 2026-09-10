@@ -57,8 +57,11 @@ import java.util.Set;
  */
 public final class JsonConversationStore implements ConversationStore {
 
-    /** Единственная поддерживаемая версия формата файла истории. */
-    public static final int SUPPORTED_SCHEMA_VERSION = 1;
+    /** Текущая поддерживаемая версия формата файла истории (День 9: + summary). */
+    public static final int SUPPORTED_SCHEMA_VERSION = 2;
+
+    /** Legacy-версия без отдельного резюме; по-прежнему читается полностью. */
+    public static final int LEGACY_SCHEMA_VERSION = 1;
 
     private static final String DEFAULT_DIR_NAME = ".ai-advent-agent";
     private static final String DEFAULT_FILE_NAME = "conversation.json";
@@ -147,15 +150,19 @@ public final class JsonConversationStore implements ConversationStore {
         }
 
         JsonNode version = root.get("schemaVersion");
-        if (version == null || !version.isIntegralNumber()
-                || version.asInt() != SUPPORTED_SCHEMA_VERSION) {
+        if (version == null || !version.isIntegralNumber()) {
+            throw corrupt("отсутствует версия формата schemaVersion");
+        }
+        int schemaVersion = version.asInt();
+        if (schemaVersion != SUPPORTED_SCHEMA_VERSION
+                && schemaVersion != LEGACY_SCHEMA_VERSION) {
             // Неизвестную версию не угадываем и файл молча не переписываем.
             throw new ConversationStoreException(
                     "Неизвестная версия формата файла истории: " + file
-                            + " (schemaVersion="
-                            + (version == null ? "отсутствует" : version.asText())
+                            + " (schemaVersion=" + version.asText()
                             + "); приложение поддерживает schemaVersion="
-                            + SUPPORTED_SCHEMA_VERSION + ". Файл не изменён: чтобы начать "
+                            + SUPPORTED_SCHEMA_VERSION + " и читает старые файлы версии "
+                            + LEGACY_SCHEMA_VERSION + ". Файл не изменён: чтобы начать "
                             + "новую беседу, вручную переименуйте или переместите его "
                             + "(сохранив копию) и запустите приложение заново.");
         }
@@ -195,7 +202,59 @@ public final class JsonConversationStore implements ConversationStore {
             // и при чтении не принимается.
             throw corrupt("незавершённая пара: последнее сообщение должно быть assistant");
         }
-        return new ConversationState(sessionIdNode.asText(), messages);
+
+        ConversationSummary summary = schemaVersion >= SUPPORTED_SCHEMA_VERSION
+                ? parseSummary(root.get("summary"))
+                : null;
+        return new ConversationState(sessionIdNode.asText(), messages, summary);
+    }
+
+    /**
+     * Читает необязательную сущность summary (День 9). Старый файл без поля
+     * summary остаётся совместимым — возвращается null. Повреждённое или
+     * неоднозначное поле — ошибка повреждения: применять его молча нельзя.
+     */
+    private static ConversationSummary parseSummary(JsonNode node) {
+        if (node == null || node.isNull() || node.isMissingNode()) {
+            return null;
+        }
+        if (!node.isObject()) {
+            throw new ConversationStoreException(
+                    "Резюме покрытой истории (summary) повреждено: ожидается объект. "
+                            + "Файл не изменён приложением. Чтобы начать новую беседу, "
+                            + "вручную переименуйте или переместите файл (сохранив копию) "
+                            + "и запустите приложение заново — архив будет загружен без "
+                            + "резюме после восстановления структуры вручную.");
+        }
+        String text = node.path("text").asText(null);
+        Integer coveredMessages = readPositiveInt(node.get("coveredMessages"),
+                "summary.coveredMessages");
+        String fingerprint = node.path("coveredFingerprint").asText(null);
+        Integer formatVersion = readPositiveInt(node.get("formatVersion"),
+                "summary.formatVersion");
+        try {
+            return new ConversationSummary(text, coveredMessages, fingerprint, formatVersion);
+        } catch (IllegalArgumentException e) {
+            throw new ConversationStoreException(
+                    "Резюме покрытой истории (summary) повреждено ("
+                            + e.getMessage() + "). Файл не изменён приложением. "
+                            + "Чтобы начать новую беседу, вручную переименуйте или "
+                            + "переместите файл (сохранив копию) и запустите приложение "
+                            + "заново.");
+        }
+    }
+
+    private static Integer readPositiveInt(JsonNode node, String name) {
+        if (node == null || !node.isIntegralNumber()) {
+            throw new IllegalArgumentException(
+                    "поле " + name + " — обязательное целое положительное число");
+        }
+        int value = node.asInt();
+        if (value <= 0) {
+            throw new IllegalArgumentException(
+                    "поле " + name + " должно быть положительным");
+        }
+        return value;
     }
 
     @Override
@@ -264,7 +323,10 @@ public final class JsonConversationStore implements ConversationStore {
         lockChannel = null;
     }
 
-    /** Собирает JSON состояния: версия формата, sessionId, пары user/assistant. */
+    /**
+     * Собирает JSON состояния: версия формата, sessionId, пары user/assistant
+     * и необязательная сущность summary (всегда schemaVersion 2).
+     */
     private String serialize(ConversationState state) throws IOException {
         ObjectNode root = MAPPER.createObjectNode();
         root.put("schemaVersion", SUPPORTED_SCHEMA_VERSION);
@@ -274,6 +336,13 @@ public final class JsonConversationStore implements ConversationStore {
             ObjectNode node = messages.addObject();
             node.put("role", message.role());
             node.put("content", message.content());
+        }
+        if (state.summary() != null) {
+            ObjectNode summary = root.putObject("summary");
+            summary.put("formatVersion", state.summary().formatVersion());
+            summary.put("coveredMessages", state.summary().coveredMessages());
+            summary.put("coveredFingerprint", state.summary().coveredFingerprint());
+            summary.put("text", state.summary().text());
         }
         return MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(root) + "\n";
     }

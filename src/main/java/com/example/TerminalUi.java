@@ -74,6 +74,13 @@ public interface TerminalUi extends AutoCloseable {
      */
     boolean confirmHistoryClear(String subject);
 
+    /**
+     * Подтверждение сравнения (/context compare): два запроса на одной
+     * истории, возможный дополнительный запрос на создание резюме.
+     * true — только y или yes.
+     */
+    boolean confirmCompare();
+
     /** Индикатор на время HTTP-запроса; используйте в try-with-resources. */
     ProgressIndicator startProgress();
 
