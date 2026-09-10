@@ -56,6 +56,36 @@ public final class SessionTokenStats {
     private long compareCompletionTokens;
 
     /**
+     * Накопленная экономия/перерасход входных токенов обычных запросов
+     * за счёт сжатия (День 9.2): оценка ≈ (разница локальной оценки полного
+     * входа и фактического prompt_tokens запроса со сжатием). Положительное
+     * значение — экономия, отрицательное — перерасход. Запросы без usage
+     * не попадают в сумму и помечаются неизвестными («недостаточно данных»).
+     */
+    private long contextSavingsPromptTokens;
+    private long contextSavingsRequests;
+    private long contextSavingsEstimatedRequests;
+    private long contextSavingsUnknownRequests;
+
+    /**
+     * Учитывает оценку (≈) разницы входа одного запроса со сжатием против
+     * гипотетического полного входа. Вызывается ровно один раз на успешный
+     * обычный запрос в режиме summary. positive = экономия.
+     */
+    public void recordContextSavings(long deltaTokens, boolean exact,
+                                     boolean actualPromptKnown) {
+        if (!actualPromptKnown) {
+            contextSavingsUnknownRequests++;
+            return;
+        }
+        contextSavingsPromptTokens += deltaTokens;
+        contextSavingsRequests++;
+        if (!exact) {
+            contextSavingsEstimatedRequests++;
+        }
+    }
+
+    /**
      * Журнал учтённого расхода по попыткам: ровно одна запись на запрос,
      * в порядке попыток. Значения те же, что уже учтены в суммах, — это
      * детализация для таблиц /demo stats, а не отдельный счётчик.
@@ -178,7 +208,9 @@ public final class SessionTokenStats {
                 requestsWithPartialUsage, totalPromptTokens, totalCompletionTokens, complete,
                 regularAttempts, regularPromptTokens, regularCompletionTokens,
                 summaryAttempts, summaryPromptTokens, summaryCompletionTokens,
-                compareAttempts, comparePromptTokens, compareCompletionTokens);
+                compareAttempts, comparePromptTokens, compareCompletionTokens,
+                contextSavingsPromptTokens, contextSavingsRequests,
+                contextSavingsEstimatedRequests, contextSavingsUnknownRequests);
     }
 
     /**
@@ -204,7 +236,22 @@ public final class SessionTokenStats {
             long summaryCompletionTokens,
             long compareAttempts,
             long comparePromptTokens,
-            long compareCompletionTokens) {
+            long compareCompletionTokens,
+            /** Оценка (≈) накопленной экономии входа обычных запросов за счёт сжатия. */
+            long contextSavingsPromptTokens,
+            long contextSavingsRequests,
+            long contextSavingsEstimatedRequests,
+            long contextSavingsUnknownRequests) {
+
+        /** Учтена ли экономия без зазора (все запросы с фактическим usage). */
+        public boolean contextSavingsKnown() {
+            return contextSavingsUnknownRequests == 0;
+        }
+
+        /** Есть ли хотя бы одна учтённая оценка различия входа. */
+        public boolean contextSavingsAvailable() {
+            return contextSavingsRequests > 0 || contextSavingsUnknownRequests > 0;
+        }
 
         /**
          * Учтённый расход сессии: сумма известных prompt_tokens и

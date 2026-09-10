@@ -349,6 +349,20 @@ public final class Main {
         if (d != null) {
             text.append("\n  вход обычного запроса: ").append(orNoData(d.promptTokens()))
                     .append(" · выход: ").append(orNoData(d.completionTokens()));
+            // День 9.2: оценка выгоды сжатия по фактическому usage и локальной
+            // оценке полного входа; метка ≈ — это оценка, не замер обоих
+            // состояний.
+            Integer estimatedFull = agent.lastEstimatedFullPromptTokens();
+            if (estimatedFull != null && d.promptTokens() != null) {
+                long delta = (long) estimatedFull - d.promptTokens();
+                text.append("\n  вход без сжатия ≈").append(estimatedFull)
+                        .append(" · разница: ")
+                        .append(delta >= 0 ? "экономия " + delta : "увеличение " + (-delta))
+                        .append(" токенов входа (оценка ≈; по одному запросу)");
+            } else if (estimatedFull != null) {
+                text.append("\n  вход без сжатия ≈").append(estimatedFull)
+                        .append(" · разница: недостаточно данных (usage запроса отсутствует)");
+            }
         }
         if (stats.summaryAttempts() > 0) {
             text.append("\n  расход суммаризации (за сессию): вход ")
@@ -553,8 +567,65 @@ public final class Main {
                     .append("расход таких запросов не учтён)");
         }
         text.append("\n  ").append(limitStatsLine(agent));
+        text.append("\n  ").append(compressionBalanceLine(stats));
         text.append("\n  ").append(costLine(settings, stats, anyUsage));
         return text.toString();
+    }
+
+    /**
+     * День 9.2: баланс сжатия для /stats — накопленная экономия/перерасход
+     * входа обычных запросов (оценка ≈), затраты на суммаризацию и итоговый
+     * баланс. Отсутствие данных помечается как «недостаточно данных», а не ноль.
+     */
+    static String compressionBalanceLine(SessionTokenStats.Snapshot stats) {
+        StringBuilder line = new StringBuilder("баланс сжатия (День 9):");
+        if (!stats.contextSavingsAvailable()) {
+            line.append(" экономия входа: недостаточно данных")
+                    .append(" (обычные запросы со сжатием ещё не выполнялись)");
+        } else {
+            long savings = stats.contextSavingsPromptTokens();
+            line.append(" экономия входа: ")
+                    .append(stats.contextSavingsKnown()
+                            ? String.valueOf(savings) + " prompt_tokens"
+                            : "недостаточно данных (у части запросов usage отсутствует)")
+                    .append(" (оценка ≈, запросов: ").append(stats.contextSavingsRequests())
+                    .append(stats.contextSavingsEstimatedRequests() > 0
+                            ? ", из них локальных оценок: " + stats.contextSavingsEstimatedRequests()
+                            : "")
+                    .append(")")
+                    .append(" · накопленный знак: ")
+                    .append(savings >= 0 ? "экономия" : "перерасход");
+        }
+        // Расход суммаризации: те же счётчики назначения SUMMARY.
+        long summaryPrompt = stats.summaryPromptTokens();
+        long summaryCompletion = stats.summaryCompletionTokens();
+        line.append(" · затраты на суммаризацию: ")
+                .append(stats.summaryAttempts() == 0
+                        ? "недостаточно данных (суммаризация не выполнялась)"
+                        : "вход " + summaryPrompt + " · выход " + summaryCompletion
+                        + (statisticalCompressionIncomplete(stats)
+                        ? " (часть запросов суммаризации без полного usage)"
+                        : " (полные данные)"));
+        if (stats.contextSavingsRequests() > 0 && stats.contextSavingsKnown()
+                && stats.summaryAttempts() > 0 && stats.complete()) {
+            long balance = stats.contextSavingsPromptTokens()
+                    - (summaryPrompt + summaryCompletion);
+            line.append(" · итоговый баланс (≈, экономия минус затраты): ")
+                    .append(balance >= 0 ? "+" : "").append(balance);
+        } else {
+            line.append(" · итоговый баланс: недостаточно данных")
+                    .append(stats.summaryAttempts() > 0 && !stats.complete()
+                            ? " (у части запросов usage отсутствует)"
+                            : "");
+        }
+        return line.toString();
+    }
+
+    private static boolean statisticalCompressionIncomplete(SessionTokenStats.Snapshot stats) {
+        // Частичный или отсутствующий usage в сессии может относиться к любым
+        // запросам; для суммаризации честно помечаем неопределённость, если итог
+        // неполный и суммаризация выполнялась.
+        return stats.summaryAttempts() > 0 && !stats.complete();
     }
 
     /**
@@ -868,6 +939,14 @@ public final class Main {
         if (!ui.confirmCompare()) {
             ui.showSystem("Сравнение отменено. API не вызывался, история сохранена.");
             return;
+        }
+        // День 9.2: явное сравнение выполняется независимо от оценки выгоды,
+        // но честно предупреждает, если локальная оценка (≈) указывает,
+        // что сжатие не уменьшит вход.
+        if (!agent.compressionBenefitLikely()) {
+            ui.showSystem("Предупреждение (локальная оценка ≈): сжатие сейчас невыгодно — "
+                    + "заменяемые сообщения короче ожидаемого резюме. Сравнение всё равно "
+                    + "выполняется по явному запросу.");
         }
         ui.showSystem("Снимок истории зафиксирован. Выполняются два запроса "
                 + "последовательно…");

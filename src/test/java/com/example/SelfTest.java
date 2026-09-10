@@ -165,6 +165,12 @@ public final class SelfTest {
             checkDay9CompareUsageGaps();
             checkDay9ContextCaptions();
             checkDay9ArchiveNoLossAcrossModes();
+            checkDay92BenefitGateShortSkips();
+            checkDay92BenefitGateProfitableRuns();
+            checkDay92RefreshWarnsButRuns();
+            checkDay92CompareWarnsButRuns();
+            checkDay92CompactTemplateAndRules();
+            checkDay92StatsBalanceLine();
             checkTwoProcessIntegration();
         } finally {
             deleteRecursively(baseTempDir);
@@ -3208,7 +3214,10 @@ public final class SelfTest {
             regularHits.incrementAndGet();
             return new Response(200, ("{\"choices\":[{\"finish_reason\":\"stop\",\"message\":"
                     + "{\"role\":\"assistant\",\"content\":\"Ответ "
-                    + answerNumber.incrementAndGet() + "\"}}],"
+                    + answerNumber.incrementAndGet()
+                    + ". Подробное развернутое подтверждение с деталями: требование "
+                    + "зафиксировано целиком, повторено в терминах переписки и сохранено "
+                    + "для дальнейших шагов без сокращений\"}}],"
                     + "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20,"
                     + "\"total_tokens\":30}}").getBytes(StandardCharsets.UTF_8));
         });
@@ -3277,7 +3286,7 @@ public final class SelfTest {
             expect("несжатый хвост отправляется дословно, без дублирования покрытых",
                     regularMessages.size() == 4 // system + tail (2 сообщения) + новый вопрос
                             && "вопрос 3".equals(regularMessages.get(1).path("content").asText())
-                            && "Ответ 3".equals(regularMessages.get(2).path("content").asText())
+                            && regularMessages.get(2).path("content").asText().startsWith("Ответ 3")
                             && "вопрос 4".equals(regularMessages.get(3).path("content").asText()));
 
             // Полный архив сохранён, резюме хранится отдельно, как сущность.
@@ -4327,6 +4336,232 @@ public final class SelfTest {
         passed++;
         System.out.println("OK: " + description);
     }
+
+    // ---------- День 9.2: оценка выгоды и баланс ----------
+
+    /** Короткие сообщения с односложными ответами: сжатие пропускается. */
+    private static void checkDay92BenefitGateShortSkips() throws Exception {
+        Path keyStore = day9KeyStore();
+        AtomicInteger summaryHits = new AtomicInteger();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            // Односложные ответы ассистента — как в реальном замере Дня 9.
+            if (requestBody.contains(SUMMARY_MARKER)) {
+                summaryHits.incrementAndGet();
+                return new Response(200, ("{\"choices\":[{\"finish_reason\":\"stop\","
+                        + "\"message\":{\"role\":\"assistant\",\"content\":\"Резюме: тест\"}}],"
+                        + "\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":5}}")
+                        .getBytes(StandardCharsets.UTF_8));
+            }
+            return new Response(200, ("{\"choices\":[{\"finish_reason\":\"stop\","
+                    + "\"message\":{\"role\":\"assistant\",\"content\":\"Запомнил.\"}}],"
+                    + "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}")
+                    .getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort() + "/v1/chat/completions",
+                    "glm-5.3-flash");
+            JsonConversationStore store = tempStore();
+            Path historyFile = store.file();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.from(day9Env("2", "2")),
+                    trustedHttpClient(keyStore), store);
+            FakeUi ui = new FakeUi(TerminalUi.Input.command("/exit"));
+            agent.setProgressListener(ui::showSystem);
+            for (int i = 1; i <= 3; i++) {
+                agent.ask("подробный факт пользователя номер " + i + " с числом, датой "
+                        + "и запретом: длинное содержательное сообщение проекта, история "
+                        + "действий, требований и ограничений, доля сведений пользователя "
+                        + "в заменяемом объёме велика, и сжатие заведомо невыгодно");
+            }
+            List<String> notes = agent.consumeContextNotes();
+            expect("короткий сценарий: сжатие пропущено, отмечена невыгодность",
+                    agent.summary() == null
+                            && summaryHits.get() == 0
+                            && notes.stream().anyMatch(
+                                    t -> t.contains("Сжатие сейчас невыгодно")));
+            JsonNode saved = MAPPER.readTree(
+                    Files.readString(historyFile, StandardCharsets.UTF_8));
+            expect("после пропуска сжатия архив сохранён без резюме",
+                    saved.path("messages").size() == 6 && !saved.has("summary"));
+            store.close();
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Выгодный сценарий: короткие вопросы, развёрнутые ответы → сжатие выполняется. */
+    private static void checkDay92BenefitGateProfitableRuns() throws Exception {
+        Path keyStore = day9KeyStore();
+        Day9Server s = startDay9Server(keyStore);
+        try {
+            Config config = new Config("test-key", day9Url(s), "glm-5.3-flash");
+            JsonConversationStore store = tempStore();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.from(day9Env("2", "2")),
+                    trustedHttpClient(keyStore), store);
+            for (int i = 1; i <= 3; i++) {
+                agent.ask("короткий вопрос " + i);
+            }
+            expect("выгодное сжатие выполняется по локальной оценке",
+                    agent.summary() != null && agent.summary().coveredMessages() == 2);
+            store.close();
+        } finally {
+            s.server().stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Явный /summary refresh при невыгодной оценке: предупреждение, но выполнение. */
+    private static void checkDay92RefreshWarnsButRuns() throws Exception {
+        Path keyStore = day9KeyStore();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            if (requestBody.contains(SUMMARY_MARKER)) {
+                return new Response(200, ("{\"choices\":[{\"finish_reason\":\"stop\","
+                        + "\"message\":{\"role\":\"assistant\",\"content\":\"Резюме: тест\"}}],"
+                        + "\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":5}}")
+                        .getBytes(StandardCharsets.UTF_8));
+            }
+            return new Response(200, ("{\"choices\":[{\"finish_reason\":\"stop\","
+                    + "\"message\":{\"role\":\"assistant\",\"content\":\"Запомнил.\"}}],"
+                    + "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}")
+                    .getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort() + "/v1/chat/completions",
+                    "glm-5.3-flash");
+            JsonConversationStore store = tempStore();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.from(day9Env("2", "2")),
+                    trustedHttpClient(keyStore), store);
+            for (int i = 1; i <= 3; i++) {
+                agent.ask("подробный факт пользователя номер " + i + ": имя проекта, датa "
+                        + "сдачи, точное число вариантов, запрет на публикацию и открытый "
+                        + "вопрос о совместимости; строка намеренно длинная, чтобы минимум "
+                        + "содержания превышал безопасный порог выгоды по локальной оценке "
+                        + "и сжатие заведомо не дало бы экономии");
+            }
+            expect("оценка указывает на невыгодность", !agent.compressionBenefitLikely());
+            String result = agent.refreshSummary();
+            expect("refresh выполняется независимо от невыгодной оценки",
+                    agent.summary() != null);
+            expect("перед явным сжатием показано предупреждение",
+                    result != null && result.contains("Предупреждение")
+                            && result.contains("невыгодно"));
+            store.close();
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** /context compare при невыгодной оценке: предупреждение и выполнение. */
+    private static void checkDay92CompareWarnsButRuns() throws Exception {
+        Path keyStore = day9KeyStore();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            if (requestBody.contains(SUMMARY_MARKER)) {
+                return new Response(200, ("{\"choices\":[{\"finish_reason\":\"stop\","
+                        + "\"message\":{\"role\":\"assistant\",\"content\":\"Резюме: тест\"}}],"
+                        + "\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":5}}")
+                        .getBytes(StandardCharsets.UTF_8));
+            }
+            return new Response(200, ("{\"choices\":[{\"finish_reason\":\"stop\","
+                    + "\"message\":{\"role\":\"assistant\",\"content\":\"Запомнил.\"}}],"
+                    + "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}")
+                    .getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort() + "/v1/chat/completions",
+                    "glm-5.3-flash");
+            JsonConversationStore store = tempStore();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.from(day9Env("4", "4")),
+                    trustedHttpClient(keyStore), store);
+            for (int i = 1; i <= 4; i++) {
+                agent.ask("подробный факт пользователя " + i + ": имя проекта, численaч "
+                        + "версия, запрет на публикацию и открытый вопрос; строка длинная, "
+                        + "чтобы содержательная доля превышала порог выгоды и сжатие "
+                        + "показывало невыгодность");
+            }
+            long attemptsBefore = agent.sessionStats().apiAttempts();
+            FakeUi ui = new FakeUi(
+                    TerminalUi.Input.command("/context compare короткая проверка?"),
+                    TerminalUi.Input.command("/exit"));
+            ui.confirmCompareAnswer = true;
+            Main.runLoop(ui, agent, "glm-5.3-flash");
+            expect("сравнение выполняется при невыгодной оценке",
+                    agent.sessionStats().apiAttempts() >= attemptsBefore + 2
+                            && ui.messages.stream().anyMatch(m -> m.contains("БЕЗ СЖАТИЯ")));
+            expect("перед сравнением показано предупреждение о невыгодности",
+                    ui.systems.stream().anyMatch(t -> t.contains("Предупреждение")
+                            && t.contains("невыгодно")));
+            store.close();
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Компактный шаблон summary: плоский список, правила против дублей. */
+    private static void checkDay92CompactTemplateAndRules() {
+        String prompt = LlmAgent.summaryPrompt();
+        expect("шаблон summary: плоский список, «один факт — одна строка»",
+                prompt.contains("плоский список") && prompt.contains("один факт — одна строка"));
+        expect("шаблон запрещает заголовки и Markdown",
+                prompt.contains("без заголовков и Markdown"));
+        expect("шаблон отбрасывает односложные подтверждения ассистента",
+                prompt.contains("«Запомнил.»") && prompt.contains("не сохраняй"));
+        expect("каждое сведение записывается один раз",
+                prompt.contains("каждое сведение записывай один раз"));
+        expect("сохраняются только действующие значения",
+                prompt.contains("только действующие значения"));
+        expect("исправления заменяют прежние значения",
+                prompt.contains("исправления заменяют прежние"));
+        expect("разовые просьбы не превращаются в предпочтения",
+                prompt.contains("не превращай"));
+        expect("пустые разделы не добавляются",
+                prompt.contains("только непустые"));
+        expect("нет обещания постоянного сокращения",
+                prompt.contains("не обещается"));
+        expect("в шаблоне нет Markdown-заголовков",
+                !prompt.contains("##") && !prompt.contains("# Резюме"));
+    }
+
+    /** Баланс экономии/затрат в /stats; отсутствие данных не выдаётся за ноль. */
+    private static void checkDay92StatsBalanceLine() {
+        SessionTokenStats emptyStats = new SessionTokenStats();
+        String emptyLine = Main.compressionBalanceLine(emptyStats.snapshot());
+        expect("без запросов баланс помечен недостатком данных",
+                emptyLine.contains("недостаточно данных"));
+
+        SessionTokenStats usedStats = new SessionTokenStats();
+        usedStats.recordAttempt();
+        usedStats.recordUsage(484, 128);
+        usedStats.recordContextSavings(20, false, true);
+        usedStats.recordAttempt(SessionTokenStats.Purpose.SUMMARY);
+        usedStats.recordUsage(SessionTokenStats.Purpose.SUMMARY, 482, 118);
+        SessionTokenStats.Snapshot used = usedStats.snapshot();
+        String usedLine = Main.compressionBalanceLine(used);
+        expect("баланс показывает оценку экономии и затраты суммаризации",
+                usedLine.contains("экономия входа: 20 prompt_tokens")
+                        && usedLine.contains("вход 482")
+                        && usedLine.contains("выход 118"));
+        long balance = used.contextSavingsPromptTokens()
+                - (used.summaryPromptTokens() + used.summaryCompletionTokens());
+        expect("итоговый баланс = экономия минус затраты суммаризации",
+                usedLine.contains((balance >= 0 ? "+" : "") + balance));
+        expect("баланс отрицательный — перерасход",
+                balance < 0 && usedLine.contains(String.valueOf(balance)));
+
+        SessionTokenStats partialStats = new SessionTokenStats();
+        partialStats.recordUsage(484, 128);
+        partialStats.recordContextSavings(0, false, false);
+        String partialLine = Main.compressionBalanceLine(partialStats.snapshot());
+        expect("отсутствующий usage помечается недостатком данных, а не нулём",
+                partialLine.contains("недостаточно данных"));
+        expect("разница при отсутствии usage не записывается как экономия",
+                partialStats.snapshot().contextSavingsRequests() == 0);
+    }
+
 
     private SelfTest() {
     }
