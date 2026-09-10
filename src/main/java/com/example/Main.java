@@ -300,13 +300,16 @@ public final class Main {
             ui.showSystem(note);
         }
         ui.showSystem(formatContextNotes(agent));
+        // День 9: подпись по фактически отправленному запросу; счётчики
+        // относятся к предыдущей истории (без system-инструкции и нового вопроса).
+        String caption = agent.lastRequestContextCaption();
+        if (caption != null) {
+            ui.showSystem(caption + " (счётчики предыдущей истории; без системной "
+                    + "инструкции и нового вопроса)");
+        }
         RequestDiagnostics diagnostics = agent.getLastDiagnostics();
         if (diagnostics == null) {
             return;
-        }
-        if (diagnostics.omittedPairs() > 0) {
-            ui.showSystem("В запрос включены последние " + diagnostics.includedPairs()
-                    + " обменов. Более ранние сообщения сейчас не учитываются.");
         }
         if (diagnostics.limitReached()) {
             // Генерация остановлена по лимиту; ответ уже показан. Повторный
@@ -336,18 +339,12 @@ public final class Main {
         ConversationSummary summary = agent.summary();
         StringBuilder text = new StringBuilder("Режим контекста: ")
                 .append(settings.contextMode().title());
+        // Покрытие и дословные счётчики уже в подписи контекста по
+        // фактически отправленному запросу — здесь не дублируются.
         if (settings.contextMode() == ContextMode.SUMMARY) {
-            if (summary == null) {
-                text.append(" · резюме: нет (или устарело)")
-                        .append(" · дословно: ").append(d == null ? "нет данных" : d.sentMessages() - 2)
-                        .append(" сообщений");
-            } else {
-                text.append(" · покрыто резюме: ").append(summary.coveredMessages())
-                        .append(" сообщений");
-                if (d != null) {
-                    text.append(" · дословно: ").append(d.includedPairs() * 2).append(" сообщений");
-                }
-            }
+            text.append(summary == null
+                    ? " · резюме: нет (или устарело)"
+                    : " · резюме действует");
         }
         if (d != null) {
             text.append("\n  вход обычного запроса: ").append(orNoData(d.promptTokens()))
@@ -854,9 +851,12 @@ public final class Main {
                     + "сообщений с проверяемыми фактами и повторите.");
             return;
         }
-        if (!agent.hasCompressibleOldMessages()) {
-            ui.showSystem("История пока слишком короткая: старых сообщений вне последних "
-                    + agent.currentSettings().keepLastMessages() + " для сжатия нет, "
+        if (!agent.canCompare()) {
+            // Нет ни корректного резюме с положительной границей, ни старых
+            // сообщений вне последних KEEP — два варианта были бы одинаковыми.
+            ui.showSystem("История пока слишком короткая: нет резюме покрытой части "
+                    + "и старых сообщений вне последних "
+                    + agent.currentSettings().keepLastMessages() + " для сжатия, "
                     + "оба варианта запросов были бы одинаковыми.");
             return;
         }
@@ -896,7 +896,7 @@ public final class Main {
         }
 
         ui.showMessage("СО СЖАТИЕМ\n" + (r.summaryError() != null
-                ? "(ошибка: " + r.summaryError() + ")" : r.summaryAnswer()));
+                ? "(статус: " + r.summaryError() + ")" : r.summaryAnswer()));
         if (r.summaryError() == null) {
             ui.showSystem("  usage: вход " + orNoData(r.summaryPromptTokens())
                     + " · выход " + orNoData(r.summaryCompletionTokens())
@@ -905,11 +905,17 @@ public final class Main {
         }
 
         boolean fullOk = r.fullError() == null;
+        boolean compactSkipped = r.summaryError() != null
+                && r.summaryError().startsWith("сравнение со сжатием не выполнялось");
         boolean summaryOk = r.summaryError() == null;
         boolean previewFailed = !fullOk || !summaryOk
                 || (r.prepPerformed() && r.prepError() != null);
         if (previewFailed) {
             ui.showSystem("Внимание: сравнение НЕ полностью успешное — см. ошибки выше.");
+        }
+        if (compactSkipped) {
+            ui.showSystem("Два одинаковых запроса не выдаются за успешное сравнение: "
+                    + "подготовка резюме не удалась. Расход попытки подготовки учтён.");
         }
 
         StringBuilder table = new StringBuilder("Таблица сравнения (фактические значения usage):");
@@ -926,22 +932,42 @@ public final class Main {
         table.append("\n  расход запроса | ").append(formatSpend(fullSpend, fullOk))
                 .append(" | ").append(formatSpend(summarySpend, summaryOk));
         if (r.prepPerformed()) {
-            table.append("\n  подготовка резюме в этом сравнении: ")
+            table.append("\n  подготовка summary в этом сравнении: ")
                     .append(r.prepError() != null
                             ? "не удалась: " + r.prepError()
                             : formatSpend(prepSpend, true) + " (вход "
                             + orNoData(r.prepPromptTokens()) + " · выход "
                             + orNoData(r.prepCompletionTokens()) + ")");
         } else {
-            table.append("\n  подготовка резюме в этом сравнении: 0 вызовов (переиспользовано ")
-                    .append("ранее созданное резюме; его возможные прошлые затраты отдельно ")
-                    .append("не бесплатны и уже учтены в расходе сессии)");
+            table.append("\n  подготовка summary в этом сравнении: ")
+                    .append("не выполнялась, использовано сохранённое резюме")
+                    .append(" · ранее понесённые затраты суммаризации — отдельно")
+                    .append(" (см. /stats, не «бесплатное создание»)");
         }
+        table.append("\n  расход FULL | ").append(formatSpend(fullSpend, fullOk));
+        table.append("\n  расход SUMMARY | ")
+                .append(compactSkipped ? "нет данных (запрос не выполнялся)"
+                        : formatSpend(summarySpend, summaryOk));
         table.append("\n  общий расход сравнения | ")
                 .append(formatSpend(fullSpend, fullOk))
                 .append(" | ")
-                .append(formatSpend(summarySpend + (r.prepPerformed()
+                .append(compactSkipped ? "нет данных"
+                        : formatSpend(summarySpend + (r.prepPerformed()
                         && r.prepError() == null ? prepSpend : 0), summaryOk));
+        // Экономия входа — только по фактическим prompt_tokens двух успешных
+        // вариантов; если сжатый вариант больше — показываем увеличение.
+        String inputDelta;
+        if (r.fullPromptTokens() == null || r.summaryPromptTokens() == null) {
+            inputDelta = "недостаточно данных (у одного из вариантов usage отсутствует)";
+        } else {
+            long delta = (long) r.fullPromptTokens() - r.summaryPromptTokens();
+            inputDelta = delta >= 0
+                    ? "вход меньше без сжатия на " + delta + " prompt_tokens"
+                    : "вход со сжатием больше на " + (-delta)
+                            + " prompt_tokens (увеличение)";
+        }
+        table.append("\n  разница входа (по факту prompt_tokens): ").append(inputDelta)
+                .append(" · это разница одного запроса, не экономия всей беседы");
         table.append("\n  времена: без сжатия ").append(ms(r.fullNanos()))
                 .append(" мс · со сжатием ").append(ms(r.summaryNanos()))
                 .append(" мс · подготовка резюме ")

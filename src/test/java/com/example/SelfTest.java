@@ -158,6 +158,13 @@ public final class SelfTest {
             checkDay9ContextCommandsNoApi();
             checkDay9Compare();
             checkDay9CompareGuards();
+            checkDay9CompareReadySummary();
+            checkDay9CompareAfterRefresh();
+            checkDay9CompareReuseAfterRestart();
+            checkDay9ComparePrepFailure();
+            checkDay9CompareUsageGaps();
+            checkDay9ContextCaptions();
+            checkDay9ArchiveNoLossAcrossModes();
             checkTwoProcessIntegration();
         } finally {
             deleteRecursively(baseTempDir);
@@ -397,20 +404,13 @@ public final class SelfTest {
                         sessions.size() >= 3
                                 && !sessions.get(sessions.size() - 1).equals(sessions.get(1)));
 
-                // --- Лимит истории: только целые старые пары ---
+                // --- День 9: архив больше не обрезается ---
                 for (int i = 1; i <= LlmAgent.MAX_HISTORY_TURNS + 1; i++) {
                     agent.ask("вопрос " + i);
                 }
-                // После сброса-запроса было 1 пара + 21 новая = 22 → старейшая удалена.
                 List<ChatMessage> fullHistory = agent.getHistory();
-                expect("история ограничена MAX_HISTORY_TURNS парами",
-                        fullHistory.size() == LlmAgent.MAX_HISTORY_TURNS * 2);
-                // Удалены пары «вопрос после сброса» и «вопрос 1»; остались целые пары 2..21.
-                expect("удалены только самые старые целые пары",
-                        "user".equals(fullHistory.get(0).role())
-                                && "вопрос 2".equals(fullHistory.get(0).content())
-                                && "user".equals(fullHistory.get(fullHistory.size() - 2).role())
-                                && "вопрос 21".equals(fullHistory.get(fullHistory.size() - 2).content()));
+                expect("День 9: архив не теряет старые сообщения",
+                        fullHistory.size() == (1 + LlmAgent.MAX_HISTORY_TURNS + 1) * 2);
                 expect("пары в истории не разорваны (чередование user/assistant)",
                         rolesAlternate(fullHistory));
 
@@ -418,14 +418,16 @@ public final class SelfTest {
                 agent.ask(overflowQuestion);
                 JsonNode overflowBody = MAPPER.readTree(lastBody.get());
                 JsonNode overflowMessages = overflowBody.path("messages");
-                expect("запрос при полной истории содержит system, 20 пар и нового user",
-                        overflowMessages.size() == 1 + LlmAgent.MAX_HISTORY_TURNS * 2 + 1);
-                expect("в запросе остались только последние целые пары",
+                expect("запрос при большой истории содержит system, весь архив и нового user",
+                        overflowMessages.size() == 2
+                                + (LlmAgent.MAX_HISTORY_TURNS + 2) * 2);
+                expect("в запросе есть и самые старые, и самые новые пары",
                         "system".equals(overflowMessages.get(0).path("role").asText())
-                                && "вопрос 2".equals(overflowMessages.get(1).path("content").asText())
-                                && "assistant".equals(overflowMessages.get(overflowMessages.size() - 2).path("role").asText())
-                                && overflowQuestion.equals(overflowMessages.get(overflowMessages.size() - 1).path("content").asText())
-                                && streamContents(overflowMessages).noneMatch("вопрос 1"::equals));
+                                && streamContents(overflowMessages).anyMatch(
+                                        m -> m.contains("вопрос после сброса"))
+                                && streamContents(overflowMessages).anyMatch("вопрос 1"::equals)
+                                && streamContents(overflowMessages).noneMatch("Вопрос"::equals)
+                                && overflowQuestion.equals(overflowMessages.get(overflowMessages.size() - 1).path("content").asText()));
 
                 // --- Неудачный запрос при заполненной истории ---
                 List<ChatMessage> historyBeforeFailure = agent.getHistory();
@@ -445,7 +447,7 @@ public final class SelfTest {
                 expect("getHistory возвращает неизменяемый снимок", immutable);
                 agent.ask("вопрос для снимка");
                 expect("снимок истории не изменяется при новых запросах",
-                        snapshot.size() == LlmAgent.MAX_HISTORY_TURNS * 2);
+                        snapshot.size() == (LlmAgent.MAX_HISTORY_TURNS + 3) * 2);
 
                 // --- Диспетчер команд Main и интерфейс ---
                 checkMainDispatch(agent, hitCounter);
@@ -1025,7 +1027,7 @@ public final class SelfTest {
                 expect("после пустого ответа память не изменилась",
                         agent2.getHistory().equals(memoryBeforeError));
 
-                // --- Лимит: на диск сохраняется тот же урезанный контекст ---
+                // --- День 9: на диск сохраняется весь архив без обрезания ---
                 for (int i = 1; i <= LlmAgent.MAX_HISTORY_TURNS + 1; i++) {
                     agent2.ask("вопрос переполнения " + i);
                 }
@@ -1035,10 +1037,10 @@ public final class SelfTest {
                 List<ChatMessage> fileMessages = new ArrayList<>();
                 overflowFile.path("messages").forEach(m -> fileMessages.add(
                         new ChatMessage(m.path("role").asText(), m.path("content").asText())));
-                expect("файл хранит тот же ограниченный контекст, что и память",
+                expect("файл хранит тот же архив, что и память (без обрезания)",
                         fileMessages.equals(memoryAfterOverflow)
-                                && memoryAfterOverflow.size() == LlmAgent.MAX_HISTORY_TURNS * 2);
-                expect("лимит сохраняет на диск только целые пары",
+                                && memoryAfterOverflow.size() > LlmAgent.MAX_HISTORY_TURNS * 2);
+                expect("чек на диске: только целые пары",
                         rolesAlternate(memoryAfterOverflow)
                                 && "user".equals(memoryAfterOverflow.get(0).role()));
             }
@@ -3607,13 +3609,16 @@ public final class SelfTest {
             expect("показаны оба ответа",
                     ui.messages.stream().anyMatch(m -> m.contains("БЕЗ СЖАТИЯ"))
                             && ui.messages.stream().anyMatch(m -> m.contains("СО СЖАТИЕМ")));
-            expect("сравнение делало ровно два запроса API (резюме переиспользовано)",
-                    agent.sessionStats().apiAttempts() == attemptsBefore + 2);
+            // Сжатое резюме покрывает 6 из 10: сравнение готовит инкремент
+            // (COMPARE_SUMMARY_PREP) и выполняет два сравнительных запроса.
+            expect("сравнение = подготовка + ровно два запроса вариантов",
+                    agent.sessionStats().apiAttempts() == attemptsBefore + 3
+                            && agent.sessionStats().compareAttempts() == 3);
             expect("расход сравнения учтён в сессии",
                     agent.sessionStats().knownTotal() > knownBefore);
             SessionTokenStats.Snapshot stats = agent.sessionStats();
-            expect("расход сравнения помечается отдельными назначениями",
-                    stats.compareAttempts() == 2 && stats.regularAttempts() >= 3
+            expect("расход сравнения и суммаризации помечен по назначениям",
+                    stats.compareAttempts() == 3 && stats.regularAttempts() >= 3
                             && stats.summaryAttempts() == 1);
             store.close();
         } finally {
@@ -3675,6 +3680,376 @@ public final class SelfTest {
                             && demoUi.systems.stream().anyMatch(
                                     t -> t.contains("демонстрационном")
                                             || t.contains("сравнивать не на чем")));
+        } finally {
+            s.server().stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    // ---------- День 9: регрессии (исправления Дня 9.1) ----------
+
+    /** Создаёт архив из пар «факт/принял» и возвращает его. */
+    private static List<ChatMessage> seededArchive(String userPrefix, String assistantPrefix,
+                                                   int pairs) {
+        List<ChatMessage> archive = new ArrayList<>();
+        for (int i = 1; i <= pairs; i++) {
+            archive.add(new ChatMessage("user", userPrefix + " " + i));
+            archive.add(new ChatMessage("assistant", "принял " + i));
+        }
+        return archive;
+    }
+
+    private static ConversationSummary seedSummary(List<ChatMessage> archive, int covered,
+                                                   String sessionId, String text) {
+        return new ConversationSummary(text, covered,
+                ConversationSummary.computeFingerprint(sessionId,
+                        new ArrayList<>(archive.subList(0, covered))),
+                ConversationSummary.FORMAT_VERSION);
+    }
+
+    /**
+     * Обязательная регрессия воспроизводённого отказа: архив 12 сообщений,
+     * корректное summary покрывает первые 8, KEEP=4, новых старых сообщений
+     * нет — сравнение выполняется по готовому summary без суммаризации.
+     */
+    private static void checkDay9CompareReadySummary() throws Exception {
+        Path keyStore = day9KeyStore();
+        Day9Server s = startDay9Server(keyStore);
+        try {
+            Config config = new Config("test-key", day9Url(s), "glm-5.3-flash");
+            JsonConversationStore store = tempStore();
+            String sessionId = "seed-session-day9";
+            List<ChatMessage> archive = seededArchive("ранний факт", "принял", 6);
+            List<ChatMessage> covered = new ArrayList<>(archive.subList(0, 8));
+            store.save(new ConversationState(sessionId, archive,
+                    seedSummary(archive, 8, sessionId,
+                            "Резюме: ранние факты 1-4 в свернутом виде")));
+
+            LlmAgent agent = new LlmAgent(config, ModelSettings.from(day9Env("4", "4")),
+                    trustedHttpClient(keyStore), store);
+            expect("готовое summary действует перед сравнением",
+                    agent.summary() != null && agent.summary().coveredMessages() == 8);
+            expect("новых старых сообщений нет (вне последних 4 всё покрыто)",
+                    agent.uncoveredOldMessagesCount() == 0);
+            expect("сравнение возможно по готовому summary", agent.canCompare());
+
+            long attemptsBefore = agent.sessionStats().apiAttempts();
+            int summaryHitsBefore = s.summaryHits().get();
+            long knownBefore = agent.sessionStats().knownTotal();
+            List<ChatMessage> archiveBefore = agent.getHistory();
+            String question = "Составь карточку проекта по нашей переписке";
+
+            FakeUi ui = new FakeUi(
+                    TerminalUi.Input.command("/context compare " + question),
+                    TerminalUi.Input.command("/exit"));
+            ui.confirmCompareAnswer = true;
+            Main.runLoop(ui, agent, "glm-5.3-flash");
+
+            expect("сравнение не блокируется, подтверждение запрошено",
+                    ui.confirmCompareCount == 1);
+            expect("служебного запроса суммаризации нет",
+                    s.summaryHits().get() == summaryHitsBefore);
+            expect("выполняются ровно два обычных запроса сравнения",
+                    agent.sessionStats().apiAttempts() == attemptsBefore + 2
+                            && agent.sessionStats().compareAttempts() == 2);
+
+            List<String> recent = s.bodies().subList(s.bodies().size() - 2, s.bodies().size());
+            String fullBody = null;
+            String compactBody = null;
+            for (String body : recent) {
+                if (body.contains("Резюме: ранние факты")) {
+                    compactBody = body;
+                } else {
+                    fullBody = body;
+                }
+            }
+            JsonNode fullMessages = MAPPER.readTree(fullBody).path("messages");
+            // system + 12 сообщений архива + новый user = 14.
+            expect("FULL содержит все 12 сообщений архива",
+                    fullMessages.size() == 14
+                            && "ранний факт 1".equals(fullMessages.get(1).path("content").asText())
+                            && "ранний факт 6".equals(fullMessages.get(11).path("content").asText())
+                            && fullMessages.get(13).path("content").asText().equals(question));
+            JsonNode compactMessages = MAPPER.readTree(compactBody).path("messages");
+            // system со справкой + 4 последних сообщения + новый user = 6.
+            expect("SUMMARY содержит резюме и последние 4 сообщения",
+                    compactMessages.size() == 6
+                            && compactMessages.get(0).path("content").asText().contains("<<<РЕЗЮМЕ")
+                            && "ранний факт 5".equals(compactMessages.get(1).path("content").asText())
+                            && "принял 6".equals(compactMessages.get(4).path("content").asText())
+                            && compactMessages.get(5).path("content").asText().equals(question));
+            expect("ранние 8 сообщений не дублируются в SUMMARY",
+                    streamContents(compactMessages).noneMatch("ранний факт 1"::equals)
+                            && streamContents(compactMessages).noneMatch("ранний факт 2"::equals)
+                            && streamContents(compactMessages).noneMatch("ранний факт 4"::equals));
+            expect("вопрос одинаковый в обоих вариантах",
+                    streamContents(fullMessages).anyMatch(question::equals)
+                            && streamContents(compactMessages).anyMatch(question::equals));
+            expect("архив и резюме после сравнения не изменились",
+                    agent.getHistory().equals(archiveBefore)
+                            && agent.summary().coveredMessages() == 8);
+            expect("расходы учтены ровно один раз (полный usage обеих веток)",
+                    agent.sessionStats().knownTotal() > knownBefore
+                            && agent.sessionStats().complete());
+            store.close();
+        } finally {
+            s.server().stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Сравнение сразу после /summary refresh: подготовка не требуется. */
+    private static void checkDay9CompareAfterRefresh() throws Exception {
+        Path keyStore = day9KeyStore();
+        Day9Server s = startDay9Server(keyStore);
+        try {
+            Config config = new Config("test-key", day9Url(s), "glm-5.3-flash");
+            JsonConversationStore store = tempStore();
+            String sessionId = "seed-refresh-day9";
+            store.save(new ConversationState(sessionId,
+                    seededArchive("факт уточнения", "принял уточнение", 6)));
+            LlmAgent agent = new LlmAgent(config, ModelSettings.from(day9Env("4", "4")),
+                    trustedHttpClient(keyStore), store);
+            String refreshMsg = agent.refreshSummary();
+            expect("/summary refresh создаёт резюме на 8 сообщений",
+                    agent.summary() != null && agent.summary().coveredMessages() == 8
+                            && refreshMsg != null);
+            long attemptsBefore = agent.sessionStats().apiAttempts();
+            int summaryHitsBefore = s.summaryHits().get();
+            FakeUi ui = new FakeUi(
+                    TerminalUi.Input.command("/context compare какие факты важны?"),
+                    TerminalUi.Input.command("/exit"));
+            ui.confirmCompareAnswer = true;
+            Main.runLoop(ui, agent, "glm-5.3-flash");
+            expect("сравнение сразу после refresh: подготовки нет, два запроса",
+                    agent.sessionStats().apiAttempts() == attemptsBefore + 2
+                            && s.summaryHits().get() == summaryHitsBefore);
+            store.close();
+        } finally {
+            s.server().stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Переиспользование сохранённого summary после перезапуска. */
+    private static void checkDay9CompareReuseAfterRestart() throws Exception {
+        Path keyStore = day9KeyStore();
+        Day9Server s = startDay9Server(keyStore);
+        try {
+            Config config = new Config("test-key", day9Url(s), "glm-5.3-flash");
+            JsonConversationStore store = tempStore();
+            Path historyFile = store.file();
+            String sessionId = "seed-restart-day9";
+            List<ChatMessage> archive = seededArchive("пара для перезапуска", "готово", 5);
+            store.save(new ConversationState(sessionId, archive,
+                    seedSummary(archive, 6, sessionId,
+                            "Резюме перезапуска: факты 1-3 в свернутом виде")));
+            store.close();
+            try (JsonConversationStore reopened = new JsonConversationStore(historyFile)) {
+                LlmAgent agent = new LlmAgent(config, ModelSettings.from(day9Env("4", "4")),
+                        trustedHttpClient(keyStore), reopened);
+                int summaryHitsBefore = s.summaryHits().get();
+                long attemptsBefore = agent.sessionStats().apiAttempts();
+                FakeUi ui = new FakeUi(
+                        TerminalUi.Input.command("/context compare откуда пара 1?"),
+                        TerminalUi.Input.command("/exit"));
+                ui.confirmCompareAnswer = true;
+                Main.runLoop(ui, agent, "glm-5.3-flash");
+                expect("после перезапуска summary переиспользуется без суммаризации",
+                        s.summaryHits().get() == summaryHitsBefore
+                                && agent.sessionStats().apiAttempts() == attemptsBefore + 2);
+            }
+        } finally {
+            s.server().stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /**
+     * Ошибка подготовки summary: full-вариант выполняется, сжатая ветка не
+     * запускается, сравнение помечается неуспешным; расход попытки учтён.
+     */
+    private static void checkDay9ComparePrepFailure() throws Exception {
+        Path keyStore = day9KeyStore();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            if (requestBody.contains(SUMMARY_MARKER)) {
+                return new Response(500, "{\"error\":{\"message\":\"internal\"}}"
+                        .getBytes(StandardCharsets.UTF_8));
+            }
+            return new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                    + "\"content\":\"Ответ\"}}],\"usage\":{\"prompt_tokens\":10,"
+                    + "\"completion_tokens\":20}}").getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort() + "/v1/chat/completions",
+                    "glm-5.3-flash");
+            JsonConversationStore store = tempStore();
+            store.save(new ConversationState("seed-prep-fail",
+                    seededArchive("предрынок подготовки", "ок", 3)));
+            LlmAgent agent = new LlmAgent(config, ModelSettings.from(day9Env("4", "4")),
+                    trustedHttpClient(keyStore), store);
+            long attemptsBefore = agent.sessionStats().apiAttempts();
+            FakeUi ui = new FakeUi(
+                    TerminalUi.Input.command("/context compare ранние события?"),
+                    TerminalUi.Input.command("/exit"));
+            ui.confirmCompareAnswer = true;
+            Main.runLoop(ui, agent, "glm-5.3-flash");
+
+            SessionTokenStats.Snapshot stats = agent.sessionStats();
+            expect("сбой подготовки: full-запрос выполнен как обычный COMPARE_FULL",
+                    agent.sessionStats().apiAttempts() == attemptsBefore + 2);
+            expect("сбой подготовки не выдаёт сравнение за успешное",
+                    ui.messages.stream().anyMatch(m -> m.contains("СО СЖАТИЕМ")
+                            && m.contains("сравнение со сжатием не выполнялось"))
+                            && ui.systems.stream().anyMatch(t ->
+                            t.contains("НЕ полностью успешное")));
+            expect("расход неудачной попытки подготовки известен как минимум",
+                    !stats.complete() || stats.requestsWithoutUsage() > 0);
+            store.close();
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Частичный и отсутствующий usage в сравнении: «недостаточно данных». */
+    private static void checkDay9CompareUsageGaps() throws Exception {
+        Path keyStore = day9KeyStore();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            if (requestBody.contains(SUMMARY_MARKER)) {
+                return new Response(200, ("{\"choices\":[{\"finish_reason\":\"stop\","
+                        + "\"message\":{\"role\":\"assistant\",\"content\":\"Резюме: тест\""
+                        + "}}],\"usage\":{\"prompt_tokens\":30,\"completion_tokens\":4}}")
+                        .getBytes(StandardCharsets.UTF_8));
+            }
+            // Различаем ветки по числу сообщений assistant: FULL содержит
+            // весь архив (4), сжатый вариант — только хвост (3-… 2).
+            int assistantCount = requestBody.split("assistant", -1).length - 1;
+            if (assistantCount >= 4) {
+                // Частичный usage у FULL.
+                return new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                        + "\"content\":\"Ответ Full\"}}],\"usage\":{\"prompt_tokens\":10}}")
+                        .getBytes(StandardCharsets.UTF_8));
+            }
+            // SUMMARY-ветка — без usage вовсе.
+            return new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                    + "\"content\":\"Ответ Summary\"}}]}").getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort() + "/v1/chat/completions",
+                    "glm-5.3-flash");
+            JsonConversationStore store = tempStore();
+            List<ChatMessage> archive = seededArchive("предрынок", "ок", 4);
+            store.save(new ConversationState("seed-usage-day9", archive));
+            LlmAgent agent = new LlmAgent(config, ModelSettings.from(day9Env("4", "4")),
+                    trustedHttpClient(keyStore), store);
+            LlmAgent.CompareResult first = agent.compare("маркерный вопрос");
+            SessionTokenStats.Snapshot stats = agent.sessionStats();
+            expect("подготовка и оба варианта составляют три сравнительных попытки",
+                    stats.compareAttempts() == 3
+                            && first.prepPerformed() && first.prepError() == null
+                            && first.prepPromptTokens() != null
+                            && first.prepCompletionTokens() != null);
+            LlmAgent.CompareResult r = agent.compare("вопрос для разрыва usage");
+            SessionTokenStats.Snapshot stats2 = agent.sessionStats();
+            expect("частичный usage у FULL и отсутствующий у SUMMARY честно помечены",
+                    stats2.totalPromptTokens() >= 50
+                            && stats2.totalCompletionTokens() >= 0
+                            && !stats2.complete()
+                            && r.fullPromptTokens() != null && r.fullCompletionTokens() == null
+                            && r.summaryPromptTokens() == null
+                            && r.summaryCompletionTokens() == null);
+            store.close();
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Подписи фактически отправленного контекста: без резюме, с резюме, пусто, full. */
+    private static void checkDay9ContextCaptions() throws Exception {
+        Path keyStore = day9KeyStore();
+        Day9Server s = startDay9Server(keyStore);
+        try {
+            Config config = new Config("test-key", day9Url(s), "glm-5.3-flash");
+
+            // Пустая история (full по умолчанию).
+            JsonConversationStore empty = tempStore();
+            LlmAgent fullAgent = new LlmAgent(config, ModelSettings.defaults(),
+                    trustedHttpClient(keyStore), empty);
+            fullAgent.ask("первый вопрос");
+            expect("пустая история: подпись «Первый запрос»",
+                    "Первый запрос: предыдущей истории нет".equals(
+                            fullAgent.lastRequestContextCaption()));
+            empty.close();
+
+            // Summary-режим без резюме.
+            JsonConversationStore noSummary = tempStore();
+            LlmAgent noSummaryAgent = new LlmAgent(
+                    config, ModelSettings.from(day9Env("4", "4")),
+                    trustedHttpClient(keyStore), noSummary);
+            noSummaryAgent.ask("начало");
+            noSummaryAgent.ask("начало второе");
+            expect("summary без резюме: дословные сообщения и «Резюме пока не создано»",
+                    "Контекст запроса: 2 сообщений истории дословно. Резюме пока не создано"
+                            .equals(noSummaryAgent.lastRequestContextCaption()));
+
+            // Full: подпись последнего запроса фиксировала 6 сообщений истории
+            // (перед четвёртым запросом в архиве 3 пары).
+            JsonConversationStore fullStore = tempStore();
+            LlmAgent fullAgent2 = new LlmAgent(config, ModelSettings.defaults(),
+                    trustedHttpClient(keyStore), fullStore);
+            for (int i = 1; i <= 4; i++) {
+                fullAgent2.ask("факт " + i);
+            }
+            String fullCaption = fullAgent2.lastRequestContextCaption();
+            expect("full: «вся история — 6 сообщений дословно»",
+                    fullCaption != null
+                            && fullCaption.contains("вся история")
+                            && fullCaption.contains("6 сообщений дословно"));
+            fullStore.close();
+            noSummary.close();
+        } finally {
+            s.server().stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /**
+     * Архив длиннее 20 пар без скрытого обрезания; переключение
+     * summary → full → summary не теряет данные.
+     */
+    private static void checkDay9ArchiveNoLossAcrossModes() throws Exception {
+        Path keyStore = day9KeyStore();
+        Day9Server s = startDay9Server(keyStore);
+        try {
+            Config config = new Config("test-key", day9Url(s), "glm-5.3-flash");
+            JsonConversationStore store = tempStore();
+            Path historyFile = store.file();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.from(day9Env("2", "2")),
+                    trustedHttpClient(keyStore), store);
+            // 12 пар подготовлены до переключений (KEEP=2/BATCH=2 прощает.
+            for (int i = 1; i <= 12; i++) {
+                agent.ask("длинный факт " + i);
+            }
+            List<ChatMessage> archiveAfterSummary = agent.getHistory();
+            agent.setContextMode("full");
+            agent.ask("проверка полного переключения");
+            List<ChatMessage> archiveAfterFull = agent.getHistory();
+            JsonNode saved = MAPPER.readTree(
+                    Files.readString(historyFile, StandardCharsets.UTF_8));
+            expect("архив не терялся при переключениях режимов",
+                    saved.path("messages").size() == 26
+                            && archiveAfterFull.size() == 26
+                            && archiveAfterSummary.size() == 24);
+            agent.setContextMode("summary");
+            agent.ask("заключительный факт");
+            expect("переключение summary → full → summary не теряет архив",
+                    agent.getHistory().size() == 28
+                            && agent.summary() != null);
+            store.close();
         } finally {
             s.server().stop(0);
             Files.deleteIfExists(keyStore);
