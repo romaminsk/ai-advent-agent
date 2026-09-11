@@ -166,6 +166,13 @@ final class PlainTerminalUi implements TerminalUi {
         err.println("  /context   — режим контекста: /context показать, /context full|summary,");
         err.println("             /context compare <вопрос> — сравнение двух запросов (API, с подтверждением)");
         err.println("  /summary   — резюме сжатия: /summary показать, /summary refresh — обновить (API)");
+        err.println("  /strategy  — стратегии контекста: /strategy показать,");
+        err.println("             /strategy sliding-window|facts|branching — переключить (без API),");
+        err.println("             /strategy compare <вопрос> — сравнение трёх стратегий (API, с подтверждением)");
+        err.println("  /facts     — блок фактов: /facts показать, /facts refresh — обновить (API),");
+        err.println("             /facts clear — очистить (подтверждение)");
+        err.println("  /branch    — ветки диалога: /branch list, /branch checkpoint,");
+        err.println("             /branch new <имя>, /branch switch <имя>, /branch delete <имя> (подтверждение)");
         err.println("  /exit      — завершение (также exit, quit)");
     }
 
@@ -210,6 +217,41 @@ final class PlainTerminalUi implements TerminalUi {
         err.println("Если резюме ещё не подготовлено, понадобится дополнительный запрос "
                 + "для его создания.");
         err.println("Это расходует средства или квоту.");
+        String answer = readLine("Продолжить? [y/N] ");
+        String trimmed = answer == null ? "" : answer.trim().toLowerCase(java.util.Locale.ROOT);
+        return trimmed.equals("y") || trimmed.equals("yes");
+    }
+
+    /** Подтверждение сравнения стратегий (/strategy compare); только y или yes. */
+    @Override
+    public boolean confirmStrategyCompare() {
+        err.println("Будут выполнены запросы на одной истории для каждой стратегии "
+                + "(скользящее окно, факты, ветки).");
+        err.println("Если блок фактов пуст, понадобится дополнительный запрос "
+                + "для его подготовки.");
+        err.println("Это расходует средства или квоту.");
+        String answer = readLine("Продолжить? [y/N] ");
+        String trimmed = answer == null ? "" : answer.trim().toLowerCase(java.util.Locale.ROOT);
+        return trimmed.equals("y") || trimmed.equals("yes");
+    }
+
+    /** Подтверждение очистки фактов (/facts clear); только y или yes. */
+    @Override
+    public boolean confirmFactsClear() {
+        err.println("Будет удалён весь блок фактов «ключ: значение» "
+                + "(в памяти и в файле истории).");
+        err.println("Уже потраченные токены не возвращаются; факты придётся");
+        err.println("накапливать заново сообщениями диалога.");
+        String answer = readLine("Продолжить? [y/N] ");
+        String trimmed = answer == null ? "" : answer.trim().toLowerCase(java.util.Locale.ROOT);
+        return trimmed.equals("y") || trimmed.equals("yes");
+    }
+
+    /** Подтверждение удаления ветки (/branch delete <имя>); только y или yes. */
+    @Override
+    public boolean confirmBranchDelete(String name) {
+        err.println("Ветка «" + name + "» будет удалена (в памяти и в файле истории).");
+        err.println("История её хвоста после checkpoint потеряна безвозвратно.");
         String answer = readLine("Продолжить? [y/N] ");
         String trimmed = answer == null ? "" : answer.trim().toLowerCase(java.util.Locale.ROOT);
         return trimmed.equals("y") || trimmed.equals("yes");

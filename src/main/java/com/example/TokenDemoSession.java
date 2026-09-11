@@ -13,11 +13,11 @@ import java.util.regex.Pattern;
  *
  * Пользователь сам вводит все сообщения, ответы приходят от настоящего API,
  * метрики берутся только из фактического usage. Отдельная пустая
- * демонстрационная история живёт во временном файле и не касается основной
+ * временная история живёт во временном файле и не касается основной
  * беседы: после /demo stop основная история и её счётчики неизменны.
  *
  * Особенности режима:
- * - история демо-беседы не ограничивается: все пары отправляются с каждым
+ * - история беседы измерений не ограничивается: все пары отправляются с каждым
  *   запросом (ограничение количества пар отключено);
  * - контекстный бюджет работает только как предупреждение, без блокировки HTTP;
  * - лимит генерации (max_tokens) сохраняется и не увеличивается;
@@ -29,7 +29,7 @@ import java.util.regex.Pattern;
  */
 final class TokenDemoSession {
 
-    /** Одна попытка запроса в журнале демо-режима (включая неуспешные). */
+    /** Одна попытка запроса в журнале режима измерений (включая неуспешные). */
     record AttemptRow(int number, Integer promptTokens, Integer completionTokens,
                       Long httpNanos, String status) {
     }
@@ -44,7 +44,7 @@ final class TokenDemoSession {
     private final JsonConversationStore store;
     private final List<AttemptRow> attempts = new java.util.ArrayList<>();
 
-    /** Номера попыток, после которых история демо-беседы была очищена (/clear). */
+    /** Номера попыток, после которых история беседы измерений была очищена (/clear). */
     private final List<Integer> clearedAfterAttempts = new java.util.ArrayList<>();
     private Integer firstSuccessfulPrompt;
     private Integer lastSuccessfulPrompt;
@@ -56,26 +56,28 @@ final class TokenDemoSession {
         this.store = store;
     }
 
-    /** Агент демонстрационной беседы (сообщения и команды идут в него). */
+    /** Агент временной беседы измерений (сообщения и команды идут в него). */
     LlmAgent agent() {
         return agent;
     }
 
     /**
-     * Создаёт демо-сессию: временный пустой файл истории и отдельный агент
+     * Создаёт сессию измерений: временный пустой файл истории и отдельный агент
      * с неограниченной историей, предупреждающим (не блокирующим) контекстным
      * бюджетом и сохранённым лимитом генерации. HTTP-клиент переиспользуется.
      */
     static TokenDemoSession start(LlmAgent mainAgent) throws IOException {
         ModelSettings s = mainAgent.currentSettings();
-        // Отдельная копия настроек: демо не меняет настройки основной беседы.
+        // Отдельная копия настроек: режим измерений не меняет настройки основной беседы.
         ModelSettings demoSettings = new ModelSettings(
                 s.profile(), s.maxOutputTokens(), s.limitOverridden(), s.temperature(),
                 s.requestTimeoutSeconds(), null, s.contextWindowTokens(),
                 ContextOverflowPolicy.WARN, s.inputPricePer1M(), s.outputPricePer1M(),
                 s.sessionTokenLimit(), false,
                 s.contextMode(), s.keepLastMessages(),
-                s.summaryBatchMessages(), s.summaryMaxOutputTokens());
+                s.summaryBatchMessages(), s.summaryMaxOutputTokens(),
+                s.contextStrategy(), s.slidingWindowMessages(), s.factsWindowMessages(),
+                s.factsMaxOutputTokens(), s.factsUpdateMode());
         Path file = Files.createTempFile("ai-advent-agent-demo-", ".json");
         Files.deleteIfExists(file);
         JsonConversationStore store = new JsonConversationStore(file);
@@ -240,14 +242,14 @@ final class TokenDemoSession {
         return (lastDeltaPrompt >= 0 ? "+" : "") + lastDeltaPrompt + " токенов";
     }
 
-    /** Таблица всех попыток текущей демонстрационной беседы (без вызова API). */
+    /** Таблица всех попыток текущей временной беседы измерений (без вызова API). */
     String table() {
         SessionTokenStats.Snapshot stats = agent.sessionStats();
         ModelSettings settings = agent.currentSettings();
         boolean prices = settings.inputPricePer1M() != null && settings.outputPricePer1M() != null;
 
         StringBuilder text = new StringBuilder(
-                "Таблица демонстрационной беседы (фактические значения usage API):");
+                "Таблица временной беседы измерений (фактические значения usage API):");
         text.append("\n  № | Вход API | Выход API | Накоплено | Стоимость накопительно")
                 .append(" | HTTP, мс | Статус");
         long cumPrompt = 0;
@@ -377,7 +379,7 @@ final class TokenDemoSession {
         return null;
     }
 
-    /** Очищает журнал попыток (команда /reset в демо-режиме: новая беседа). */
+    /** Очищает журнал попыток (команда /reset в режиме измерений: новая беседа). */
     void clearLog() {
         attempts.clear();
         clearedAfterAttempts.clear();
@@ -388,7 +390,7 @@ final class TokenDemoSession {
     }
 
     /**
-     * Отмечает очистку истории демо-беседы (/clear): таблица сохраняется,
+     * Отмечает очистку истории беседы измерений (/clear): таблица сохраняется,
      * между попытками появляется строка «история очищена», чтобы по таблице
      * было видно, что следующий запрос шёл с пустой историей.
      */
@@ -400,7 +402,7 @@ final class TokenDemoSession {
 
     /**
      * Завершает режим: освобождает блокировку и удаляет временные файлы
-     * демо-истории (основная беседа не затрагивается).
+     * истории измерений (основная беседа не затрагивается).
      */
     void close() {
         store.close();

@@ -14,11 +14,11 @@ import java.util.List;
  * текущей истории: это разные показатели (история отправляется повторно,
  * поэтому сумма входов за сессию обычно больше размера истории).
  *
- * С День 9 каждый вызов помечается назначением ({@link Purpose}): обычный
- * ответ, создание/обновление summary, запросы ручного сравнения (full и
- * со сжатием, включая подготовку summary в сравнении). Общий расход
- * считает все назначения ровно один раз: каждый запрос учитывается в одной
- * категории, total_tokens поверх суммы не прибавляется.
+ * Каждый вызов помечается назначением ({@link Purpose}): обычный ответ,
+ * сжатие истории, обновление блока фактов, ручное сравнение (все виды,
+ * включая подготовку). Общий расход считает все назначения ровно один раз:
+ * каждый запрос учитывается в одной категории, total_tokens поверх суммы
+ * не прибавляется.
  */
 public final class SessionTokenStats {
 
@@ -28,12 +28,22 @@ public final class SessionTokenStats {
         REGULAR,
         /** Создание или обновление резюме истории (в том числе /summary refresh). */
         SUMMARY,
-        /** Ручное сравнение: запрос без сжатия. */
+        /** Ручное сравнение сжатия: запрос без сжатия. */
         COMPARE_FULL,
-        /** Ручное сравнение: запрос со сжатым контекстом. */
+        /** Ручное сравнение сжатия: запрос со сжатым контекстом. */
         COMPARE_SUMMARY,
-        /** Ручное сравнение: подготовка резюме внутри сравнения. */
-        COMPARE_SUMMARY_PREP
+        /** Ручное сравнение сжатия: подготовка резюме внутри сравнения. */
+        COMPARE_SUMMARY_PREP,
+        /** Обновление блока фактов (стратегия facts). */
+        FACTS_UPDATE,
+        /** Сравнение стратегий: вариант sliding-window. */
+        COMPARE_SLIDING,
+        /** Сравнение стратегий: вариант facts. */
+        COMPARE_FACTS,
+        /** Сравнение стратегий: вариант branching. */
+        COMPARE_BRANCHING,
+        /** Сравнение стратегий: подготовка фактов внутри сравнения. */
+        COMPARE_FACTS_PREP
     }
 
     private long apiAttempts;
@@ -55,9 +65,13 @@ public final class SessionTokenStats {
     private long comparePromptTokens;
     private long compareCompletionTokens;
 
+    private long factsAttempts;
+    private long factsPromptTokens;
+    private long factsCompletionTokens;
+
     /**
      * Накопленная экономия/перерасход входных токенов обычных запросов
-     * за счёт сжатия (День 9.2): оценка ≈ (разница локальной оценки полного
+     * за счёт сжатия: оценка ≈ (разница локальной оценки полного
      * входа и фактического prompt_tokens запроса со сжатием). Положительное
      * значение — экономия, отрицательное — перерасход. Запросы без usage
      * не попадают в сумму и помечаются неизвестными («недостаточно данных»).
@@ -103,7 +117,9 @@ public final class SessionTokenStats {
         switch (purpose) {
             case REGULAR -> regularAttempts++;
             case SUMMARY -> summaryAttempts++;
-            case COMPARE_FULL, COMPARE_SUMMARY, COMPARE_SUMMARY_PREP -> compareAttempts++;
+            case FACTS_UPDATE -> factsAttempts++;
+            case COMPARE_FULL, COMPARE_SUMMARY, COMPARE_SUMMARY_PREP, COMPARE_SLIDING,
+                    COMPARE_FACTS, COMPARE_BRANCHING, COMPARE_FACTS_PREP -> compareAttempts++;
         }
     }
 
@@ -162,6 +178,22 @@ public final class SessionTokenStats {
                     compareCompletionTokens += completionTokens;
                 }
             }
+            case FACTS_UPDATE -> {
+                if (promptTokens != null) {
+                    factsPromptTokens += promptTokens;
+                }
+                if (completionTokens != null) {
+                    factsCompletionTokens += completionTokens;
+                }
+            }
+            case COMPARE_SLIDING, COMPARE_FACTS, COMPARE_BRANCHING, COMPARE_FACTS_PREP -> {
+                if (promptTokens != null) {
+                    comparePromptTokens += promptTokens;
+                }
+                if (completionTokens != null) {
+                    compareCompletionTokens += completionTokens;
+                }
+            }
         }
     }
 
@@ -209,6 +241,7 @@ public final class SessionTokenStats {
                 regularAttempts, regularPromptTokens, regularCompletionTokens,
                 summaryAttempts, summaryPromptTokens, summaryCompletionTokens,
                 compareAttempts, comparePromptTokens, compareCompletionTokens,
+                factsAttempts, factsPromptTokens, factsCompletionTokens,
                 contextSavingsPromptTokens, contextSavingsRequests,
                 contextSavingsEstimatedRequests, contextSavingsUnknownRequests);
     }
@@ -237,6 +270,10 @@ public final class SessionTokenStats {
             long compareAttempts,
             long comparePromptTokens,
             long compareCompletionTokens,
+            /** Попытки обновления блока фактов. */
+            long factsAttempts,
+            long factsPromptTokens,
+            long factsCompletionTokens,
             /** Оценка (≈) накопленной экономии входа обычных запросов за счёт сжатия. */
             long contextSavingsPromptTokens,
             long contextSavingsRequests,
@@ -255,8 +292,8 @@ public final class SessionTokenStats {
 
         /**
          * Учтённый расход сессии: сумма известных prompt_tokens и
-         * completion_tokens всех запросов (обычные ответы, суммаризация
-         * и сравнение; лимит сессии учитывает все назначения).
+         * completion_tokens всех запросов (обычные ответы, суммаризация, факты
+     * и сравнение; лимит сессии учитывает все назначения).
          * total_tokens повторно не прибавляется — это привело бы к двойному
          * учёту. Переполнение суммы (практически недостижимо) трактуется
          * безопасно: расход считается максимальным, то есть не меньше

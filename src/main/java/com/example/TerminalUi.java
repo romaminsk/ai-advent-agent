@@ -69,7 +69,7 @@ public interface TerminalUi extends AutoCloseable {
 
     /**
      * Подтверждение удаления истории диалога (/clear): subject — «текущего
-     * диалога» или «демонстрационного диалога». true — только y или yes
+     * диалога» или «временной беседы измерений». true — только y или yes
      * без учёта регистра; пустой ввод, EOF и любой другой ответ — отказ.
      */
     boolean confirmHistoryClear(String subject);
@@ -81,6 +81,24 @@ public interface TerminalUi extends AutoCloseable {
      */
     boolean confirmCompare();
 
+    /**
+     * Подтверждение сравнения стратегий (/strategy compare): три запроса
+     * на одной истории, возможный дополнительный запрос на подготовку фактов.
+     * true — только y или yes.
+     */
+    boolean confirmStrategyCompare();
+
+    /**
+     * Подтверждение очистки блока фактов (/facts clear). true — только y или yes.
+     */
+    boolean confirmFactsClear();
+
+    /**
+     * Подтверждение удаления ветки (/branch delete <имя>); история хвоста
+     * ветки будет потеряна безвозвратно. true — только y или yes.
+     */
+    boolean confirmBranchDelete(String name);
+
     /** Индикатор на время HTTP-запроса; используйте в try-with-resources. */
     ProgressIndicator startProgress();
 
@@ -88,7 +106,7 @@ public interface TerminalUi extends AutoCloseable {
     void clearScreen();
 
     /**
-     * Метка активного режима в приглашении ввода (например, «демо»);
+     * Метка активного режима в приглашении ввода например, «измерение»;
      * null возвращает обычное приглашение. Реализации без поддержки
      * метки игнорируют её.
      */

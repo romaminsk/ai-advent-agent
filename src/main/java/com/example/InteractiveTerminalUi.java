@@ -52,6 +52,11 @@ final class InteractiveTerminalUi implements TerminalUi {
                         "/mode fast", "/mode balanced", "/mode detailed",
                         "/context", "/context full", "/context summary",
                         "/context compare ", "/summary", "/summary refresh",
+                        "/strategy", "/strategy sliding-window", "/strategy facts",
+                        "/strategy branching", "/strategy compare ",
+                        "/facts", "/facts refresh", "/facts clear",
+                        "/branch", "/branch list", "/branch checkpoint",
+                        "/branch new ", "/branch switch ", "/branch delete ",
                         "/exit", "exit", "quit"))
                 .build();
         // История ввода хранится только в памяти: файл истории не подключается.
@@ -212,6 +217,13 @@ final class InteractiveTerminalUi implements TerminalUi {
         out.println("  /context   — режим контекста: /context показать, /context full|summary,");
         out.println("             /context compare <вопрос> — сравнение двух запросов (API, с подтверждением)");
         out.println("  /summary   — резюме сжатия: /summary показать, /summary refresh — обновить (API)");
+        out.println("  /strategy  — стратегии контекста: /strategy показать,");
+        out.println("             /strategy sliding-window|facts|branching — переключить (без API),");
+        out.println("             /strategy compare <вопрос> — сравнение трёх стратегий (API, с подтверждением)");
+        out.println("  /facts     — блок фактов: /facts показать, /facts refresh — обновить (API),");
+        out.println("             /facts clear — очистить (подтверждение)");
+        out.println("  /branch    — ветки диалога: /branch list, /branch checkpoint,");
+        out.println("             /branch new <имя>, /branch switch <имя>, /branch delete <имя> (подтверждение)");
         out.println("  /exit      — завершение (также exit, quit)");
         out.println("Стрелки вверх/вниз — предыдущие сообщения, Tab — автодополнение команд.");
         out.flush();
@@ -277,6 +289,59 @@ final class InteractiveTerminalUi implements TerminalUi {
         out.println(dim("Если резюме ещё не подготовлено, понадобится дополнительный "
                 + "запрос для его создания."));
         out.println(dim("Это расходует средства или квоту."));
+        out.flush();
+        try {
+            String answer = reader.readLine("Продолжить? [y/N] ");
+            String trimmed = answer == null ? "" : answer.trim().toLowerCase(Locale.ROOT);
+            return trimmed.equals("y") || trimmed.equals("yes");
+        } catch (UserInterruptException | EndOfFileException e) {
+            return false;
+        }
+    }
+
+    /** Подтверждение сравнения стратегий (/strategy compare); только y или yes. */
+    @Override
+    public boolean confirmStrategyCompare() {
+        PrintWriter out = terminal.writer();
+        out.println(dim("Будут выполнены запросы на одной истории для каждой стратегии "
+                + "(скользящее окно, факты, ветки)."));
+        out.println(dim("Если блок фактов пуст, понадобится дополнительный запрос "
+                + "для его подготовки."));
+        out.println(dim("Это расходует средства или квоту."));
+        out.flush();
+        try {
+            String answer = reader.readLine("Продолжить? [y/N] ");
+            String trimmed = answer == null ? "" : answer.trim().toLowerCase(Locale.ROOT);
+            return trimmed.equals("y") || trimmed.equals("yes");
+        } catch (UserInterruptException | EndOfFileException e) {
+            return false;
+        }
+    }
+
+    /** Подтверждение очистки фактов (/facts clear); только y или yes. */
+    @Override
+    public boolean confirmFactsClear() {
+        PrintWriter out = terminal.writer();
+        out.println(dim("Будет удалён весь блок фактов «ключ: значение» "
+                + "(в памяти и в файле истории)."));
+        out.println(dim("Уже потраченные токены не возвращаются; факты придётся "
+                + "накапливать заново сообщениями диалога."));
+        out.flush();
+        try {
+            String answer = reader.readLine("Продолжить? [y/N] ");
+            String trimmed = answer == null ? "" : answer.trim().toLowerCase(Locale.ROOT);
+            return trimmed.equals("y") || trimmed.equals("yes");
+        } catch (UserInterruptException | EndOfFileException e) {
+            return false;
+        }
+    }
+
+    /** Подтверждение удаления ветки (/branch delete <имя>); только y или yes. */
+    @Override
+    public boolean confirmBranchDelete(String name) {
+        PrintWriter out = terminal.writer();
+        out.println(dim("Ветка «" + name + "» будет удалена (в памяти и в файле истории)."));
+        out.println(dim("История её хвоста после checkpoint потеряна безвозвратно."));
         out.flush();
         try {
             String answer = reader.readLine("Продолжить? [y/N] ");

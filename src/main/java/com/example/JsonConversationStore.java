@@ -6,6 +6,9 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import java.io.IOException;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
@@ -57,11 +60,12 @@ import java.util.Set;
  */
 public final class JsonConversationStore implements ConversationStore {
 
-    /** Текущая поддерживаемая версия формата файла истории (День 9: + summary). */
-    public static final int SUPPORTED_SCHEMA_VERSION = 2;
+    /** Текущая поддерживаемая версия формата (+ блок фактов и ветки). */
+    public static final int SUPPORTED_SCHEMA_VERSION = 3;
 
-    /** Legacy-версия без отдельного резюме; по-прежнему читается полностью. */
+    /** Версии без резюме/фактов/веток; по-прежнему читаются полностью. */
     public static final int LEGACY_SCHEMA_VERSION = 1;
+    public static final int DAY9_SCHEMA_VERSION = 2;
 
     private static final String DEFAULT_DIR_NAME = ".ai-advent-agent";
     private static final String DEFAULT_FILE_NAME = "conversation.json";
@@ -155,16 +159,18 @@ public final class JsonConversationStore implements ConversationStore {
         }
         int schemaVersion = version.asInt();
         if (schemaVersion != SUPPORTED_SCHEMA_VERSION
-                && schemaVersion != LEGACY_SCHEMA_VERSION) {
+                && schemaVersion != LEGACY_SCHEMA_VERSION
+                && schemaVersion != DAY9_SCHEMA_VERSION) {
             // Неизвестную версию не угадываем и файл молча не переписываем.
             throw new ConversationStoreException(
                     "Неизвестная версия формата файла истории: " + file
                             + " (schemaVersion=" + version.asText()
                             + "); приложение поддерживает schemaVersion="
-                            + SUPPORTED_SCHEMA_VERSION + " и читает старые файлы версии "
-                            + LEGACY_SCHEMA_VERSION + ". Файл не изменён: чтобы начать "
-                            + "новую беседу, вручную переименуйте или переместите его "
-                            + "(сохранив копию) и запустите приложение заново.");
+                            + SUPPORTED_SCHEMA_VERSION + " и читает старые файлы версий "
+                            + LEGACY_SCHEMA_VERSION + " и " + DAY9_SCHEMA_VERSION
+                            + ". Файл не изменён: чтобы начать новую беседу, вручную "
+                            + "переименуйте или переместите его (сохранив копию) "
+                            + "и запустите приложение заново.");
         }
 
         JsonNode sessionIdNode = root.get("sessionId");
@@ -203,14 +209,49 @@ public final class JsonConversationStore implements ConversationStore {
             throw corrupt("незавершённая пара: последнее сообщение должно быть assistant");
         }
 
-        ConversationSummary summary = schemaVersion >= SUPPORTED_SCHEMA_VERSION
-                ? parseSummary(root.get("summary"))
-                : null;
-        return new ConversationState(sessionIdNode.asText(), messages, summary);
+        ConversationSummary summary = parseSummaryForVersion(schemaVersion, root);
+        LinkedHashMap<String, String> facts;
+        BranchData branches;
+        try {
+            facts = schemaVersion >= DAY9_SCHEMA_VERSION
+                    ? parseFacts(root.get("facts"))
+                    : null;
+            branches = schemaVersion >= SUPPORTED_SCHEMA_VERSION
+                    ? parseBranches(root.get("branches"), messages.size())
+                    : null;
+        } catch (ConversationStoreException e) {
+            // Ошибка необязательной сущности тоже содержит путь к файлу.
+            throw new ConversationStoreException(e.getMessage() + " Файл: " + file, e);
+        }
+        if (branches == null) {
+            branches = BranchData.empty();
+        } else {
+            if (branches.checkpointIndex() > messages.size()) {
+                throw corrupt("branches.checkpointIndex больше числа сохранённых сообщений");
+            }
+            BranchData.Branch activeBranch = branches.branchByName(branches.active());
+            if (activeBranch != null
+                    && branches.checkpointIndex() + activeBranch.messages().size()
+                    != messages.size()) {
+                // Полная история активной ветки (префикс + хвост) должна
+                // совпадать с массивом messages: иначе модель веток рассинхронизирована.
+                throw corrupt("хвост активной ветки не совпадает с массивом messages");
+            }
+        }
+        return new ConversationState(sessionIdNode.asText(), messages, summary, facts, branches);
     }
 
+    /** Summary читается в версиях 2+; в старых файлах его нет. */
+    private static ConversationSummary parseSummaryForVersion(int schemaVersion, JsonNode root) {
+        return schemaVersion >= DAY9_SCHEMA_VERSION ? parseSummary(root.get("summary")) : null;
+    }
+
+
+
+
+
     /**
-     * Читает необязательную сущность summary (День 9). Старый файл без поля
+     * Читает необязательную сущность summary. Старый файл без поля
      * summary остаётся совместимым — возвращается null. Повреждённое или
      * неоднозначное поле — ошибка повреждения: применять его молча нельзя.
      */
@@ -242,6 +283,129 @@ public final class JsonConversationStore implements ConversationStore {
                             + "переместите файл (сохранив копию) и запустите приложение "
                             + "заново.");
         }
+    }
+
+    /**
+     * Читает необязательный блок фактов. Отсутствие — null.
+     * Повреждённое поле (не текст, пустой ключ) — ошибка повреждения:
+     * применять молча нельзя.
+     */
+    private static LinkedHashMap<String, String> parseFacts(JsonNode node) {
+        if (node == null || node.isNull() || node.isMissingNode()) {
+            return null;
+        }
+        if (!node.isObject()) {
+            throw corruptEntity("блок фактов (facts)",
+                    "ожидается объект вида {\"ключ\": \"значение\"}");
+        }
+        LinkedHashMap<String, String> facts = new LinkedHashMap<>();
+        Iterator<String> nameIterator = node.fieldNames();
+        while (nameIterator.hasNext()) {
+            String key = nameIterator.next();
+            JsonNode valueNode = node.get(key);
+            if (key.isBlank() || !valueNode.isTextual() || valueNode.asText().isBlank()) {
+                throw corruptEntity("блок фактов (facts)",
+                        "ключ «" + key + "» пуст или значение не является текстом");
+            }
+            facts.put(key, valueNode.asText());
+        }
+        return facts;
+    }
+
+    /**
+     * Читает необязательную модель веток. Отсутствие — null
+     * (совместимость со старыми файлами). Хвост каждой ветки — целые пары,
+     * начинающиеся с user; имена уникальны и валидны; активная ветка есть.
+     */
+    private static BranchData parseBranches(JsonNode node, int totalMessages) {
+        if (node == null || node.isNull() || node.isMissingNode()) {
+            return null;
+        }
+        if (!node.isObject()) {
+            throw corruptEntity("модель веток (branches)", "ожидается объект");
+        }
+        JsonNode checkpoint = node.get("checkpointIndex");
+        if (checkpoint == null || !checkpoint.isIntegralNumber()) {
+            throw corruptEntity("модель веток (branches)",
+                    "отсутствует целое checkpointIndex");
+        }
+        int checkpointIndex = checkpoint.asInt();
+        if (checkpointIndex < 0 || checkpointIndex % 2 != 0) {
+            throw corruptEntity("модель веток (branches)",
+                    "checkpointIndex должен быть неотрицательным чётным числом");
+        }
+        JsonNode activeNode = node.get("active");
+        if (activeNode == null || !activeNode.isTextual() || activeNode.asText().isBlank()) {
+            throw corruptEntity("модель веток (branches)", "отсутствует имя активной ветки");
+        }
+        JsonNode listNode = node.get("list");
+        if (listNode == null || !listNode.isArray() || listNode.isEmpty()) {
+            throw corruptEntity("модель веток (branches)",
+                    "отсутствует непустой массив list");
+        }
+        List<BranchData.Branch> branches = new ArrayList<>();
+        java.util.Set<String> usedNames = new java.util.LinkedHashSet<>();
+        for (int i = 0; i < listNode.size(); i++) {
+            JsonNode item = listNode.get(i);
+            if (item == null || !item.isObject()) {
+                throw corruptEntity("модель веток (branches)",
+                        "list[" + i + "] не является объектом");
+            }
+            String name = item.path("name").asText(null);
+            if (name == null || name.isBlank()) {
+                throw corruptEntity("модель веток (branches)",
+                        "list[" + i + "] без имени");
+            }
+            try {
+                name = BranchData.validateName(name);
+            } catch (AgentException e) {
+                throw corruptEntity("модель веток (branches)", e.getMessage());
+            }
+            if (!usedNames.add(name)) {
+                throw corruptEntity("модель веток (branches)",
+                        "повторяющееся имя ветки: " + name);
+            }
+            JsonNode tailNode = item.get("messages");
+            List<ChatMessage> tail = new ArrayList<>();
+            int limit = tailNode != null && tailNode.isArray() ? tailNode.size() : 0;
+            for (int j = 0; j < limit; j++) {
+                JsonNode msg = tailNode.get(j);
+                String role = msg.path("role").asText(null);
+                String content = msg.path("content").asText(null);
+                String expectedRole = (j % 2 == 0) ? "user" : "assistant";
+                if (role == null || !expectedRole.equals(role)) {
+                    throw corruptEntity("модель веток (branches)",
+                            "хвост ветки «" + name + "»: ожидалась роль \""
+                                    + expectedRole + "\"");
+                }
+                if (content == null || content.isBlank()) {
+                    throw corruptEntity("модель веток (branches)",
+                            "хвост ветки «" + name + "»: пустой текст сообщения");
+                }
+                tail.add(new ChatMessage(role, content));
+            }
+            branches.add(new BranchData.Branch(name, tail));
+        }
+        String active = activeNode.asText().toLowerCase(java.util.Locale.ROOT);
+        try {
+            active = BranchData.validateName(active);
+        } catch (AgentException e) {
+            throw corruptEntity("модель веток (branches)", e.getMessage());
+        }
+        try {
+            return new BranchData(checkpointIndex, active, branches);
+        } catch (IllegalArgumentException e) {
+            throw corruptEntity("модель веток (branches)", e.getMessage());
+        }
+    }
+
+    /** Единая ошибка повреждённой необязательной сущности (файл не изменён). */
+    private static ConversationStoreException corruptEntity(String entity, String detail) {
+        return new ConversationStoreException(
+                "Необязательная сущность файла истории повреждена (" + entity + ": "
+                        + detail + "). Файл не изменён приложением. Чтобы начать новую "
+                        + "беседу, вручную переименуйте или переместите файл "
+                        + "(сохранив копию) и запустите приложение заново.");
     }
 
     private static Integer readPositiveInt(JsonNode node, String name) {
@@ -344,7 +508,40 @@ public final class JsonConversationStore implements ConversationStore {
             summary.put("coveredFingerprint", state.summary().coveredFingerprint());
             summary.put("text", state.summary().text());
         }
+        if (state.facts() != null && !state.facts().isEmpty()) {
+            ObjectNode facts = root.putObject("facts");
+            for (Map.Entry<String, String> entry : state.facts().entrySet()) {
+                facts.put(entry.getKey(), entry.getValue());
+            }
+        }
+        BranchData branches = state.branches();
+        if (branches != null && !isTrivialBranching(branches)) {
+            ObjectNode branchesNode = root.putObject("branches");
+            branchesNode.put("checkpointIndex", branches.checkpointIndex());
+            branchesNode.put("active", branches.active());
+            ArrayNode list = branchesNode.putArray("list");
+            for (BranchData.Branch branch : branches.branches()) {
+                ObjectNode item = list.addObject();
+                item.put("name", branch.name());
+                ArrayNode tail = item.putArray("messages");
+                for (ChatMessage message : branch.messages()) {
+                    ObjectNode node = tail.addObject();
+                    node.put("role", message.role());
+                    node.put("content", message.content());
+                }
+            }
+        }
         return MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(root) + "\n";
+    }
+
+    /**
+     * Тривиальное ветвление (только ветка main, checkpoint в начале)
+     * не сериализуется: полная история ветки main и есть массив messages.
+     */
+    private static boolean isTrivialBranching(BranchData branches) {
+        return branches.checkpointIndex() == 0
+                && branches.branches().size() == 1
+                && BranchData.DEFAULT_ACTIVE.equals(branches.active());
     }
 
     /** Открывает lock-файл и берёт блокировку на всё время работы с беседой. */

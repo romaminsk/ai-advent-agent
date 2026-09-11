@@ -64,8 +64,8 @@ public final class Main {
 
     /** Основной цикл чата: команды обрабатываются локально, сообщения уходят агенту.
      *  Возвращает код завершения: 0 — обычное окончание, 1 — сбой сохранения контекста.
-     *  Пока активен демо-режим измерений (/demo tokens), сообщения и просмотр
-     *  статистики относятся к демонстрационной беседе, а не к основной. */
+     *  Пока активен режим измерения токенов (/demo tokens), сообщения и просмотр
+     *  статистики относятся к временной беседе измерений, а не к основной. */
     static int runLoop(TerminalUi ui, LlmAgent agent, String model) {
         DemoRef demoRef = new DemoRef();
         try {
@@ -73,8 +73,10 @@ public final class Main {
             // Ход долгих операций (суммаризация) — в терминал во время запроса.
             agent.setProgressListener(ui::showSystem);
             ui.showSystem(describeMode(agent.currentSettings()));
+            ui.showSystem(describeStrategy(agent));
             ui.showSystem(describeContextMode(agent));
             ui.showSystem(describeSessionLimit(agent.currentSettings()));
+            setBranchLabel(ui, agent, demoRef);
             if (agent.hasRestoredContext()) {
                 ui.showSystem("Контекст восстановлен: "
                         + agent.getHistory().size() / 2 + " завершённых обменов.");
@@ -92,17 +94,26 @@ public final class Main {
                         String normalized = input.text().toLowerCase(java.util.Locale.ROOT);
                         if (normalized.equals("/demo") || normalized.startsWith("/demo ")) {
                             handleDemoCommand(ui, agent, model, normalized, demoRef);
+                        } else if (normalized.equals("/strategy")
+                                || normalized.startsWith("/strategy ")
+                                || normalized.equals("/facts")
+                                || normalized.startsWith("/facts ")
+                                || normalized.equals("/branch")
+                                || normalized.startsWith("/branch ")) {
+                            LlmAgent activeAgent = activeAgent(demoRef, agent);
+                            handleContextDay10Command(ui, activeAgent, input.text(), normalized,
+                                    demoRef);
                         } else if (normalized.equals("/context") || normalized.startsWith("/context ")
                                 || normalized.equals("/summary")
                                 || normalized.startsWith("/summary ")) {
-                            // Пока демо активно, команды относятся к демо-беседе.
+                            // В режиме измерений команды относятся к её беседе.
                             LlmAgent activeAgent = activeAgent(demoRef, agent);
                             handleContextCommand(ui, activeAgent, input.text(), normalized, demoRef);
                         } else {
-                            // Пока демо активно, команды относятся к демо-беседе.
+                            // В режиме измерений команды относятся к её беседе.
                             LlmAgent activeAgent = activeAgent(demoRef, agent);
                             if (demoRef.demo != null && normalized.equals("/reset")) {
-                                demoRef.demo.clearLog(); // новая демонстрационная беседа
+                                demoRef.demo.clearLog(); // новая беседа измерений
                             }
                             if (handleCommand(ui, activeAgent, model, input.text(), demoRef)) {
                                 return 0;
@@ -166,21 +177,448 @@ public final class Main {
                 }
             }
         } finally {
-            // Явный выход во время демо: временные файлы закрываются тихо,
+            // Явный выход во время измерений: временные файлы закрываются тихо,
             // основная история и её счётчики не изменялись.
             if (demoRef.demo != null) {
                 demoRef.demo.close();
-                ui.showSystem("Демонстрационная беседа закрыта; основная история не изменялась.");
+                ui.showSystem("Временная беседа измерений закрыта; основная история не изменялась.");
             }
         }
     }
 
-    /** Активный агент: демо-беседа, если режим включён, иначе основная. */
+    /** Активный агент: беседа измерений, если режим включён, иначе основная. */
     private static LlmAgent activeAgent(DemoRef demoRef, LlmAgent mainAgent) {
         return demoRef.demo != null ? demoRef.demo.agent() : mainAgent;
     }
 
-    /** Изменяемая ссылка на активный демо-режим (null — обычный режим). */
+    /**
+     * Диспетчер команд стратегий: /strategy (показ, переключение, compare),
+     * /facts (показ, refresh, clear), /branch (list, checkpoint, new, switch,
+     * delete). Команды не попадают в историю.
+     */
+    private static void handleContextDay10Command(TerminalUi ui, LlmAgent agent, String raw,
+                                                  String normalized, DemoRef demoRef) {
+        if (normalized.equals("/strategy") || normalized.startsWith("/strategy ")) {
+            handleStrategyCommand(ui, agent, raw, normalized, demoRef);
+        } else if (normalized.equals("/facts") || normalized.startsWith("/facts ")) {
+            handleFactsCommand(ui, agent, normalized, demoRef);
+        } else {
+            handleBranchCommand(ui, agent, normalized, demoRef);
+        }
+    }
+
+    /**
+     * /strategy: показать текущую стратегию и параметры; /strategy
+     * sliding-window|facts|branching — переключить без вызова API;
+     * /strategy compare <вопрос> — сравнение трёх стратегий (только после
+     * подтверждения).
+     */
+    private static void handleStrategyCommand(TerminalUi ui, LlmAgent agent, String raw,
+                                              String normalized, DemoRef demoRef) {
+        String argument = normalized.length() > "/strategy".length()
+                ? normalized.substring("/strategy".length()).trim()
+                : "";
+        if (argument.isEmpty()) {
+            ui.showSystem(formatStrategy(agent));
+            return;
+        }
+        if (argument.startsWith("compare ")) {
+            String question = raw.substring(raw.toLowerCase(java.util.Locale.ROOT)
+                    .indexOf("compare ") + "compare ".length()).trim();
+            handleStrategyCompareCommand(ui, agent, question, demoRef);
+            return;
+        }
+        switch (argument) {
+            case "sliding-window", "facts", "branching" -> {
+                try {
+                    ModelSettings settings = agent.setStrategy(argument);
+                    ui.showSystem("Стратегия изменена: " + settings.contextStrategy().title()
+                            + ". Действует до конца текущего запуска; история, факты и ветки "
+                            + "не изменены. Следующий запрос будет сформирован по новой "
+                            + "стратегии."
+                            + (settings.contextStrategy() != ContextStrategy.BRANCHING
+                            && settings.contextMode() == ContextMode.SUMMARY
+                            ? "\n  режим контекства summary настроен, но в этой стратегии "
+                            + "не применяется — это отмечается в /context и /tokens."
+                            : ""));
+                    setBranchLabel(ui, agent, demoRef);
+                } catch (AgentException e) {
+                    ui.showError(e.getMessage());
+                }
+            }
+            default -> {
+                try {
+                    agent.setStrategy(argument);
+                } catch (AgentException e) {
+                    ui.showError(e.getMessage());
+                }
+                ui.showSystem("Использование: /strategy [sliding-window|facts|branching], "
+                        + "/strategy compare <вопрос>.");
+            }
+        }
+    }
+
+    /** Описание стратегии для приветствия и /strategy. */
+    static String describeStrategy(LlmAgent agent) {
+        return formatStrategy(agent);
+    }
+
+    /** Текст /strategy: стратегия, её параметры и подсказки по командам. */
+    static String formatStrategy(LlmAgent agent) {
+        ModelSettings s = agent.currentSettings();
+        StringBuilder text = new StringBuilder("Стратегия контекста: ")
+                .append(s.contextStrategy().title());
+        switch (s.contextStrategy()) {
+            case SLIDING_WINDOW -> text
+                    .append("\n  окно: ").append(s.slidingWindowMessages())
+                    .append(" сообщений (LLM_SLIDING_WINDOW_MESSAGES)")
+                    .append("\n  архив диалога хранится полностью; старые сообщения ")
+                    .append("не отправляются в запрос");
+            case FACTS -> text
+                    .append("\n  окно сообщений: ").append(s.factsWindowMessages())
+                    .append(" (LLM_FACTS_WINDOW_MESSAGES)")
+                    .append(" · пар фактов сейчас: ").append(agent.factsView().size())
+                    .append("\n  лимит генерации фактов: ").append(s.factsMaxOutputTokens())
+                    .append(" (LLM_FACTS_MAX_OUTPUT_TOKENS) · режим обновления: ")
+                    .append(s.factsUpdateMode().title())
+                    .append("\n  команды: /facts, /facts refresh, /facts clear");
+            case BRANCHING -> text
+                    .append("\n  активная ветка: «").append(agent.activeBranchName())
+                    .append("»")
+                    .append("\n  команды: /branch list, /branch checkpoint, ")
+                    .append("/branch new <имя>, /branch switch <имя>, ")
+                    .append("/branch delete <имя>");
+        }
+        if (s.contextStrategy() != ContextStrategy.BRANCHING
+                && s.contextMode() == ContextMode.SUMMARY) {
+            text.append("\n  режим контекства summary настроен, но в этой стратегии ")
+                    .append("не применяется; см. /context и README");
+        }
+        text.append("\n  переключение стратегии не вызывает API: меняется способ ")
+                .append("формирования следующего запроса");
+        return text.toString();
+    }
+
+    /** /facts: показать блок фактов без вызова API; /facts refresh; /facts clear. */
+    private static void handleFactsCommand(TerminalUi ui, LlmAgent agent, String normalized,
+                                           DemoRef demoRef) {
+        String argument = normalized.length() > "/facts".length()
+                ? normalized.substring("/facts".length()).trim()
+                : "";
+        switch (argument) {
+            case "" -> ui.showSystem(formatFacts(agent));
+            case "refresh" -> {
+                if (demoRef.demo != null) {
+                    ui.showSystem("В режиме измерения токенов обновление фактов отключено. "
+                            + "Завершите режим (/demo stop) и повторите.");
+                    return;
+                }
+                ui.showSystem(agent.refreshFacts());
+            }
+            case "clear" -> {
+                if (!ui.confirmFactsClear()) {
+                    ui.showSystem("Очистка фактов отменена. Блок сохранён.");
+                    return;
+                }
+                try {
+                    agent.factsClear();
+                    ui.showSystem("Блок фактов очищен (в памяти и в файле истории). "
+                            + "Уже потраченный расход не отменяется.");
+                } catch (ConversationStoreException e) {
+                    ui.showError("Очистка фактов не выполнена, блок не изменён: "
+                            + e.getMessage());
+                }
+            }
+            default -> ui.showSystem("Использование: /facts — показать блок фактов, "
+                    + "/facts refresh (API), /facts clear (с подтверждением).");
+        }
+    }
+
+    /** Текст /facts: текущие факты, параметры и время последнего обновления. */
+    static String formatFacts(LlmAgent agent) {
+        ModelSettings s = agent.currentSettings();
+        var facts = agent.factsView();
+        StringBuilder text = new StringBuilder("Блок фактов (без вызова API): ");
+        if (facts.isEmpty()) {
+            text.append("пуст. Заполняется служебными вызовами после ответов (режим: ")
+                    .append(s.factsUpdateMode().title()).append(")");
+        } else {
+            text.append(facts.size()).append(" пар · режим обновления: ")
+                    .append(s.factsUpdateMode().title());
+            for (var entry : facts.entrySet()) {
+                text.append("\n  ").append(entry.getKey()).append(": ")
+                        .append(entry.getValue());
+            }
+        }
+        Long lastNanos = agent.lastFactsCallNanos();
+        text.append("\n  последний служебный вызов: ")
+                .append(lastNanos == null ? "не выполнялся"
+                        : (lastNanos / 1_000_000) + " мс");
+        return text.toString();
+    }
+
+    /** /branch: list | checkpoint | new | switch | delete. */
+    private static void handleBranchCommand(TerminalUi ui, LlmAgent agent, String normalized,
+                                            DemoRef demoRef) {
+        String argument = normalized.length() > "/branch".length()
+                ? normalized.substring("/branch".length()).trim()
+                : "";
+        switch (argument) {
+            case "", "list" -> ui.showSystem(agent.branchesDescription());
+            case "checkpoint" -> {
+                try {
+                    agent.branchCheckpoint();
+                    ui.showSystem("Checkpoint перенесён на конец текущей истории.\n"
+                            + agent.branchesDescription());
+                } catch (ConversationStoreException e) {
+                    ui.showError("Checkpoint не сохранён, история не изменена: "
+                            + e.getMessage());
+                } catch (AgentException e) {
+                    ui.showError(e.getMessage());
+                }
+            }
+            default -> {
+                String[] parts = argument.split(" ", 2);
+                String sub = parts[0];
+                String name = parts.length > 1 ? parts[1].trim() : "";
+                switch (sub) {
+                    case "new" -> {
+                        if (name.isEmpty()) {
+                            ui.showSystem("Использование: /branch new <имя>.");
+                            return;
+                        }
+                        try {
+                            agent.branchNew(name);
+                            ui.showSystem("Создана ветка «"
+                                    + name.trim().toLowerCase(java.util.Locale.ROOT)
+                                    + "» от checkpoint; диалог продолжается в ней. "
+                                    + "История прежней активной ветки сохранена.");
+                            setBranchLabel(ui, agent, demoRef);
+                        } catch (ConversationStoreException e) {
+                            ui.showError("Ветка не создана: " + e.getMessage());
+                        } catch (AgentException e) {
+                            ui.showError(e.getMessage());
+                        }
+                    }
+                    case "switch" -> {
+                        if (name.isEmpty()) {
+                            ui.showSystem("Использование: /branch switch <имя>.");
+                            return;
+                        }
+                        try {
+                            agent.branchSwitch(name);
+                            ui.showSystem("Ветка «"
+                                    + name.trim().toLowerCase(java.util.Locale.ROOT)
+                                    + "» активна. Истории всех веток сохранены; "
+                                    + "следующее сообщение продолжит выбранную ветку.");
+                            showPendingContextNotes(ui, agent);
+                            setBranchLabel(ui, agent, demoRef);
+                        } catch (ConversationStoreException e) {
+                            ui.showError("Переключение не выполнено, ветки не изменены: "
+                                    + e.getMessage());
+                        } catch (AgentException e) {
+                            ui.showError(e.getMessage());
+                        }
+                    }
+                    case "delete" -> {
+                        if (name.isEmpty()) {
+                            ui.showSystem("Использование: /branch delete <имя>.");
+                            return;
+                        }
+                        if (!ui.confirmBranchDelete(name)) {
+                            ui.showSystem("Удаление отменено. Ветка сохранена.");
+                            return;
+                        }
+                        try {
+                            agent.branchDelete(name);
+                            ui.showSystem("Ветка «"
+                                    + name.trim().toLowerCase(java.util.Locale.ROOT)
+                                    + "» удалена; история её хвоста потеряна безвозвратно.");
+                            showPendingContextNotes(ui, agent);
+                        } catch (ConversationStoreException e) {
+                            ui.showError("Удаление не выполнено, ветки не изменены: "
+                                    + e.getMessage());
+                        } catch (AgentException e) {
+                            ui.showError(e.getMessage());
+                        }
+                    }
+                    default -> ui.showSystem("Использование: /branch [list|checkpoint], "
+                            + "/branch new <имя>, /branch switch <имя>, "
+                            + "/branch delete <имя>.");
+                }
+            }
+        }
+    }
+
+    /** Заметки о ветках после операций (однократное чтение). */
+    private static void showPendingContextNotes(TerminalUi ui, LlmAgent agent) {
+        for (String note : agent.consumeContextNotes()) {
+            ui.showSystem(note);
+        }
+    }
+
+    /**
+     * Метка приглашения с активной веткой; в режиме измерений метка занята
+     * и не перезаписывается, а вне стратегии веток метки нет.
+     */
+    private static void setBranchLabel(TerminalUi ui, LlmAgent agent, DemoRef demoRef) {
+        if (demoRef.demo != null) {
+            return;
+        }
+        if (agent.currentSettings().contextStrategy() == ContextStrategy.BRANCHING) {
+            ui.setActiveModeLabel("ветка: " + agent.activeBranchName());
+        } else {
+            ui.setActiveModeLabel(null);
+        }
+    }
+
+    /**
+     * /strategy compare <вопрос>: подтверждение, один снимок истории,
+     * три последовательных запроса (по одному на каждую стратегию).
+     * Экспериментальные ответы в историю не попадают; расход всех вызовов
+     * учитывается в статистике сессии.
+     */
+    private static void handleStrategyCompareCommand(TerminalUi ui, LlmAgent agent,
+                                                     String question, DemoRef demoRef) {
+        if (question.isBlank()) {
+            ui.showSystem("Использование: /strategy compare <вопрос>.");
+            return;
+        }
+        if (agent.getHistory().isEmpty()) {
+            ui.showSystem("История пока пуста: сравнивать не на чем. Введите несколько "
+                    + "сообщений с проверяемыми фактами и повторите.");
+            return;
+        }
+        if (demoRef.demo != null) {
+            ui.showSystem("В режиме измерения токенов сравнение стратегий отключено. "
+                    + "Завершите режим (/demo stop) и повторите.");
+            return;
+        }
+        if (!ui.confirmStrategyCompare()) {
+            ui.showSystem("Сравнение отменено. API не вызывался, история сохранена.");
+            return;
+        }
+        ui.showSystem("Снимок истории зафиксирован. Выполняются три запроса "
+                + "последовательно…");
+        try (TerminalUi.ProgressIndicator progress = ui.startProgress()) {
+            LlmAgent.StrategyCompareResult result = agent.strategyCompare(question);
+            showStrategyCompareResult(ui, agent, result);
+        }
+        ui.showSystem("Сравнение стратегий завершено. Экспериментальные ответы "
+                + "в историю не добавлялись; расход учтён в статистике сессии.");
+    }
+
+    /** Полный вывод сравнения стратегий: ответы, фактический расход и таблица. */
+    private static void showStrategyCompareResult(TerminalUi ui, LlmAgent agent,
+                                                  LlmAgent.StrategyCompareResult r) {
+        ModelSettings settings = agent.currentSettings();
+        for (LlmAgent.StrategyRow row : r.rows()) {
+            ui.showMessage(row.label() + "\n" + (row.error() != null
+                    ? "(недостоверно: " + row.error() + ")" : row.content()));
+            if (row.error() == null) {
+                ui.showSystem("  расход: вход " + orNoData(row.promptTokens())
+                        + " · выход " + orNoData(row.completionTokens())
+                        + " · время " + ms(row.callNanos()) + " мс · завершение: "
+                        + orNoDataText(row.finishReason()));
+            }
+        }
+        ui.showSystem("Блок фактов на момент сравнения: "
+                + (r.factsPrepPerformed() && r.factsPrepError() != null
+                ? "подготовка не удалась (" + r.factsPrepError() + ")"
+                : r.factsPairs() + " пар")
+                + (r.reusedFacts()
+                ? " · использован сохранённый блок (подготовка не требовалась)"
+                : r.factsPrepPerformed() && r.factsPrepError() == null
+                ? " · подготовлен служебным запросом из снимка сравнения"
+                : ""));
+        long slidingSpend = spend(rowOf(r, ContextStrategy.SLIDING_WINDOW).promptTokens(),
+                rowOf(r, ContextStrategy.SLIDING_WINDOW).completionTokens());
+        long factsSpend = spend(rowOf(r, ContextStrategy.FACTS).promptTokens(),
+                rowOf(r, ContextStrategy.FACTS).completionTokens());
+        long branchingSpend = spend(rowOf(r, ContextStrategy.BRANCHING).promptTokens(),
+                rowOf(r, ContextStrategy.BRANCHING).completionTokens());
+        long prepSpend = spend(r.factsPrepPromptTokens(), r.factsPrepCompletionTokens());
+        long totalKnown = slidingSpend + branchingSpend
+                + factsSpend + prepSpend;
+
+        StringBuilder table = new StringBuilder(
+                "Таблица сравнения стратегий (фактический расход по данным API):");
+        table.append("\n  показатель | sliding-window | facts | branching");
+        table.append("\n  входные токены | ")
+                .append(orNoData(rowOf(r, ContextStrategy.SLIDING_WINDOW).promptTokens()))
+                .append(" | ").append(orNoData(rowOf(r, ContextStrategy.FACTS).promptTokens()))
+                .append(" | ").append(orNoData(rowOf(r, ContextStrategy.BRANCHING).promptTokens()));
+        table.append("\n  выходные токены | ")
+                .append(orNoData(rowOf(r, ContextStrategy.SLIDING_WINDOW).completionTokens()))
+                .append(" | ").append(orNoData(rowOf(r, ContextStrategy.FACTS).completionTokens()))
+                .append(" | ").append(orNoData(rowOf(r, ContextStrategy.BRANCHING).completionTokens()));
+        table.append("\n  расход запроса | ").append(formatSpend(rowSpend(r, ContextStrategy.SLIDING_WINDOW)))
+                .append(" | ").append(formatSpend(rowSpend(r, ContextStrategy.FACTS)))
+                .append(" | ").append(formatSpend(rowSpend(r, ContextStrategy.BRANCHING)));
+        table.append("\n  время ответа | ")
+                .append(ms(rowOf(r, ContextStrategy.SLIDING_WINDOW).callNanos()))
+                .append(" мс | ").append(ms(rowOf(r, ContextStrategy.FACTS).callNanos()))
+                .append(" мс | ").append(ms(rowOf(r, ContextStrategy.BRANCHING).callNanos()))
+                .append(" мс");
+        if (settings.inputPricePer1M() != null && settings.outputPricePer1M() != null) {
+            table.append("\n  стоимость (расчётная, не списание): суммарно по входу ")
+                    .append("≈")
+                    .append(TokenCost.formatUsd(TokenCost.perMillion(
+                            settings.inputPricePer1M(), totalKnown)));
+            table.append("\n  стоимость каждого варианта считайте по его входу/выходу ")
+                    .append("выше; кэширование и reasoning-тарифы расчётом не учитываются");
+        } else {
+            table.append("\n  стоимость: нет данных — тариф не настроен");
+        }
+        table.append("\n  расход запроса = вход + выход (total повторно не прибавляется); ")
+                .append("частичный usage показан как «не менее»");
+        if (r.factsPrepPerformed() && r.factsPrepError() == null) {
+            table.append("\n  расход подготовки фактов: ").append(formatSpend(prepSpend))
+                    .append(" (вход ").append(orNoData(r.factsPrepPromptTokens()))
+                    .append(" · выход ").append(orNoData(r.factsPrepCompletionTokens()))
+                    .append(") — учтён отдельно и входит в лимит сессии");
+        } else if (r.factsPrepPerformed()) {
+            table.append("\n  подготовка фактов не удалась; расход попытки учтён, ")
+                    .append("для части данных он может быть неизвестен (см. /stats)");
+        }
+        table.append("\n  варианты выполнены на одном снимке истории и не попадают ")
+                .append("в эту беседу");
+        table.append("\n  генерации могут различаться даже при одинаковых настройках; ")
+                .append("сравните сохранность фактов и выполнение задачи сами: ")
+                .append("автоматической оценки качества нет");
+        ui.showSystem(table.toString());
+    }
+
+    /** Строка стратегии в результате сравнения. */
+    private static LlmAgent.StrategyRow rowOf(LlmAgent.StrategyCompareResult r,
+                                              ContextStrategy strategy) {
+        for (LlmAgent.StrategyRow row : r.rows()) {
+            if (row.label().equals(strategy.title())) {
+                return row;
+            }
+        }
+        return new LlmAgent.StrategyRow(strategy.title(), null, "строка отсутствует",
+                null, null, null, 0);
+    }
+
+    /** Расход строки стратегии; нет usage — «нет данных», а не ноль. */
+    private static long rowSpend(LlmAgent.StrategyCompareResult r, ContextStrategy strategy) {
+        LlmAgent.StrategyRow row = rowOf(r, strategy);
+        if (row.promptTokens() == null && row.completionTokens() == null) {
+            return -1;
+        }
+        return spend(row.promptTokens(), row.completionTokens());
+    }
+
+    /** формат расхода; нет данных — честно «нет данных». */
+    private static String formatSpend(long known) {
+        if (known < 0) {
+            return "нет данных";
+        }
+        return String.valueOf(known);
+    }
+
+    /** Изменяемая ссылка на активный режим измерений (null — обычный режим). */
     private static final class DemoRef {
         TokenDemoSession demo;
     }
@@ -207,17 +645,17 @@ public final class Main {
                 try {
                     demo = TokenDemoSession.start(agent);
                 } catch (ConversationStoreException | java.io.IOException e) {
-                    ui.showError("Не удалось создать демонстрационную беседу: " + e.getMessage());
+                    ui.showError("Не удалось создать временную беседу измерений: " + e.getMessage());
                     return;
                 }
                 demoRef.demo = demo;
                 demo.agent().setProgressListener(ui::showSystem);
-                ui.setActiveModeLabel("демо");
+                ui.setActiveModeLabel("измерение");
                 ui.showSystem("""
                                 Режим измерения токенов включён.
                                 Вводите сообщения как обычно — каждый запрос отправляется настоящей модели.
 
-                                В этом режиме вся история демонстрационной беседы повторно отправляется \
+                                В этом режиме вся история временной беседы измерений повторно отправляется \
                                 с каждым сообщением. Автоматическое сокращение контекста отключено.
 
                                 Большие запросы могут расходовать значительную квоту или средства. \
@@ -253,7 +691,7 @@ public final class Main {
         return "Профиль: " + modeSummary(settings);
     }
 
-    /** Описание режима контекста и параметров сжатия (День 9). */
+    /** Описание режима контекста и параметров сжатия. */
     static String describeContextMode(LlmAgent agent) {
         ModelSettings s = agent.currentSettings();
         StringBuilder text = new StringBuilder("Режим контекста: ").append(s.contextMode().title())
@@ -264,7 +702,7 @@ public final class Main {
                 .append(" · лимит генерации резюме: ").append(s.summaryMaxOutputTokens());
         if (agent.contextMaxTurnsConfigured()) {
             text.append("\n  LLM_CONTEXT_MAX_TURNS задана, но в режимах контекста full/summary ")
-                    .append("(День 9) не применяется — отмечается и в /tokens");
+                    .append("не применяется — отмечается и в /tokens");
         }
         return text.toString();
     }
@@ -294,40 +732,89 @@ public final class Main {
      * Не содержит текстов переписки и секретов — только счётчики и метрики.
      */
     private static void showAnswerNotes(TerminalUi ui, LlmAgent agent, String model) {
-        // Заметки о сжатии (обновление summary в обычном запросе) и Day-9
-        // блок с режимом контекста и расходом — независимо от диагностики.
-        for (String note : agent.consumeContextNotes()) {
-            ui.showSystem(note);
-        }
-        ui.showSystem(formatContextNotes(agent));
-        // День 9: подпись по фактически отправленному запросу; счётчики
-        // относятся к предыдущей истории (без system-инструкции и нового вопроса).
+        // Подробные служебные заметки (о сжатии, выгоде и т.п.) показываются
+        // только в подробном режиме диагностики; прочтение обязательное —
+        // это однократное потребление, а не потеря данных.
+        List<String> contextNotes = agent.consumeContextNotes();
+        RequestDiagnostics diagnostics = agent.getLastDiagnostics();
+
+        // По умолчанию — краткий и понятный блок: контекст запроса,
+        // реальные входные/выходные токены, расход сессии и стоимость.
         String caption = agent.lastRequestContextCaption();
         if (caption != null) {
-            ui.showSystem(caption + " (счётчики предыдущей истории; без системной "
-                    + "инструкции и нового вопроса)");
+            ui.showSystem("Контекст: " + caption);
         }
-        RequestDiagnostics diagnostics = agent.getLastDiagnostics();
+        ui.showSystem(formatShortAnswerNote(agent));
+        for (String note : contextNotes) {
+            boolean userFacing = note.startsWith("Стратегия:")
+                    || note.startsWith("Блок фактов")
+                    || note.startsWith("Не удалось обновить факты")
+                    || note.startsWith("Факты обновлены в памяти")
+                    || note.startsWith("Выбрана ветка");
+            if (userFacing || agent.currentSettings().diagnostics()) {
+                ui.showSystem(note);
+            }
+        }
+        String limitNotice = agent.consumeSessionLimitNotice();
+        if (limitNotice != null) {
+            ui.showSystem(limitNotice);
+        }
         if (diagnostics == null) {
             return;
         }
         if (diagnostics.limitReached()) {
             // Генерация остановлена по лимиту; ответ уже показан. Повторный
             // запрос не выполняется — решение за пользователем.
-            ui.showSystem("Ответ мог быть обрезан по лимиту генерации (finish_reason: length). "
-                    + "Для более подробного ответа переключите профиль: /mode detailed, "
-                    + "или задайте LLM_MAX_OUTPUT_TOKENS.");
+            ui.showSystem("Ответ мог быть обрезан по лимиту генерации. Для более подробного "
+                    + "ответа задайте LLM_MAX_OUTPUT_TOKENS или выберите /mode detailed.");
         }
-        // Информационный лимит сессии: показывается независимо от диагностики.
-        showSessionLimitNoticeIfAny(ui, agent);
         if (agent.currentSettings().diagnostics()) {
+            ui.showSystem(formatContextNotes(agent));
             ui.showSystem(formatDiagnostics(diagnostics, model, agent.sessionStats(),
                     agent.currentSettings()));
         }
     }
 
     /**
-     * Компактный блок после обычного ответа (День 9): режим контекста,
+     * Краткая и понятная сводка после ответа (без подробной диагностики):
+     * стратегия, входные/выходные токены по данным API, накопленный расход
+     * сессии и стоимость при известном тарифе.
+     */
+    static String formatShortAnswerNote(LlmAgent agent) {
+        SessionTokenStats.Snapshot stats = agent.sessionStats();
+        ModelSettings settings = agent.currentSettings();
+        RequestDiagnostics d = agent.getLastDiagnostics();
+        StringBuilder text = new StringBuilder();
+        Long factsNanos = agent.lastFactsCallNanos();
+        boolean factsSpent = factsNanos != null
+                && agent.currentSettings().contextStrategy() == ContextStrategy.FACTS;
+        if (settings.inputPricePer1M() != null && settings.outputPricePer1M() != null
+                && stats.requestsWithUsage() > 0) {
+            text.append("Стоимость: ≈")
+                    .append(TokenCost.formatUsd(TokenCost.total(
+                            TokenCost.perMillion(settings.inputPricePer1M(),
+                                    stats.totalPromptTokens()),
+                            TokenCost.perMillion(settings.outputPricePer1M(),
+                                    stats.totalCompletionTokens()))))
+                    .append(" (расчётная)");
+        }
+        StringBuilder result = new StringBuilder("Расход сессии: ")
+                .append(stats.knownTotal())
+                .append(stats.complete() ? "" : " (неполные данные)");
+        if (text.length() > 0) {
+            result.append(" · ").append(text);
+        }
+        if (d != null && (d.promptTokens() != null || d.completionTokens() != null)) {
+            result.append("\\n  последний запрос: вход ")
+                    .append(orNoData(d.promptTokens()))
+                    .append(" · выход ").append(orNoData(d.completionTokens()))
+                    .append(" токенов");
+        }
+        return result.toString();
+    }
+
+    /**
+     * Компактный блок после обычного ответа: режим контекста,
      * покрытие резюме, дословные сообщения, фактический расход обычного
      * запроса, отдельный расход суммаризации за сессию и общий расход.
      * Показывается независимо от LLM_DIAGNOSTICS.
@@ -349,7 +836,7 @@ public final class Main {
         if (d != null) {
             text.append("\n  вход обычного запроса: ").append(orNoData(d.promptTokens()))
                     .append(" · выход: ").append(orNoData(d.completionTokens()));
-            // День 9.2: оценка выгоды сжатия по фактическому usage и локальной
+            // Оценка выгоды сжатия по фактическому usage и локальной
             // оценке полного входа; метка ≈ — это оценка, не замер обоих
             // состояний.
             Integer estimatedFull = agent.lastEstimatedFullPromptTokens();
@@ -512,7 +999,7 @@ public final class Main {
         text.append(" · ≈").append(agent.estimateNextContextTokens()).append(" токенов");
         if (agent.contextMaxTurnsConfigured()) {
             text.append("\n  LLM_CONTEXT_MAX_TURNS задана, но в режимах контекста full/summary ")
-                    .append("(День 9) не применяется: full отправляет весь архив, summary — ")
+                    .append("не применяется: full отправляет весь архив, summary — ")
                     .append("резюме и весь несжатый хвост");
         }
         if (settings.contextWindowTokens() != null) {
@@ -547,7 +1034,7 @@ public final class Main {
                 .append(usageTotals(stats.totalPromptTokens(), stats))
                 .append("\n  выходные токены (фактические, сумма completion_tokens): ")
                 .append(usageTotals(stats.totalCompletionTokens(), stats));
-        // День 9: разбивка по назначениям API-вызовов (без двойного учёта):
+        // Разбивка по назначениям API-вызовов (без двойного учёта):
         // сумма групп равна общим суммам выше.
         text.append("\n  из них обычные ответы: попыток ").append(stats.regularAttempts())
                 .append(" · вход ").append(usageTotals(stats.regularPromptTokens(), stats))
@@ -573,12 +1060,12 @@ public final class Main {
     }
 
     /**
-     * День 9.2: баланс сжатия для /stats — накопленная экономия/перерасход
+     * Баланс сжатия для /stats — накопленная экономия/перерасход
      * входа обычных запросов (оценка ≈), затраты на суммаризацию и итоговый
      * баланс. Отсутствие данных помечается как «недостаточно данных», а не ноль.
      */
     static String compressionBalanceLine(SessionTokenStats.Snapshot stats) {
-        StringBuilder line = new StringBuilder("баланс сжатия (День 9):");
+        StringBuilder line = new StringBuilder("баланс сжатия (оценка ≈):");
         if (!stats.contextSavingsAvailable()) {
             line.append(" экономия входа: недостаточно данных")
                     .append(" (обычные запросы со сжатием ещё не выполнялись)");
@@ -806,10 +1293,10 @@ public final class Main {
         return "стоимость: ≈" + TokenCost.formatUsd(total) + " (расчётная, не списание)";
     }
 
-    // ================= День 9: /context и /summary =================
+    // ================= /context и /summary =================
 
     /**
-     * День 9: команды /context (показ, full, summary, compare) и /summary
+     * Команды /context (показ, full, summary, compare) и /summary
      * (показ, refresh). Переключение режима API не вызывает; сравнение —
      * единственная команда, выполняющая API-запросы, и только после явного
      * подтверждения. Команды в историю не попадают. Вопрос сравнения
@@ -844,7 +1331,7 @@ public final class Main {
         }
         if (normalized.equals("/summary refresh")) {
             if (demoRef.demo != null) {
-                ui.showSystem("В демонстрационном режиме сжатие отключено. "
+                ui.showSystem("В режиме измерения токенов сжатие отключено. "
                         + "Выключите его (/demo stop) и повторите.");
                 return;
             }
@@ -879,7 +1366,7 @@ public final class Main {
     /** /summary без вызова API: резюме, граница покрытия и дословный хвост. */
     static String formatSummary(LlmAgent agent) {
         ModelSettings s = agent.currentSettings();
-        StringBuilder text = new StringBuilder("Резюме покрытой истории (Day-9 сжатие · без вызова API):");
+        StringBuilder text = new StringBuilder("Резюме покрытой истории (сжатие · без вызова API):");
         ContextMode mode = s.contextMode();
         ConversationSummary summary = agent.summary();
         text.append("\n  режим контекста: ").append(mode.title());
@@ -932,7 +1419,7 @@ public final class Main {
             return;
         }
         if (demoRef.demo != null) {
-            ui.showSystem("В демонстрационном режиме сжатие отключено. "
+            ui.showSystem("В режиме измерения токенов сжатие отключено. "
                     + "Выключите его (/demo stop) и повторите сравнение.");
             return;
         }
@@ -940,7 +1427,7 @@ public final class Main {
             ui.showSystem("Сравнение отменено. API не вызывался, история сохранена.");
             return;
         }
-        // День 9.2: явное сравнение выполняется независимо от оценки выгоды,
+        // Явное сравнение выполняется независимо от оценки выгоды,
         // но честно предупреждает, если локальная оценка (≈) указывает,
         // что сжатие не уменьшит вход.
         if (!agent.compressionBenefitLikely()) {
@@ -1155,13 +1642,13 @@ public final class Main {
      * записывается на диск тем же механизмом, что и /reset (новая сессия
      * x-opencode-session), затем очищается память. Статистика сессии,
      * лимиты и тарифы не сбрасываются — удаление не отменяет потраченные
-     * токены. В демо-режиме очищается только история демонстрационного
+     * токены. В режиме измерений очищается только история временной
      * диалога. Команда не вызывает API; при ошибке записи история
      * в памяти сохраняется, CLI продолжает работать.
      */
     private static void handleClearCommand(TerminalUi ui, LlmAgent agent, DemoRef demoRef) {
         boolean demoMode = demoRef.demo != null;
-        String subject = demoMode ? "демонстрационного диалога" : "текущего диалога";
+        String subject = demoMode ? "временной беседы измерений" : "текущего диалога";
         if (!ui.confirmHistoryClear(subject)) {
             ui.showSystem("Удаление отменено. История сохранена.");
             return;
@@ -1169,11 +1656,11 @@ public final class Main {
         try {
             agent.resetConversation();
             if (demoMode) {
-                // Журнал попыток демо сохраняется: между попытками появляется
+                // Журнал попыток сохраняется: между попытками появляется
                 // пометка «история очищена (/clear)».
                 demoRef.demo.markHistoryCleared();
-                ui.showSystem("История демонстрационного диалога удалена.\n"
-                        + "Расход и таблица демонстрационного режима сохранены.");
+                ui.showSystem("История временной беседы измерений удалена.\n"
+                        + "Расход и таблица режима измерений сохранены.");
             } else {
                 ui.showSystem("История текущего диалога удалена (вместе с резюме, "
                         + "если оно было). Можно начать новую беседу.\n"
