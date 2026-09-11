@@ -2,6 +2,8 @@ package com.example;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.sun.net.httpserver.HttpsConfigurator;
 import com.sun.net.httpserver.HttpsServer;
 
@@ -171,6 +173,21 @@ public final class SelfTest {
             checkDay92CompareWarnsButRuns();
             checkDay92CompactTemplateAndRules();
             checkDay92StatsBalanceLine();
+            checkDay10SettingsValidation();
+            checkDay10StrategySwitchNoApi();
+            checkDay10SlidingWindow();
+            checkDay10FactsFlow();
+            checkDay10FactsManualAndClear();
+            checkDay10FactsInSessionLimit();
+            checkDay10Branching();
+            checkDay10BranchPersistence();
+            checkDay10StrategyCompare();
+            checkDay10CompareGuards();
+            checkDay10OtherStoreValidation();
+            checkFactsPrepLengthAbortsCompare();
+            checkFactsNearLimitWarning();
+            checkUserFacingOutputNeutral();
+            checkDiagnosticsHiddenByDefault();
             checkTwoProcessIntegration();
         } finally {
             deleteRecursively(baseTempDir);
@@ -291,7 +308,11 @@ public final class SelfTest {
                         "https://127.0.0.1:" + server.getAddress().getPort() + "/v1/chat/completions",
                         "glm-5.3-flash");
                 JsonConversationStore store = tempStore();
-                LlmAgent agent = new LlmAgent(config, ModelSettings.defaults(), trustedHttpClient(keyStore), store);
+                // Стратегия branching: без веток контекст — вся история дословно
+                // (как в режиме full Дня 9), поэтому этот общий диалог проверяет
+                // прежние семантики после появления стратегий.
+                LlmAgent agent = new LlmAgent(config, ModelSettings.from(branchingEnv()),
+                        trustedHttpClient(keyStore), store);
                 Path historyFile = store.file();
 
                 // --- Первый запрос: system + user ---
@@ -485,6 +506,13 @@ public final class SelfTest {
         boolean confirmAnswer = false;
         int confirmCompareCount = 0;
         boolean confirmCompareAnswer = false;
+        int confirmStrategyCompareCount = 0;
+        boolean confirmStrategyCompareAnswer = false;
+        int confirmFactsClearCount = 0;
+        boolean confirmFactsClearAnswer = false;
+        int confirmBranchDeleteCount = 0;
+        boolean confirmBranchDeleteAnswer = false;
+        String confirmBranchDeleteName;
 
         FakeUi(TerminalUi.Input... inputs) {
             this.script = List.of(inputs);
@@ -544,6 +572,25 @@ public final class SelfTest {
         public boolean confirmCompare() {
             confirmCompareCount++;
             return confirmCompareAnswer;
+        }
+
+        @Override
+        public boolean confirmStrategyCompare() {
+            confirmStrategyCompareCount++;
+            return confirmStrategyCompareAnswer;
+        }
+
+        @Override
+        public boolean confirmFactsClear() {
+            confirmFactsClearCount++;
+            return confirmFactsClearAnswer;
+        }
+
+        @Override
+        public boolean confirmBranchDelete(String name) {
+            confirmBranchDeleteCount++;
+            confirmBranchDeleteName = name;
+            return confirmBranchDeleteAnswer;
         }
 
         @Override
@@ -966,7 +1013,7 @@ public final class SelfTest {
             String question1 = "Запомни: кодовое слово «северный маяк», цвет — зелёный.\n"
                     + "Вторая строка вопроса с \"кавычками\"";
             try (JsonConversationStore store1 = new JsonConversationStore(historyFile)) {
-                LlmAgent agent1 = new LlmAgent(config, ModelSettings.defaults(), client, store1);
+                LlmAgent agent1 = new LlmAgent(config, ModelSettings.from(branchingEnv()), client, store1);
                 expect("первый запуск начинает без истории",
                         !agent1.hasRestoredContext() && agent1.getHistory().isEmpty());
                 expect("первый запуск получает ответ", "Ответ 1".equals(agent1.ask(question1)));
@@ -986,7 +1033,7 @@ public final class SelfTest {
 
             // --- Второй «запуск»: восстановление и передача контекста в API ---
             try (JsonConversationStore store2 = new JsonConversationStore(historyFile)) {
-                LlmAgent agent2 = new LlmAgent(config, ModelSettings.defaults(), client, store2);
+                LlmAgent agent2 = new LlmAgent(config, ModelSettings.from(branchingEnv()), client, store2);
                 expect("новый экземпляр восстанавливает пару из файла",
                         agent2.hasRestoredContext()
                                 && agent2.getHistory().equals(List.of(
@@ -1480,6 +1527,8 @@ public final class SelfTest {
             Map<String, String> env = new java.util.HashMap<>();
             env.put("LLM_CONTEXT_MAX_TURNS", "2");
             env.put("LLM_MAX_OUTPUT_TOKENS", "128");
+            // Полный архив отправляется в стратегии веток.
+            env.put("LLM_CONTEXT_STRATEGY", "branching");
             JsonConversationStore store = tempStore();
             LlmAgent agent = new LlmAgent(config, ModelSettings.from(env), client, store);
             Path historyFile = store.file();
@@ -2678,9 +2727,9 @@ public final class SelfTest {
                         capturingStream().stream).confirmHistoryClear("текущего диалога"));
         CapturedStream demoErr = capturingStream();
         new PlainTerminalUi(reader("y\n"), capturingStream().stream, demoErr.stream)
-                .confirmHistoryClear("демонстрационного диалога");
-        expect("в демо подтверждение называет демонстрационный диалог",
-                demoErr.text().contains("Удалить всю историю демонстрационного диалога?"));
+                .confirmHistoryClear("временной беседы измерений");
+        expect("в измерениях подтверждение называет временную беседу",
+                demoErr.text().contains("Удалить всю историю временной беседы измерений?"));
     }
 
     private static void checkClearDemoIsolation() throws Exception {
@@ -2715,10 +2764,10 @@ public final class SelfTest {
             ui.confirmClearAnswer = true;
             Main.runLoop(ui, mainAgent, "glm-5.3-flash");
 
-            expect("/clear в демо называет демонстрационный диалог и сохраняет таблицу",
+            expect("/clear в режиме измерений называет временную беседу и сохраняет таблицу",
                     ui.systems.stream().anyMatch(s ->
-                            s.contains("История демонстрационного диалога удалена")
-                                    && s.contains("Расход и таблица демонстрационного режима сохранены")));
+                            s.contains("История временной беседы измерений удалена")
+                                    && s.contains("Расход и таблица режима измерений сохранены")));
             expect("таблица демо показывает очистку истории между попытками",
                     ui.systems.stream().anyMatch(s ->
                             s.contains("история очищена (/clear)")
@@ -2853,7 +2902,7 @@ public final class SelfTest {
 
             // /demo stats и /demo stop не вызывают API (3 хита — по числу сообщений).
             expect("таблица демо содержит все попытки и сводку",
-                    ui.systems.stream().anyMatch(s -> s.contains("Таблица демонстрационной беседы")
+                    ui.systems.stream().anyMatch(s -> s.contains("Таблица временной беседы измерений")
                             && s.contains("№ | Вход API | Выход API | Накоплено")
                             && s.contains("1 | 123 | 45 | 168")
                             && s.contains("2 | 123 | 45 | 336")
@@ -2929,7 +2978,7 @@ public final class SelfTest {
                     httpUi.systems.stream().anyMatch(s -> s.contains("причина не подтверждена"))
                             && httpUi.messages.size() == 1);
             expect("неуспешная попытка попадает в таблицу без выдуманного расхода",
-                    httpUi.systems.stream().anyMatch(s -> s.contains("Таблица демонстрационной беседы")
+                    httpUi.systems.stream().anyMatch(s -> s.contains("Таблица временной беседы измерений")
                             && s.contains("1 | нет данных | нет данных | 0")
                             && s.contains("HTTP 500 (internal_error)")
                             && s.contains("2 | 123 | 45 | 168")));
@@ -3027,7 +3076,7 @@ public final class SelfTest {
                             s.contains("Режим измерения токенов уже включён")));
             expect("выход во время демо закрывает её без изменения основной истории",
                     doubleUi.systems.stream().anyMatch(s ->
-                            s.contains("Демонстрационная беседа закрыта"))
+                            s.contains("Временная беседа измерений закрыта"))
                             && agent.getHistory().isEmpty() && agent.sessionStats().apiAttempts() == 0);
             store.close();
         } finally {
@@ -3065,17 +3114,17 @@ public final class SelfTest {
         out = capturingStream();
         err = capturingStream();
         PlainTerminalUi labelUi = new PlainTerminalUi(reader("exit\n"), out.stream, err.stream);
-        labelUi.setActiveModeLabel("демо");
+        labelUi.setActiveModeLabel("измерение");
         labelUi.nextInput();
-        expect("приглашение показывает активный демо-режим",
-                err.text().contains("[демо]"));
+        expect("приглашение показывает активный режим измерений",
+                err.text().contains("[измерение]"));
         labelUi.setActiveModeLabel(null);
         out = capturingStream();
         err = capturingStream();
         PlainTerminalUi restoredUi = new PlainTerminalUi(reader("exit\n"), out.stream, err.stream);
         restoredUi.nextInput();
         expect("после выхода из режима приглашение обычное",
-                !err.text().contains("[демо]"));
+                !err.text().contains("[измерение]"));
     }
 
     // ---------- День 8: совместимость со старыми JSON-файлами ----------
@@ -3132,6 +3181,9 @@ public final class SelfTest {
     private static Map<String, String> day9Env(String keep, String batch) {
         Map<String, String> env = new java.util.HashMap<>();
         env.put("LLM_CONTEXT_MODE", "summary");
+        // Сжатие истории применяется внутри стратегии веток; это даёт
+        // старым проверкам те же семантики, что до появления стратегий.
+        env.put("LLM_CONTEXT_STRATEGY", "branching");
         env.put("LLM_CONTEXT_KEEP_LAST_MESSAGES", keep);
         env.put("LLM_SUMMARY_BATCH_MESSAGES", batch);
         return env;
@@ -3226,6 +3278,13 @@ public final class SelfTest {
 
     private static String day9Url(Day9Server s) {
         return "https://127.0.0.1:" + s.server().getAddress().getPort() + "/v1/chat/completions";
+    }
+
+    /** Environment-набор со стратегией branching (семантики full-истории Дней 8–9). */
+    private static Map<String, String> branchingEnv() {
+        Map<String, String> env = new java.util.HashMap<>();
+        env.put("LLM_CONTEXT_STRATEGY", "branching");
+        return env;
     }
 
     private static Path day9KeyStore() throws Exception {
@@ -3687,7 +3746,7 @@ public final class SelfTest {
             expect("в демо-режиме сравнение не выполняется без API",
                     s.regularHits().get() + s.summaryHits().get() == hitsBefore
                             && demoUi.systems.stream().anyMatch(
-                                    t -> t.contains("демонстрационном")
+                                    t -> t.contains("режиме измерения")
                                             || t.contains("сравнивать не на чем")));
         } finally {
             s.server().stop(0);
@@ -4564,5 +4623,897 @@ public final class SelfTest {
 
 
     private SelfTest() {
+    }
+
+    // ================= Стратегии управления контекстом =================
+
+    /** Маркер служебного запроса обновления facts в теле запроса. */
+    private static final String FACTS_MARKER = "Ты обновляешь блок фактов";
+
+    private static Map<String, String> factsEnv() {
+        Map<String, String> env = new java.util.HashMap<>();
+        env.put("LLM_CONTEXT_STRATEGY", "facts");
+        return env;
+    }
+
+    /** Валидация настроек Дня 10: значения, чётность окон, режим обновления. */
+    private static void checkDay10SettingsValidation() {
+        Map<String, String> env = new java.util.HashMap<>();
+        ModelSettings defaults = ModelSettings.from(env);
+        expect("стратегия по умолчанию sliding-window",
+                defaults.contextStrategy() == ContextStrategy.SLIDING_WINDOW
+                        && defaults.slidingWindowMessages()
+                        == ModelSettings.DEFAULT_SLIDING_WINDOW_MESSAGES
+                        && defaults.factsWindowMessages()
+                        == ModelSettings.DEFAULT_FACTS_WINDOW_MESSAGES
+                        && defaults.factsMaxOutputTokens()
+                        == ModelSettings.DEFAULT_FACTS_MAX_OUTPUT_TOKENS
+                        && defaults.factsUpdateMode() == FactsUpdateMode.AUTO);
+
+        env.put("LLM_CONTEXT_STRATEGY", " facts ");
+        expect("LLM_CONTEXT_STRATEGY читается без учёта регистра и пробелов",
+                ModelSettings.from(env).contextStrategy() == ContextStrategy.FACTS);
+        env.put("LLM_CONTEXT_STRATEGY", "branching");
+        expect("стратегия branching читается",
+                ModelSettings.from(env).contextStrategy() == ContextStrategy.BRANCHING);
+        env.put("LLM_SLIDING_WINDOW_MESSAGES", "14");
+        env.put("LLM_FACTS_WINDOW_MESSAGES", "6");
+        env.put("LLM_FACTS_MAX_OUTPUT_TOKENS", "256");
+        env.put("LLM_FACTS_UPDATE_MODE", " manual ");
+        ModelSettings full = ModelSettings.from(env);
+        expect("окна и лимит генерации фактов читаются",
+                full.slidingWindowMessages() == 14 && full.factsWindowMessages() == 6
+                        && full.factsMaxOutputTokens() == 256
+                        && full.factsUpdateMode() == FactsUpdateMode.MANUAL);
+
+        for (String invalid : new String[]{"0", "3", "9", "abc", "-2"}) {
+            Map<String, String> badWindow = new java.util.HashMap<>(env);
+            badWindow.put("LLM_SLIDING_WINDOW_MESSAGES", invalid);
+            try {
+                ModelSettings.from(badWindow);
+                expect("LLM_SLIDING_WINDOW_MESSAGES=" + invalid + " отклоняется", false);
+            } catch (AgentException e) {
+                expect("LLM_SLIDING_WINDOW_MESSAGES=" + invalid + " отклоняется "
+                        + "с понятной ошибкой", e.getMessage()
+                        .contains("LLM_SLIDING_WINDOW_MESSAGES"));
+            }
+            Map<String, String> badFactsWindow = new java.util.HashMap<>(env);
+            badFactsWindow.put("LLM_FACTS_WINDOW_MESSAGES", invalid);
+            try {
+                ModelSettings.from(badFactsWindow);
+                expect("LLM_FACTS_WINDOW_MESSAGES=" + invalid + " отклоняется", false);
+            } catch (AgentException e) {
+                expect("LLM_FACTS_WINDOW_MESSAGES=" + invalid + " отклоняется",
+                        e.getMessage().contains("LLM_FACTS_WINDOW_MESSAGES"));
+            }
+        }
+        Map<String, String> badStrategy = new java.util.HashMap<>(env);
+        badStrategy.put("LLM_CONTEXT_STRATEGY", "summary");
+        try {
+            ModelSettings.from(badStrategy);
+            expect("LLM_CONTEXT_STRATEGY=summary отклоняется", false);
+        } catch (AgentException e) {
+            expect("LLM_CONTEXT_STRATEGY=summary отклоняется",
+                    e.getMessage().contains("LLM_CONTEXT_STRATEGY"));
+        }
+        expectSettingsError(env, "LLM_CONTEXT_STRATEGY", "gip");
+        expectSettingsError(env, "LLM_FACTS_MAX_OUTPUT_TOKENS", "-1");
+        expectSettingsError(env, "LLM_FACTS_UPDATE_MODE", "always");
+
+        ContextStrategy switched = ContextStrategy.SLIDING_WINDOW;
+        expect("переключение стратегии через withStrategy не меняет остальные поля",
+                switched == ContextStrategy.SLIDING_WINDOW
+                        && full.withStrategy(ContextStrategy.FACTS).contextStrategy()
+                        == ContextStrategy.FACTS
+                        && full.withStrategy(ContextStrategy.FACTS).slidingWindowMessages()
+                        == full.slidingWindowMessages());
+
+        expect("имя ветки валидируется: пустое отклоняется",
+                expectAgentThrow(() -> BranchData.validateName("  "))
+                        .contains("Имя ветки"));
+        expect("имя ветки валидируется: пробелы и слэши отклоняются",
+                expectAgentThrow(() -> BranchData.validateName("новая ветка/x"))
+                        .contains("Недопустимый символ"));
+        expect("имя ветки валидируется: длина ограничена 32",
+                expectAgentThrow(() -> BranchData.validateName("а".repeat(33)))
+                        .contains("не длиннее 32"));
+        expect("корректное имя ветки нормализуется",
+                BranchData.validateName(" Спорная-1 ").equals("спорная-1"));
+    }
+
+    private static String expectAgentThrow(java.util.function.Supplier<String> action) {
+        try {
+            action.get();
+            return "";
+        } catch (AgentException e) {
+            return e.getMessage();
+        }
+    }
+
+    /** Переключение стратегий и /facts показ без вызова API; подсказки. */
+    private static void checkDay10StrategySwitchNoApi() throws Exception {
+        Path keyStore = day9KeyStore();
+        Day9Server s = startDay9Server(keyStore);
+        try {
+            Config config = new Config("test-key", day9Url(s), "glm-5.3-flash");
+            JsonConversationStore store = tempStore();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.defaults(),
+                    trustedHttpClient(keyStore), store);
+            agent.ask("разговорное сообщение");
+            int hitsBefore = s.regularHits().get() + s.summaryHits().get();
+
+            FakeUi ui = new FakeUi(
+                    TerminalUi.Input.command("/strategy"),
+                    TerminalUi.Input.command("/strategy facts"),
+                    TerminalUi.Input.command("/strategy"),
+                    TerminalUi.Input.command("/strategy branching"),
+                    TerminalUi.Input.command("/branch list"),
+                    TerminalUi.Input.command("/strategy sliding-window"),
+                    TerminalUi.Input.command("/strategy rectangular"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(ui, agent, "glm-5.3-flash");
+            expect("переключение стратегии не вызывает API",
+                    s.regularHits().get() + s.summaryHits().get() == hitsBefore);
+            expect("/strategy показывает текущую стратегию и параметры",
+                    ui.systems.stream().anyMatch(t ->
+                            t.contains("Стратегия контекста: Скользящее окно")));
+            expect("переключение на facts сообщается",
+                    ui.systems.stream().anyMatch(t ->
+                            t.contains("Стратегия изменена: Факты")));
+            expect("переключение на branching меняет настройки и показывает команды",
+                    ui.systems.stream().anyMatch(t ->
+                            t.contains("Ветки (история активной ветки)")));
+            expect("неизвестная стратегия даёт ошибку и подсказку",
+                    ui.errors.stream().anyMatch(t ->
+                            t.contains("sliding-window, facts или branching")));
+            expect("после возврата на sliding-window история не тронута",
+                    agent.getHistory().size() == 2 && agent.factsView().isEmpty());
+            store.close();
+        } finally {
+            s.server().stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /**
+     * Стратегия sliding-window: в запросе ровно окно, старые сообщения
+     * не отправляются, архив сохранён, отброшенное честно показано.
+     */
+    private static void checkDay10SlidingWindow() throws Exception {
+        Path keyStore = day9KeyStore();
+        Day9Server s = startDay9Server(keyStore);
+        try {
+            Config config = new Config("test-key", day9Url(s), "glm-5.3-flash");
+            JsonConversationStore store = tempStore();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.defaults(),
+                    trustedHttpClient(keyStore), store);
+
+            for (int i = 1; i <= 7; i++) {
+                agent.ask("вопрос окна " + i);
+            }
+            String lastRegular = null;
+            for (int i = s.bodies().size() - 1; i >= 0; i--) {
+                if (!s.bodies().get(i).contains(SUMMARY_MARKER)) {
+                    lastRegular = s.bodies().get(i);
+                    break;
+                }
+            }
+            JsonNode body = MAPPER.readTree(lastRegular);
+            JsonNode messages = body.path("messages");
+            expect("sliding-window: в запросе ровно system + окно 10 + новое сообщение",
+                    messages.size() == 12
+                            && "system".equals(messages.get(0).path("role").asText())
+                            && "вопрос окна 2".equals(messages.get(1).path("content").asText())
+                            && "вопрос окна 7".equals(messages.get(messages.size() - 1).path("content").asText()));
+            expect("sliding-window: более ранние сообщения не отправляются",
+                    streamContents(messages).noneMatch(m -> m.contains("вопрос окна 1"))
+                            && streamContents(messages).noneMatch(
+                            m -> m.contains("Ответ 1")));
+            JsonNode saved = MAPPER.readTree(Files.readString(store.file(),
+                    StandardCharsets.UTF_8));
+            expect("sliding-window: архив в файле не теряется (14 сообщений)",
+                    saved.path("messages").size() == 14);
+            expect("старые сообщения остаются в памяти при отправке окна",
+                    agent.getHistory().size() == 14
+                            && "вопрос окна 1".equals(agent.getHistory().get(0).content()));
+            expect("подпись запроса отмечает отброшенные сообщения",
+                    agent.lastRequestContextCaption().contains("отброшено из запроса 2"));
+            List<String> notes = agent.consumeContextNotes();
+            expect("заметка после ответа: стратегия, окно, отброшенные пакеты "
+                    + "и сохранённый архив",
+                    notes.stream().anyMatch(t -> t.contains("Стратегия: Скользящее окно"))
+                            && notes.stream().anyMatch(t ->
+                            t.contains("окно 10") && t.contains("отброшено из запроса 2")));
+            SessionTokenStats.Snapshot stats = agent.sessionStats();
+            expect("каждый запрос учтён ровно один раз: 7 попыток, полный usage",
+                    stats.apiAttempts() == 7 && stats.complete()
+                            && stats.knownTotal() == 7 * 30L);
+            store.close();
+        } finally {
+            s.server().stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Поток стратегии facts (auto): facts обновляются после каждого ответа. */
+    private static void checkDay10FactsFlow() throws Exception {
+        Path keyStore = day9KeyStore();
+        // Порядок ответов facts-запросов детерминирован: серия значений.
+        AtomicInteger factsCall = new AtomicInteger();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            if (requestBody.contains(FACTS_MARKER)) {
+                int call = factsCall.incrementAndGet();
+                // «Замена устаревшего значения»: тем же ключом — новое значение.
+                String pairs = call == 1
+                        ? "цель: собрать ТЗ проекта МАЯК"
+                        : "цель: собрать финальное ТЗ проекта МАЯК";
+                return new Response(200, ("{\"choices\":[{\"finish_reason\":\"stop\","
+                        + "\"message\":{\"role\":\"assistant\",\"content\":\""
+                        + pairs + "\"}}],"
+                        + "\"usage\":{\"prompt_tokens\":30,\"completion_tokens\":4,"
+                        + "\"total_tokens\":34}}").getBytes(StandardCharsets.UTF_8));
+            }
+            return new Response(200, ("{\"choices\":[{\"finish_reason\":\"stop\","
+                    + "\"message\":{\"role\":\"assistant\",\"content\":\"См. факты "
+                    + "блока\"}}],\"usage\":{\"prompt_tokens\":10,"
+                    + "\"completion_tokens\":20,\"total_tokens\":30}}")
+                    .getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort()
+                            + "/v1/chat/completions", "glm-5.3-flash");
+            JsonConversationStore store = tempStore();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.from(factsEnv()),
+                    trustedHttpClient(keyStore), store);
+
+            agent.ask("Сбор ТЗ: цель — проект МАЯК, запрет цитрусовых, число 42");
+            expect("после первого ответа facts обновлены первым служебным запросом",
+                    factsCall.get() == 1
+                            && agent.factsView().size() == 1
+                            && agent.factsView().get("цель").contains("МАЯК"));
+            expect("служебный запрос facts не попал в историю диалога",
+                    agent.getHistory().size() == 2);
+
+            agent.ask("Обновляю: цель меняется на финальное ТЗ, число 42 сохраняем");
+            expect("второй служебный запрос обновил и заменил факты",
+                    factsCall.get() == 2
+                            && agent.factsView().size() == 1
+                            && agent.factsView().get("цель").contains("финальное"));
+            expect("история содержит только пары диалога (4 сообщения)",
+                    agent.getHistory().size() == 4
+                            && agent.getHistory().stream()
+                            .noneMatch(m -> m.content().contains("цель:")));
+
+            // Проверяем контекст и подписи агента.
+            String caption = agent.lastRequestContextCaption();
+            expect("подпись facts сообщает блок фактов и окно сообщений",
+                    caption != null && caption.contains("блок фактов") && caption.contains("пар"));
+            expect("facts хранятся отдельно от сообщений",
+                    agent.factsView().size() == 1
+                            && agent.getHistory().size() == 4);
+
+            var stats = agent.sessionStats();
+            expect("расход facts учтён отдельно: попыток FACTS_UPDATE ровно 2",
+                    stats.factsAttempts() == 2 && stats.regularAttempts() == 2
+                            && stats.factsPromptTokens() == 60
+                            && stats.factsCompletionTokens() == 8);
+            expect("случайные тексты фактов не попадали в ответ",
+                    agent.lastRequestContextCaption() != null);            store.close();
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Manual-режим и /facts clear: без автоматических служебных запросов. */
+    private static void checkDay10FactsManualAndClear() throws Exception {
+        Path keyStore = day9KeyStore();
+        AtomicInteger factsCalls = new AtomicInteger();
+        AtomicReference<String> lastBody = new AtomicReference<>();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            lastBody.set(requestBody);
+            if (requestBody.contains(FACTS_MARKER)) {
+                factsCalls.incrementAndGet();
+                return new Response(200, ("{\"choices\":[{\"finish_reason\":\"stop\","
+                        + "\"message\":{\"role\":\"assistant\",\"content\":\""
+                        + "решение: держать факты вручную\"}}],"
+                        + "\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}")
+                        .getBytes(StandardCharsets.UTF_8));
+            }
+            return new Response(200, ("{\"choices\":[{\"finish_reason\":\"stop\","
+                    + "\"message\":{\"role\":\"assistant\",\"content\":\"Ответ "
+                    + factsCalls.get() + "\"}}],\"usage\":{\"prompt_tokens\":15,"
+                    + "\"completion_tokens\":25}}").getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort()
+                            + "/v1/chat/completions", "glm-5.3-flash");
+            Map<String, String> env = factsEnv();
+            env.put("LLM_FACTS_UPDATE_MODE", "manual");
+            JsonConversationStore store = tempStore();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.from(env),
+                    trustedHttpClient(keyStore), store);
+
+            agent.ask("должен ли я говорить вручную?");
+            agent.ask(" Manual-режим не обновляет сам");
+            expect("manual-режим не обновляет facts автоматически",
+                    factsCalls.get() == 0 && agent.factsView().isEmpty());
+
+            String result = agent.refreshFacts();
+            expect("/facts refresh делает ровно один служебный запрос",
+                    factsCalls.get() == 1 && agent.factsView().size() == 1
+                            && agent.factsView().get("решение").contains("вручную"));
+            expect("в refresh приходят текущая история и блок facts (текущий пуст)",
+                    lastBody.get() != null
+                            && lastBody.get().contains("история — данные")
+                            && lastBody.get().contains("(пуст"));
+            expect("результат сводки после подтверждения содержит отметку расхода",
+                    result.contains("учтён отдельно"));
+
+            agent.factsClear();
+            expect("/facts clear очищает блок (после подтверждения в Main)",
+                    agent.factsView().isEmpty());
+            expect("очищенный блок в файле не сериализуется как объект facts",
+                    !Files.readString(store.file(), StandardCharsets.UTF_8)
+                            .contains("\"facts\""));
+            store.close();
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Служебный расход facts входит в лимит сессии; неполный usage честно. */
+    private static void checkDay10FactsInSessionLimit() throws Exception {
+        Path keyStore = day9KeyStore();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            if (requestBody.contains(FACTS_MARKER)) {
+                // Частичный usage у служебного запроса (только prompt_tokens).
+                return new Response(200, ("{\"choices\":[{\"finish_reason\":\"stop\","
+                        + "\"message\":{\"role\":\"assistant\",\"content\":\"лимит: 90\"}}],"
+                        + "\"usage\":{\"prompt_tokens\":70}}")
+                        .getBytes(StandardCharsets.UTF_8));
+            }
+            return new Response(200, ("{\"choices\":[{\"finish_reason\":\"stop\","
+                    + "\"message\":{\"role\":\"assistant\",\"content\":\"Ответ\"}}],"
+                    + "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20}}")
+                    .getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort()
+                            + "/v1/chat/completions", "glm-5.3-flash");
+            Map<String, String> env = factsEnv();
+            env.put("LLM_SESSION_TOKEN_LIMIT", "80");
+            JsonConversationStore store = tempStore();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.from(env),
+                    trustedHttpClient(keyStore), store);
+            agent.ask("сообщение с лимитом фактов");
+            var stats = agent.sessionStats();
+            String notice = agent.consumeSessionLimitNotice();
+            expect("расход facts входит в лимит сессии (10+20+70 > 80)",
+                    notice != null && notice.contains("не менее 100")
+                            && !stats.complete());
+            expect("частичный usage facts: prompt учтён, итог не опровергается",
+                    stats.factsAttempts() == 1 && stats.factsPromptTokens() == 70
+                            && stats.factsCompletionTokens() == 0
+                            && stats.requestsWithPartialUsage() == 1);
+            store.close();
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Ветки: checkpoint, создание, независимость, guard переноса, удаление. */
+    private static void checkDay10Branching() throws Exception {
+        Path keyStore = day9KeyStore();
+        Day9Server s = startDay9Server(keyStore);
+        try {
+            Config config = new Config("test-key", day9Url(s), "glm-5.3-flash");
+            JsonConversationStore store = tempStore();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.from(branchingEnv()),
+                    trustedHttpClient(keyStore), store);
+
+            agent.ask("вопрос основной 1");
+            agent.ask("вопрос основной 2");
+            agent.branchCheckpoint();
+            expect("checkpoint на конце истории, ветка main пустая",
+                    agent.branchesDescription().contains("checkpoint: сообщения [0..4)"));
+            agent.branchNew("спорная");
+            expect("новая ветка начинается с префикса checkpoint",
+                    agent.getHistory().size() == 4
+                            && agent.activeBranchName().equals("спорная"));
+
+            agent.ask("вариант спорной");
+            agent.branchSwitch("main");
+            expect("переключение обратно сохраняет историю ветки «main»",
+                    agent.getHistory().size() == 4
+                            && agent.activeBranchName().equals("main")
+                            && agent.getHistory().get(0).content().contains("основной 1"));
+
+            agent.ask("вопрос основной 3");
+            expect("строка «main» продолжает собственную независимую треду",
+                    agent.getHistory().size() == 6);
+
+            agent.branchSwitch("спорная");
+            expect("ветка «спорная» не потеряла собственные сообщения",
+                    agent.getHistory().size() == 6
+                            && agent.getHistory().get(4).content().contains("вариант спорной"));
+
+            String guard = expectAgentThrow(() -> {
+                agent.branchCheckpoint();
+                return "";
+            });
+            expect("перенос checkpoint при непустых чужих хвостах отказывается",
+                    guard.contains("Перенести checkpoint сейчас нельзя"));
+
+            agent.branchSwitch("main");
+            agent.branchDelete("спорная");
+            expect("после удаления ветки вернулась только одна",
+                    agent.branchesDescription().contains("активная: «main»")
+                            && !agent.branchesDescription().contains("спорная"));
+            expect("активная ветка не удаляется",
+                    expectAgentThrow(() -> {
+                        agent.branchDelete("main");
+                        return "";
+                    }).contains("Активную ветку"));
+
+            expect("инвалидные имена веток отклоняются без записи файла",
+                    expectAgentThrow(() -> {
+                        agent.branchNew("bad name");
+                        return "";
+                    }).contains("Недопустимый"));
+
+            expect("служебный запрос facts/summary не появился в ветках",
+                    s.summaryHits().get() == 0 && s.regularHits().get() >= 4);
+            expect("каптion branching называет всю историю ветки",
+                    agent.lastRequestContextCaption().contains("вся история"));
+            store.close();
+        } finally {
+            s.server().stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Восстановление веток после перезапуска; повреждённые ветки отклоняются. */
+    private static void checkDay10BranchPersistence() throws Exception {
+        Path keyStore = day9KeyStore();
+        Day9Server s = startDay9Server(keyStore);
+        try {
+            Config config = new Config("test-key", day9Url(s), "glm-5.3-flash");
+            JsonConversationStore store = tempStore();
+            Path historyFile = store.file();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.from(branchingEnv()),
+                    trustedHttpClient(keyStore), store);
+            agent.ask("до checkpoint");
+            agent.branchCheckpoint();
+            agent.branchNew("вилка");
+            agent.ask("в ветке «вилка»");
+            store.close();
+
+            try (JsonConversationStore reopened = new JsonConversationStore(historyFile)) {
+                LlmAgent restored = new LlmAgent(config, ModelSettings.from(branchingEnv()),
+                        trustedHttpClient(keyStore), reopened);
+                expect("после перезапуска активная ветка и история восстановлены",
+                        restored.activeBranchName().equals("вилка")
+                                && restored.getHistory().size() == 4
+                                && restored.getHistory().get(0).content()
+                                .contains("до checkpoint")
+                                && !restored.getHistory().get(3).content().isEmpty());
+                restored.branchSwitch("main");
+                expect("переключение после перезапуска возвращается в основную ветку",
+                        restored.getHistory().size() == 2
+                                && restored.getHistory().get(0).content()
+                                .contains("до checkpoint"));
+            }
+        } finally {
+            s.server().stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /**
+     * /strategy compare: три запроса на одном снимке с подтверждением,
+     * отдельный расход facts и изоляция истории.
+     */
+    private static void checkDay10StrategyCompare() throws Exception {
+        Path keyStore = day9KeyStore();
+        AtomicInteger answers = new AtomicInteger();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            if (requestBody.contains(FACTS_MARKER)) {
+                return new Response(200, ("{\"choices\":[{\"finish_reason\":\"stop\","
+                        + "\"message\":{\"role\":\"assistant\",\"content\":\""
+                        + "сравнение: маркер фактов МАЯК\"}}],"
+                        + "\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":4}}")
+                        .getBytes(StandardCharsets.UTF_8));
+            }
+            // Вспомогательные запросы сравнения различаются по числу
+            // сообщений: branching отправляет весь снимок, facts — хвост
+            // с блоком «ФАКТЫ», sliding — то же окно, что и facts.
+            if (requestBody.contains("ФАКТЫ")) {
+                return new Response(200, ("{\"choices\":[{\"finish_reason\":\"stop\","
+                        + "\"message\":{\"role\":\"assistant\",\"content\":\"Ответ Facts\"}}]}")
+                        .getBytes(StandardCharsets.UTF_8));   // usage отсутствует
+            }
+            int assistantCount = requestBody.split("\"assistant\"", -1).length - 1;
+            if (assistantCount >= 8) {
+                return new Response(200, ("{\"choices\":[{\"finish_reason\":\"stop\","
+                        + "\"message\":{\"role\":\"assistant\",\"content\":\"Ответ Branching\"}}],"
+                        + "\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":3}}")
+                        .getBytes(StandardCharsets.UTF_8));
+            }
+            return new Response(200, ("{\"choices\":[{\"finish_reason\":\"stop\","
+                    + "\"message\":{\"role\":\"assistant\",\"content\":\"Ответ Sliding "
+                    + answers.incrementAndGet() + "\"}}],"
+                    + "\"usage\":{\"prompt_tokens\":6,\"completion_tokens\":1}}")
+                    .getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort()
+                            + "/v1/chat/completions", "glm-5.3-flash");
+            JsonConversationStore store = tempStore();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.defaults(),
+                    trustedHttpClient(keyStore), store);
+            for (int i = 1; i <= 8; i++) {
+                agent.ask("факт сравнения " + i);
+            }
+            List<ChatMessage> before = agent.getHistory();
+            long knownBefore = agent.sessionStats().knownTotal();
+
+            FakeUi ui = new FakeUi(
+                    TerminalUi.Input.command("/strategy compare первый факт?"),
+                    TerminalUi.Input.command("/exit"));
+            ui.confirmStrategyCompareAnswer = true;
+            Main.runLoop(ui, agent, "glm-5.3-flash");
+            expect("сравнение стратегий не изменяет историю",
+                    agent.getHistory().equals(before)
+                            && !agent.getHistory().toString().contains("МАЯК"));
+            expect("показаны ответы всех трёх стратегий",
+                    ui.messages.stream().anyMatch(m -> m.contains("Ответ Sliding"))
+                            && ui.messages.stream().anyMatch(m -> m.contains("Ответ Facts"))
+                            && ui.messages.stream().anyMatch(m -> m.contains("Ответ Branching")));
+            var stats = agent.sessionStats();
+            expect("сравнение = 4 попытки (facts-prep и три ряда), отсутствующий "
+                    + "usage у варианта facts честно помечен",
+                    stats.compareAttempts() == 4
+                            && stats.requestsWithPartialUsage() + stats.requestsWithoutUsage() >= 1
+                            && !stats.complete());
+            expect("расход сравнения входит в общий knownTotal",
+                    agent.sessionStats().knownTotal() > knownBefore);
+            expect("таблица содержит все три стратегии и пометку «не списание» "
+                    + "или честное «нет данных» без тарифа",
+                    ui.systems.stream().anyMatch(t ->
+                            t.contains("Таблица сравнения стратегий")
+                                    && t.contains("sliding-window")
+                                    && t.contains("facts")
+                                    && t.contains("branching")
+                                    && (t.contains("расчётная, не списание")
+                                    || t.contains("стоимость: нет данных — тариф не настроен"))));
+            expect("факты подготовлены из снимка и занесены в ряд facts",
+                    ui.systems.stream().anyMatch(t -> t.contains("подготовлен служебным")));
+            store.close();
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Отмена /strategy compare не вызывает API; в демо сравнение отключено. */
+    private static void checkDay10CompareGuards() throws Exception {
+        Path keyStore = day9KeyStore();
+        Day9Server s = startDay9Server(keyStore);
+        try {
+            Config config = new Config("test-key", day9Url(s), "glm-5.3-flash");
+            JsonConversationStore store = tempStore();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.defaults(),
+                    trustedHttpClient(keyStore), store);
+            agent.ask("единственный вопрос для сравнения");
+            int hitsBefore = s.regularHits().get() + s.summaryHits().get();
+
+            FakeUi cancelUi = new FakeUi(
+                    TerminalUi.Input.command("/strategy compare вопрос"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(cancelUi, agent, "glm-5.3-flash");
+            expect("отмена подтверждения не вызывает API",
+                    s.regularHits().get() + s.summaryHits().get() == hitsBefore);
+
+            FakeUi demoUi = new FakeUi(
+                    TerminalUi.Input.command("/demo tokens"),
+                    TerminalUi.Input.command("/strategy compare вопрос"),
+                    TerminalUi.Input.command("/demo stop"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(demoUi, agent, "glm-5.3-flash");
+            expect("в демо сравнение стратегий не выполняется без API",
+                    s.regularHits().get() + s.summaryHits().get() == hitsBefore
+                            && demoUi.systems.stream().anyMatch(
+                            t -> t.contains("режиме измерения")
+                                    || t.contains("сравнивать не на чем")));
+            store.close();
+        } finally {
+            s.server().stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /**
+     * finish_reason=length при подготовке фактов прерывает вариант facts:
+     * сравнение остальных стратегий продолжается, «ответ facts» не выводится,
+     * расход попытки учтён ровно один раз.
+     */
+    private static void checkFactsPrepLengthAbortsCompare() throws Exception {
+        Path keyStore = day9KeyStore();
+        AtomicInteger regularAnswers = new AtomicInteger();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            if (requestBody.contains(FACTS_MARKER)) {
+                return new Response(200, lengthAnswer().getBytes(StandardCharsets.UTF_8));
+            }
+            return new Response(200, regularAnswer(regularAnswers.incrementAndGet())
+                    .getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort()
+                            + "/v1/chat/completions", "glm-5.3-flash");
+            JsonConversationStore store = tempStore();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.defaults(),
+                    trustedHttpClient(keyStore), store);
+            for (int i = 1; i <= 3; i++) {
+                agent.ask("факт до сравнения " + i);
+            }
+            List<ChatMessage> before = agent.getHistory();
+            long knownBefore = agent.sessionStats().knownTotal();
+
+            FakeUi ui = new FakeUi(
+                    TerminalUi.Input.command("/strategy compare ранние факты?"),
+                    TerminalUi.Input.command("/exit"));
+            ui.confirmStrategyCompareAnswer = true;
+            Main.runLoop(ui, agent, "glm-5.3-flash");
+
+            expect("сравнение не изменяет историю", agent.getHistory().equals(before));
+            expect("строка facts помечена «недостоверно», а не полноценным ответом",
+                    ui.messages.stream().anyMatch(m -> m.startsWith("Факты")
+                            && m.contains("(недостоверно:")
+                            && m.contains("подготовка фактов не выполнена")));
+            expect("ошибка подготовки предлагает увеличить лимит и повторить",
+                    ui.messages.stream().anyMatch(m ->
+                            m.contains("LLM_FACTS_MAX_OUTPUT_TOKENS")
+                                    && m.contains("повторите")));
+            expect("вывод нет полноценного «ответа facts» поверх сбоя",
+                    ui.messages.stream().noneMatch(
+                            m -> m.startsWith("Факты (ключ: значение)")
+                                    && !m.contains("недостоверно")));
+            SessionTokenStats.Snapshot stats = agent.sessionStats();
+            expect("подготовка учтена ровно один раз, facts-запрос не выполнялся",
+                    stats.compareAttempts() == 3
+                            && stats.knownTotal() == knownBefore + 60 + 900 + 30 + 30);
+            expect("в таблице строка facts без выдуманного расхода",
+                    ui.systems.stream().anyMatch(t ->
+                            t.contains("Таблица сравнения стратегий")
+                                    && t.contains("нет данных")));
+            store.close();
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+    /** Тело length-ответа тестового сервера с полным usage. */
+    private static String lengthAnswer() {
+        ObjectNode root = MAPPER.createObjectNode();
+        ArrayNode choices = root.putArray("choices");
+        ObjectNode choice = choices.addObject();
+        choice.put("finish_reason", "length");
+        choice.putObject("message")
+                .put("role", "assistant")
+                .put("content", "частичный");
+        root.putObject("usage")
+                .put("prompt_tokens", 60)
+                .put("completion_tokens", 900)
+                .put("total_tokens", 960);
+        return root.toString();
+    }
+
+    /** Обычный успешный ответ тестового сервера. */
+    private static String regularAnswer(int number) {
+        ObjectNode root = MAPPER.createObjectNode();
+        ArrayNode choices = root.putArray("choices");
+        ObjectNode choice = choices.addObject();
+        choice.put("finish_reason", "stop");
+        choice.putObject("message")
+                .put("role", "assistant")
+                .put("content", "Ответ " + number + " содержательный развёрнутый текст для проверки контекста");
+        root.putObject("usage")
+                .put("prompt_tokens", 10)
+                .put("completion_tokens", 20)
+                .put("total_tokens", 30);
+        return root.toString();
+    }
+
+    /** Тело response-записи для компактности тестов. */
+    private static Response json(final int status, final String body) {
+        return new Response(status, body.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /** Предупреждение при занятости 90% или более лимита генерации фактов. */
+    private static void checkFactsNearLimitWarning() throws Exception {
+        Path keyStore = day9KeyStore();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            if (requestBody.contains(FACTS_MARKER)) {
+                return json(200, factsUsage95Body());
+            }
+            return json(200, regularAnswer(999));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort()
+                            + "/v1/chat/completions", "glm-5.3-flash");
+            Map<String, String> env = factsEnv();
+            env.put("LLM_FACTS_MAX_OUTPUT_TOKENS", "100");
+            JsonConversationStore store = tempStore();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.from(env),
+                    trustedHttpClient(keyStore), store);
+            agent.ask("сообщение для предупреждения");
+            List<String> notes = agent.consumeContextNotes();
+            expect("предупреждение при занятости лимита 90% и более",
+                    notes.stream().anyMatch(t ->
+                            t.contains("Предупреждение: обновление фактов заняло 95 из 100")
+                                    && t.contains("LLM_FACTS_MAX_OUTPUT_TOKENS")));
+            JsonConversationStore freshStore = tempStore();
+            Map<String, String> fresh = factsEnv();
+            fresh.put("LLM_FACTS_MAX_OUTPUT_TOKENS", "200");
+            LlmAgent freshAgent = new LlmAgent(config, ModelSettings.from(fresh),
+                    trustedHttpClient(keyStore), freshStore);
+            freshAgent.ask("сообщение ниже порога предупреждения");
+            expect("ниже 90% предупреждение не выводится",
+                    freshAgent.consumeContextNotes().stream()
+                            .noneMatch(t -> t.contains("Предупреждение:")));
+            freshStore.close();
+            store.close();
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Тело facts-ответа с usage completion 95 при тестовом лимите 100. */
+    private static String factsUsage95Body() {
+        ObjectNode root = MAPPER.createObjectNode();
+        ArrayNode choices = root.putArray("choices");
+        ObjectNode choice = choices.addObject();
+        choice.put("finish_reason", "stop");
+        choice.putObject("message")
+                .put("role", "assistant")
+                .put("content", "цель: МАЯК");
+        root.putObject("usage")
+                .put("prompt_tokens", 10)
+                .put("completion_tokens", 95)
+                .put("total_tokens", 105);
+        return root.toString();
+    }
+
+    /** Пользовательский вывод не содержит упоминаний дней заданий и учёбы. */
+    private static void checkUserFacingOutputNeutral() throws Exception {
+        Path keyStore = day9KeyStore();
+        Day9Server s = startDay9Server(keyStore);
+        try {
+            Config config = new Config("test-key", day9Url(s), "glm-5.3-flash");
+            JsonConversationStore store = tempStore();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.defaults(),
+                    trustedHttpClient(keyStore), store);
+
+            FakeUi ui = new FakeUi(
+                    TerminalUi.Input.message("обычное сообщение"),
+                    TerminalUi.Input.command("/help"),
+                    TerminalUi.Input.command("/tokens"),
+                    TerminalUi.Input.command("/stats"),
+                    TerminalUi.Input.command("/limit"),
+                    TerminalUi.Input.command("/context"),
+                    TerminalUi.Input.command("/summary"),
+                    TerminalUi.Input.command("/strategy"),
+                    TerminalUi.Input.command("/strategy facts"),
+                    TerminalUi.Input.command("/strategy"),
+                    TerminalUi.Input.command("/facts"),
+                    TerminalUi.Input.command("/branch list"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(ui, agent, "glm-5.3-flash");
+            String text = String.join("\n", ui.systems) + "\n"
+                    + String.join("\n", ui.messages) + "\n"
+                    + String.join("\n", ui.errors);
+            for (String banned : new String[]{
+                    "День 8", "День 9", "День 10", "Day 8", "Day 9", "Day 10",
+                    "Day-", "задание", "учеб"}) {
+                expect("пользовательский вывод без отметки «" + banned + "»",
+                        !text.contains(banned));
+            }
+            expect("подписи стратегии нейтральные",
+                    text.contains("Скользящее окно")
+                            && text.contains("Факты"));
+
+            store.close();
+        } finally {
+            s.server().stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /**
+     * Подробная диагностика скрыта по умолчанию и появляется только
+     * при LLM_DIAGNOSTICS=true.
+     */
+    private static void checkDiagnosticsHiddenByDefault() throws Exception {
+        Path keyStore = day9KeyStore();
+        Day9Server s = startDay9Server(keyStore);
+        try {
+            Config config = new Config("test-key", day9Url(s), "glm-5.3-flash");
+
+            JsonConversationStore quietStore = tempStore();
+            LlmAgent quietAgent = new LlmAgent(config, ModelSettings.defaults(),
+                    trustedHttpClient(keyStore), quietStore);
+            FakeUi quietUi = new FakeUi(
+                    TerminalUi.Input.message("короткое сообщение"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(quietUi, quietAgent, "glm-5.3-flash");
+            expect("подробная диагностика скрыта по умолчанию",
+                    quietUi.systems.stream().noneMatch(t -> t.contains("Диагностика:")));
+            expect("краткая сводка присутствует",
+                    quietUi.systems.stream().anyMatch(
+                            t -> t.contains("Расход сессии")));
+            quietStore.close();
+
+            Map<String, String> env = new java.util.HashMap<>();
+            env.put("LLM_DIAGNOSTICS", "true");
+            JsonConversationStore diagStore = tempStore();
+            LlmAgent diagAgent = new LlmAgent(config, ModelSettings.from(env),
+                    trustedHttpClient(keyStore), diagStore);
+            FakeUi diagUi = new FakeUi(
+                    TerminalUi.Input.message("сообщение с диагностикой"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(diagUi, diagAgent, "glm-5.3-flash");
+            expect("при LLM_DIAGNOSTICS=true подробная диагностика видна",
+                    diagUi.systems.stream().anyMatch(t -> t.contains("Диагностика:")));
+            diagStore.close();
+        } finally {
+            s.server().stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Повреждённые необязательные сущности (facts, branches) отклоняются. */
+    private static void checkDay10OtherStoreValidation() throws IOException {
+        Path file = Files.createTempDirectory(baseTempDir, "day10-")
+                .resolve("conversation.json");
+        byte[] brokenFact = ("{\"schemaVersion\":3,\"sessionId\":\"s\",\"messages\":[],"
+                + "\"facts\":{\"ключ\": 42}}").getBytes(StandardCharsets.UTF_8);
+        Files.write(file, brokenFact);
+        try (JsonConversationStore store = new JsonConversationStore(file)) {
+            expectLoadCorrupted(store, file, "повреждённый facts распознаётся");
+            expect("повреждённый facts не перезаписывается",
+                    Arrays.equals(Files.readAllBytes(file), brokenFact));
+        }
+
+        byte[] brokenBranch = ("{\"schemaVersion\":3,\"sessionId\":\"s\",\"messages\":[],"
+                + "\"branches\":{\"checkpointIndex\":3,\"active\":\"main\","
+                + "\"list\":[{\"name\":\"main\",\"messages\":[]}]}}")
+                .getBytes(StandardCharsets.UTF_8);
+        Files.write(file, brokenBranch);
+        try (JsonConversationStore store = new JsonConversationStore(file)) {
+            expectLoadCorrupted(store, file, "нечётный checkpoint распознаётся");
+        }
+
+        byte[] goodRoundtrip = ("{\"schemaVersion\":3,\"sessionId\":\"s\","
+                + "\"messages\":[{\"role\":\"user\",\"content\":\"в\"},"
+                + "{\"role\":\"assistant\",\"content\":\"о\"}],"
+                + "\"facts\":{\"цель\": \"МАЯК\"}}").getBytes(StandardCharsets.UTF_8);
+        Files.write(file, goodRoundtrip);
+        try (JsonConversationStore store = new JsonConversationStore(file)) {
+            ConversationState state = store.load();
+            expect("facts восстанавливаются из файла, ветки по умолчанию",
+                    state.facts() != null && state.facts().get("цель").equals("МАЯК")
+                            && state.branches() != null
+                            && state.branches().active().equals("main"));
+        }
     }
 }

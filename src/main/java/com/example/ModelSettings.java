@@ -29,7 +29,7 @@ import java.util.Map;
  * - LLM_SESSION_TOKEN_LIMIT — необязательный информационный лимит расхода
  *   токенов за сессию (сумма известных prompt_tokens и completion_tokens);
  *   уведомление при превышении, не жёсткая квота;
- * - LLM_CONTEXT_MODE — режим контекста (День 9): full (полная история,
+ * - LLM_CONTEXT_MODE — режим контекста: full (полная история,
  *   по умолчанию) или summary (резюме старой части + несжатый хвост);
  * - LLM_CONTEXT_KEEP_LAST_MESSAGES — положительное чётное число последних
  *   сообщений, всегда сохраняемых дословно (по умолчанию 10);
@@ -38,11 +38,22 @@ import java.util.Map;
  * - LLM_SUMMARY_MAX_OUTPUT_TOKENS — положительный отдельный лимит генерации
  *   для запроса суммаризации (по умолчанию 512); обычный лимит ответа
  *   не меняет;
- * - LLM_DIAGNOSTICS — краткие метрики запроса (true/false).
+ * - LLM_DIAGNOSTICS — краткие метрики запроса (true/false);
+ * - LLM_CONTEXT_STRATEGY — стратегия управления контекстом:
+ *   sliding-window (по умолчанию), facts или branching;
+ * - LLM_SLIDING_WINDOW_MESSAGES — положительное чётное число последних
+ *   сообщений, отправляемых в запросе стратегии sliding-window
+ *   (по умолчанию 10);
+ * - LLM_FACTS_WINDOW_MESSAGES — положительное чётное число последних
+ *   сообщений стратегии facts (по умолчанию 10);
+ * - LLM_FACTS_MAX_OUTPUT_TOKENS — положительный отдельный лимит генерации
+ *   служебного запроса обновления facts (по умолчанию 2048);
+ * - LLM_FACTS_UPDATE_MODE — auto (обновление после каждого сообщения
+ *   пользователя, по умолчанию) или manual (только /facts refresh).
  * 
- * Примечание (День 9): LLM_CONTEXT_MAX_TURNS в режимах контекста
- * full/summary больше не ограничивает отправку (см. README); о заданной
- * переменной приложение сообщает явно.
+ * Примечание: LLM_CONTEXT_MAX_TURNS в режимах контекста full/summary
+ * больше не ограничивает отправку (см. README); о заданной переменной
+ * приложение сообщает явно.
  *
  * Лимиты профилей — экспериментальные начальные значения,
  * а не проверенные оптимумы для glm-5.3-flash. max_tokens — верхний предел
@@ -65,7 +76,12 @@ public record ModelSettings(
         ContextMode contextMode,
         int keepLastMessages,
         int summaryBatchMessages,
-        int summaryMaxOutputTokens) {
+        int summaryMaxOutputTokens,
+        ContextStrategy contextStrategy,
+        int slidingWindowMessages,
+        int factsWindowMessages,
+        int factsMaxOutputTokens,
+        FactsUpdateMode factsUpdateMode) {
 
     public static final String FAST = "fast";
     public static final String BALANCED = "balanced";
@@ -90,10 +106,20 @@ public record ModelSettings(
 
     public static final int DEFAULT_REQUEST_TIMEOUT_SECONDS = 180;
 
-    /** День 9: настройки сжатия по умолчанию. */
+    /** Настройки сжатия истории по умолчанию. */
     public static final int DEFAULT_KEEP_LAST_MESSAGES = 10;
     public static final int DEFAULT_SUMMARY_BATCH_MESSAGES = 10;
     public static final int DEFAULT_SUMMARY_MAX_OUTPUT_TOKENS = 512;
+
+    /**
+     * Настройки стратегий управления контекстом по умолчанию.
+     * Лимит 2048 для обновления фактов: блок памяти диалога средней длины
+     * на reasoning-модели glm-5.3-flash не укладывался в 512 (реальный
+     * прогон закончился finish_reason: length с пустым блоком фактов).
+     */
+    public static final int DEFAULT_SLIDING_WINDOW_MESSAGES = 10;
+    public static final int DEFAULT_FACTS_WINDOW_MESSAGES = 10;
+    public static final int DEFAULT_FACTS_MAX_OUTPUT_TOKENS = 2048;
 
     /** Максимум temperature по контракту OpenAI-совместимых эндпоинтов. */
     public static final double MAX_TEMPERATURE = 2.0;
@@ -104,7 +130,10 @@ public record ModelSettings(
                 false, null, DEFAULT_REQUEST_TIMEOUT_SECONDS, null,
                 null, ContextOverflowPolicy.DEFAULT, null, null, null, false,
                 ContextMode.DEFAULT, DEFAULT_KEEP_LAST_MESSAGES,
-                DEFAULT_SUMMARY_BATCH_MESSAGES, DEFAULT_SUMMARY_MAX_OUTPUT_TOKENS);
+                DEFAULT_SUMMARY_BATCH_MESSAGES, DEFAULT_SUMMARY_MAX_OUTPUT_TOKENS,
+                ContextStrategy.DEFAULT, DEFAULT_SLIDING_WINDOW_MESSAGES,
+                DEFAULT_FACTS_WINDOW_MESSAGES, DEFAULT_FACTS_MAX_OUTPUT_TOKENS,
+                FactsUpdateMode.DEFAULT);
     }
 
     /** Читает настройки из переменных окружения. */
@@ -137,6 +166,18 @@ public record ModelSettings(
         int summaryMaxOutputTokens = summaryMaxOverride != null
                 ? summaryMaxOverride
                 : DEFAULT_SUMMARY_MAX_OUTPUT_TOKENS;
+        ContextStrategy contextStrategy = ContextStrategy.parse(env.get("LLM_CONTEXT_STRATEGY"),
+                "LLM_CONTEXT_STRATEGY");
+        int slidingWindowMessages = readOptionalEvenPositiveInt(env, "LLM_SLIDING_WINDOW_MESSAGES",
+                DEFAULT_SLIDING_WINDOW_MESSAGES);
+        int factsWindowMessages = readOptionalEvenPositiveInt(env, "LLM_FACTS_WINDOW_MESSAGES",
+                DEFAULT_FACTS_WINDOW_MESSAGES);
+        Integer factsMaxOverride = readOptionalPositiveInt(env, "LLM_FACTS_MAX_OUTPUT_TOKENS");
+        int factsMaxOutputTokens = factsMaxOverride != null
+                ? factsMaxOverride
+                : DEFAULT_FACTS_MAX_OUTPUT_TOKENS;
+        FactsUpdateMode factsUpdateMode =
+                FactsUpdateMode.parse(env.get("LLM_FACTS_UPDATE_MODE"), "LLM_FACTS_UPDATE_MODE");
         return new ModelSettings(
                 profile,
                 limitOverride != null ? limitOverride : PROFILE_LIMITS.get(profile),
@@ -153,7 +194,12 @@ public record ModelSettings(
                 contextMode,
                 keepLastMessages,
                 summaryBatchMessages,
-                summaryMaxOutputTokens);
+                summaryMaxOutputTokens,
+                contextStrategy,
+                slidingWindowMessages,
+                factsWindowMessages,
+                factsMaxOutputTokens,
+                factsUpdateMode);
     }
 
     /**
@@ -173,12 +219,13 @@ public record ModelSettings(
                 temperature, requestTimeoutSeconds, contextMaxTurns,
                 contextWindowTokens, overflowPolicy, inputPricePer1M, outputPricePer1M,
                 sessionTokenLimit, diagnostics, contextMode,
-                keepLastMessages, summaryBatchMessages, summaryMaxOutputTokens);
+                keepLastMessages, summaryBatchMessages, summaryMaxOutputTokens,
+                contextStrategy, slidingWindowMessages, factsWindowMessages,
+                factsMaxOutputTokens, factsUpdateMode);
     }
 
     /**
-     * Тот же экземпляр с другим лимитом расхода токенов за сессию (команда
-     * /limit). Запись неизменяема: метод возвращает копию. null — лимит
+     * Тот же экземпляр с другим лимитом расхода токенов за сессию (/limit). Запись неизменяема: метод возвращает копию. null — лимит
      * отключён; накопленный расход и счётчики при смене не сбрасываются.
      */
     public ModelSettings withSessionTokenLimit(Long newLimit) {
@@ -186,7 +233,9 @@ public record ModelSettings(
                 temperature, requestTimeoutSeconds, contextMaxTurns,
                 contextWindowTokens, overflowPolicy, inputPricePer1M, outputPricePer1M,
                 newLimit, diagnostics, contextMode,
-                keepLastMessages, summaryBatchMessages, summaryMaxOutputTokens);
+                keepLastMessages, summaryBatchMessages, summaryMaxOutputTokens,
+                contextStrategy, slidingWindowMessages, factsWindowMessages,
+                factsMaxOutputTokens, factsUpdateMode);
     }
 
     /**
@@ -198,7 +247,24 @@ public record ModelSettings(
                 temperature, requestTimeoutSeconds, contextMaxTurns,
                 contextWindowTokens, overflowPolicy, inputPricePer1M, outputPricePer1M,
                 sessionTokenLimit, diagnostics, newMode,
-                keepLastMessages, summaryBatchMessages, summaryMaxOutputTokens);
+                keepLastMessages, summaryBatchMessages, summaryMaxOutputTokens,
+                contextStrategy, slidingWindowMessages, factsWindowMessages,
+                factsMaxOutputTokens, factsUpdateMode);
+    }
+
+    /**
+     * Тот же экземпляр с другой стратегией управления контекстом
+     * (/strategy). Все прочие значения не меняются; API команда не вызывает,
+     * историю и факты не меняет.
+     */
+    public ModelSettings withStrategy(ContextStrategy newStrategy) {
+        return new ModelSettings(profile, maxOutputTokens, limitOverridden,
+                temperature, requestTimeoutSeconds, contextMaxTurns,
+                contextWindowTokens, overflowPolicy, inputPricePer1M, outputPricePer1M,
+                sessionTokenLimit, diagnostics, contextMode,
+                keepLastMessages, summaryBatchMessages, summaryMaxOutputTokens,
+                newStrategy, slidingWindowMessages, factsWindowMessages,
+                factsMaxOutputTokens, factsUpdateMode);
     }
 
     /** Лимит отправляемых в API пар: явная настройка или прежнее поведение. */
@@ -314,7 +380,7 @@ public record ModelSettings(
     }
 
     /**
-     * Необязательное положительное чётное число (День 9: параметры сжатия).
+     * Необязательное положительное чётное число (параметры сжатия).
      * Отсутствие значения — переданное значение по умолчанию. Ноль,
      * нечётные, текст и прочие ошибки дают понятное сообщение.
      */

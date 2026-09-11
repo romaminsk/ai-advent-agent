@@ -1,22 +1,34 @@
 package com.example;
 
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 /**
  * Снимок беседы для хранения: идентификатор сессии, завершённые пары
- * user/assistant (полный архив) и необязательное резюме покрытого
- * префикса ({@link ConversationSummary}, День 9) — отдельная сущность,
- * а не сообщение архива. Системная инструкция в снимок не входит — она не
- * хранится в истории, а добавляется к каждому запросу из текущего кода
- * агента, поэтому после перезапуска она не дублируется.
+ * user/assistant (полный архив), необязательное резюме покрытого префикса
+ * ({@link ConversationSummary}), блок фактов ({@link FactsBlock},
+ * стратегия facts) и модель веток ({@link BranchData}, стратегия branching).
+ * Резюме, факты и ветки — отдельные сущности, а не сообщения архива.
+ * Системная инструкция в снимок не входит — она не хранится в истории,
+ * а добавляется к каждому запросу из текущего кода агента, поэтому
+ * после перезапуска она не дублируется.
  */
 public record ConversationState(String sessionId, List<ChatMessage> messages,
-                                ConversationSummary summary) {
+                                ConversationSummary summary,
+                                LinkedHashMap<String, String> facts,
+                                BranchData branches) {
 
-    /** Совместимый конструктор без summary (старая схема, День 7). */
+    /** Совместимый конструктор без summary (старые файлы истории). */
     public ConversationState(String sessionId, List<ChatMessage> messages) {
-        this(sessionId, messages, null);
+        this(sessionId, messages, null, null, null);
+    }
+
+    /** Совместимый конструктор с summary (сжатие истории). */
+    public ConversationState(String sessionId, List<ChatMessage> messages,
+                             ConversationSummary summary) {
+        this(sessionId, messages, summary, null, null);
     }
 
     public ConversationState {
@@ -26,8 +38,8 @@ public record ConversationState(String sessionId, List<ChatMessage> messages,
         messages = List.copyOf(messages);
     }
 
-    /** Новая пустая беседа со свежим идентификатором сессии (без summary). */
+    /** Новая пустая беседа со свежим идентификатором сессии. */
     public static ConversationState newEmpty() {
-        return new ConversationState(UUID.randomUUID().toString(), List.of());
+        return new ConversationState(UUID.randomUUID().toString(), List.of(), null, null, null);
     }
 }
