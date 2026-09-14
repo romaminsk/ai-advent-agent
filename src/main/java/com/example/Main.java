@@ -82,12 +82,20 @@ public final class Main {
                 ui.showSystem(describeSessionLimit(agent.currentSettings()));
                 ui.showSystem(describeMemory(agent));
             }
-            setBranchLabel(ui, agent, demoRef);
+            updatePromptLabels(ui, agent, demoRef);
             if (agent.hasRestoredContext()) {
-                ui.showSystem("Контекст восстановлен: "
-                        + agent.getHistory().size() / 2 + " завершённых обменов.");
-            } else {
-                ui.showSystem("Начата новая беседа.");
+                // Необычное состояние — одна компактная строка; очевидное
+                // «начата новая беседа» не печатается.
+                StringBuilder restored = new StringBuilder("Восстановлено: ")
+                        .append(agent.getHistory().size() / 2).append(" ")
+                        .append(plural(agent.getHistory().size() / 2, "обмен", "обмена", "обменов"));
+                if (agent.currentSettings().contextStrategy() == ContextStrategy.BRANCHING) {
+                    restored.append(" · ветка ").append(agent.activeBranchName());
+                }
+                if (agent.currentTask() != null) {
+                    restored.append(" · задача «").append(agent.currentTask()).append("»");
+                }
+                ui.showSystem(restored + ".");
             }
             while (true) {
                 TerminalUi.Input input = ui.nextInput();
@@ -141,7 +149,7 @@ public final class Main {
                         // бюджета (только политика warn; block блокирует внутри агента).
                         String budgetWarning = activeAgent.predictContextBudgetWarning(input.text());
                         if (budgetWarning != null) {
-                            ui.showSystem(budgetWarning);
+                            ui.showSystem(warn(budgetWarning));
                         }
                         try (TerminalUi.ProgressIndicator progress = ui.startProgress()) {
                             String answer = activeAgent.ask(input.text());
@@ -247,16 +255,15 @@ public final class Main {
             case "sliding-window", "facts", "branching" -> {
                 try {
                     ModelSettings settings = agent.setStrategy(argument);
-                    ui.showSystem("Стратегия изменена: " + settings.contextStrategy().title()
+                    ui.showSystem("✓ Стратегия: " + settings.contextStrategy().title()
                             + ". Действует до конца текущего запуска; история, факты и ветки "
-                            + "не изменены. Следующий запрос будет сформирован по новой "
-                            + "стратегии."
+                            + "не изменены."
                             + (settings.contextStrategy() != ContextStrategy.BRANCHING
                             && settings.contextMode() == ContextMode.SUMMARY
                             ? "\n  режим контекства summary настроен, но в этой стратегии "
                             + "не применяется — это отмечается в /context и /tokens."
                             : ""));
-                    setBranchLabel(ui, agent, demoRef);
+                    updatePromptLabels(ui, agent, demoRef);
                 } catch (AgentException e) {
                     ui.showError(e.getMessage());
                 }
@@ -332,13 +339,13 @@ public final class Main {
             }
             case "clear" -> {
                 if (!ui.confirmFactsClear()) {
-                    ui.showSystem("Очистка фактов отменена. Блок сохранён.");
+                    ui.showSystem("Удаление отменено.");
                     return;
                 }
                 try {
                     agent.factsClear();
-                    ui.showSystem("Блок фактов очищен (в памяти и в файле истории). "
-                            + "Уже потраченный расход не отменяется.");
+                    ui.showSystem("✓ Блок фактов очищен (в памяти и в файле истории). "
+                            + "Расход не возвращается.");
                 } catch (ConversationStoreException e) {
                     ui.showError("Очистка фактов не выполнена, блок не изменён: "
                             + e.getMessage());
@@ -398,21 +405,20 @@ public final class Main {
             if (argument.isEmpty()) {
                 String task = agent.currentTask();
                 ui.showSystem(task == null
-                        ? "Текущая задача не задана. Задайте: /task <текст> или сформируйте "
-                        + "ее из диалога (/facts refresh обновит факты рабочей памяти)."
-                        : "Текущая задача: " + task);
+                        ? "Задача не задана. Задать: /task <текст>."
+                        : "Задача: " + task);
                 return;
             }
             if (argument.equalsIgnoreCase("clear")) {
                 agent.clearTask();
-                ui.showSystem("Текущая задача очищена. Факты рабочей памяти "
-                        + "сохранены (очистка фактов: /facts clear).");
+                updatePromptLabels(ui, agent, demoRef);
+                ui.showSystem("✓ Задача очищена. Факты сохранены (очистка фактов: /facts clear).");
                 return;
             }
             try {
                 agent.setTask(argument);
-                ui.showSystem("Текущая задача установлена. Она подставляется в блок "
-                        + "рабочей памяти каждого запроса до /task clear / /clear.");
+                updatePromptLabels(ui, agent, demoRef);
+                ui.showSystem("✓ Задача задана: «" + argument + "». Действует до /task clear.");
             } catch (AgentException e) {
                 ui.showError(e.getMessage());
             }
@@ -438,7 +444,16 @@ public final class Main {
                 return;
             }
             try {
-                ui.showSystem(agent.forget(argument).message());
+                LlmAgent.ForgetResult result = agent.forget(argument);
+                if (result.matches() > 1) {
+                    // Неоднозначность — короткий список вариантов, не ошибка.
+                    ui.showSystem(result.message());
+                } else if (result.removed()) {
+                    ui.showSystem(result.message());
+                } else {
+                    // Не найдено или сбой записи — ошибка с одним шагом.
+                    ui.showError(result.message());
+                }
             } catch (AgentException e) {
                 ui.showError(e.getMessage());
             }
@@ -449,8 +464,8 @@ public final class Main {
                 ? raw.substring("/remember".length()).trim() : "";
         try {
             agent.remember(argument);
-            ui.showSystem("Сохранено в долговременную память (переживает /clear, /reset "
-                    + "и перезапуск; файл отдельный от истории). Список записей: /memory.");
+            ui.showSystem("✓ Сохранено: " + LlmAgent.deriveMemoryKey(argument).key()
+                    + ". Список записей: /memory.");
         } catch (AgentException e) {
             ui.showError(e.getMessage());
         }
@@ -506,7 +521,7 @@ public final class Main {
             case "checkpoint" -> {
                 try {
                     agent.branchCheckpoint();
-                    ui.showSystem("Checkpoint перенесён на конец текущей истории.\n"
+                    ui.showSystem("✓ Checkpoint перенесён на конец текущей истории.\n"
                             + agent.branchesDescription());
                 } catch (ConversationStoreException e) {
                     ui.showError("Checkpoint не сохранён, история не изменена: "
@@ -527,11 +542,11 @@ public final class Main {
                         }
                         try {
                             agent.branchNew(name);
-                            ui.showSystem("Создана ветка «"
+                            ui.showSystem("✓ Ветка «"
                                     + name.trim().toLowerCase(java.util.Locale.ROOT)
-                                    + "» от checkpoint; диалог продолжается в ней. "
+                                    + "» создана от checkpoint; диалог продолжается в ней. "
                                     + "История прежней активной ветки сохранена.");
-                            setBranchLabel(ui, agent, demoRef);
+                            updatePromptLabels(ui, agent, demoRef);
                         } catch (ConversationStoreException e) {
                             ui.showError("Ветка не создана: " + e.getMessage());
                         } catch (AgentException e) {
@@ -545,12 +560,12 @@ public final class Main {
                         }
                         try {
                             agent.branchSwitch(name);
-                            ui.showSystem("Ветка «"
+                            ui.showSystem("✓ Ветка «"
                                     + name.trim().toLowerCase(java.util.Locale.ROOT)
                                     + "» активна. Истории всех веток сохранены; "
                                     + "следующее сообщение продолжит выбранную ветку.");
                             showPendingContextNotes(ui, agent);
-                            setBranchLabel(ui, agent, demoRef);
+                            updatePromptLabels(ui, agent, demoRef);
                         } catch (ConversationStoreException e) {
                             ui.showError("Переключение не выполнено, ветки не изменены: "
                                     + e.getMessage());
@@ -564,12 +579,12 @@ public final class Main {
                             return;
                         }
                         if (!ui.confirmBranchDelete(name)) {
-                            ui.showSystem("Удаление отменено. Ветка сохранена.");
+                            ui.showSystem("Удаление отменено.");
                             return;
                         }
                         try {
                             agent.branchDelete(name);
-                            ui.showSystem("Ветка «"
+                            ui.showSystem("✓ Ветка «"
                                     + name.trim().toLowerCase(java.util.Locale.ROOT)
                                     + "» удалена; история её хвоста потеряна безвозвратно.");
                             showPendingContextNotes(ui, agent);
@@ -596,10 +611,10 @@ public final class Main {
     }
 
     /**
-     * Метка приглашения с активной веткой; в режиме измерений метка занята
-     * и не перезаписывается, а вне стратегии веток метки нет.
+     * Метки приглашения: активная ветка (в стратегии веток) и текущая
+     * задача. В режиме измерений метка занята и не перезаписывается.
      */
-    private static void setBranchLabel(TerminalUi ui, LlmAgent agent, DemoRef demoRef) {
+    private static void updatePromptLabels(TerminalUi ui, LlmAgent agent, DemoRef demoRef) {
         if (demoRef.demo != null) {
             return;
         }
@@ -608,6 +623,7 @@ public final class Main {
         } else {
             ui.setActiveModeLabel(null);
         }
+        ui.setPromptTask(agent.currentTask());
     }
 
     /**
@@ -896,7 +912,7 @@ public final class Main {
         if (!verbose) {
             String limitNotice = agent.consumeSessionLimitNotice();
             if (limitNotice != null) {
-                ui.showSystem(limitNotice);
+                ui.showSystem(warn(limitNotice));
             }
             return;
         }
@@ -912,7 +928,7 @@ public final class Main {
         }
         String limitNotice = agent.consumeSessionLimitNotice();
         if (limitNotice != null) {
-            ui.showSystem(limitNotice);
+            ui.showSystem(warn(limitNotice));
         }
         if (diagnostics == null) {
             return;
@@ -920,8 +936,8 @@ public final class Main {
         if (diagnostics.limitReached()) {
             // Генерация остановлена по лимиту; ответ уже показан. Повторный
             // запрос не выполняется — решение за пользователем.
-            ui.showSystem("Ответ мог быть обрезан по лимиту генерации. Для более подробного "
-                    + "ответа задайте LLM_MAX_OUTPUT_TOKENS или выберите /mode detailed.");
+            ui.showSystem(warn("Ответ мог быть обрезан по лимиту генерации. Для более подробного "
+                    + "ответа задайте LLM_MAX_OUTPUT_TOKENS или выберите /mode detailed."));
         }
         ui.showSystem(formatContextNotes(agent));
         ui.showSystem(formatDiagnostics(diagnostics, model, agent.sessionStats(),
@@ -1038,8 +1054,14 @@ public final class Main {
     private static void showSessionLimitNoticeIfAny(TerminalUi ui, LlmAgent agent) {
         String notice = agent.consumeSessionLimitNotice();
         if (notice != null) {
-            ui.showSystem(notice);
+            ui.showSystem(warn(notice));
         }
+    }
+
+    /** Предупреждение: единый маркер «!» перед текстом (без дублирования). */
+    static String warn(String text) {
+        String trimmed = text == null ? "" : text.strip();
+        return trimmed.startsWith("!") ? trimmed : "! " + trimmed;
     }
 
     /** Краткие метрики последнего запроса; отсутствующие значения — «нет данных». */
@@ -1387,7 +1409,7 @@ public final class Main {
         }
         if ("off".equals(argument)) {
             agent.setSessionTokenLimit(null);
-            ui.showSystem("Уведомление по лимиту сессии отключено. "
+            ui.showSystem("✓ Уведомление по лимиту сессии отключено. "
                     + "Накопленный расход сохранён: "
                     + agent.sessionStats().knownTotal() + ".");
             return;
@@ -1409,7 +1431,7 @@ public final class Main {
         // Установка лимита не сбрасывает расход. Если учтённый расход уже
         // превышает новый порог и об этом ещё не сообщали — сообщение сразу.
         String immediateNotice = agent.setSessionTokenLimit(value);
-        ui.showSystem("Лимит сессии установлен: " + value
+        ui.showSystem("✓ Лимит сессии установлен: " + value
                 + ". Действует до конца текущего запуска; накопленный расход сохранён.");
         if (immediateNotice != null) {
             ui.showSystem(immediateNotice);
@@ -1517,7 +1539,7 @@ public final class Main {
         ContextMode before = agent.currentSettings().contextMode();
         try {
             ModelSettings settings = agent.setContextMode(mode);
-            ui.showSystem("Режим контекста изменён: " + settings.contextMode().title()
+            ui.showSystem("✓ Режим контекста: " + settings.contextMode().title()
                     + ". Действует до конца текущего запуска; история и резюме не изменены. "
                     + "Summary создаётся при следующем обычном запросе, когда накопится "
                     + "порог, либо по /summary refresh.");
@@ -1599,9 +1621,9 @@ public final class Main {
         // но честно предупреждает, если локальная оценка (≈) указывает,
         // что сжатие не уменьшит вход.
         if (!agent.compressionBenefitLikely()) {
-            ui.showSystem("Предупреждение (локальная оценка ≈): сжатие сейчас невыгодно — "
+            ui.showSystem(warn("Предупреждение (локальная оценка ≈): сжатие сейчас невыгодно — "
                     + "заменяемые сообщения короче ожидаемого резюме. Сравнение всё равно "
-                    + "выполняется по явному запросу.");
+                    + "выполняется по явному запросу."));
         }
         ui.showSystem("Снимок истории зафиксирован. Выполняются два запроса "
                 + "последовательно…");
@@ -1645,7 +1667,7 @@ public final class Main {
         boolean previewFailed = !fullOk || !summaryOk
                 || (r.prepPerformed() && r.prepError() != null);
         if (previewFailed) {
-            ui.showSystem("Внимание: сравнение НЕ полностью успешное — см. ошибки выше.");
+            ui.showSystem(warn("Внимание: сравнение НЕ полностью успешное — см. ошибки выше."));
         }
         if (compactSkipped) {
             ui.showSystem("Два одинаковых запроса не выдаются за успешное сравнение: "
@@ -1770,7 +1792,16 @@ public final class Main {
                 ui.showSystem("Работа завершена. История беседы сохранена.");
                 return true;
             }
-            case "/help" -> ui.showHelp();
+            case "/help" -> {
+                String argument = normalized.length() > "/help".length()
+                        ? normalized.substring("/help".length()).trim() : "";
+                if (argument.isEmpty() || UiText.lower(argument).startsWith("/help")) {
+                    ui.showHelp();
+                } else {
+                    // «/help task» и «/help /task» — обе формы положены.
+                    ui.showCommandHelp(argument.startsWith("/") ? argument : "/" + argument);
+                }
+            }
             case "/history" -> ui.showHistory(agent.getHistory());
             case "/tokens" -> ui.showSystem(formatTokens(agent, model));
             case "/stats" -> ui.showSystem(formatStats(agent));
@@ -1783,16 +1814,32 @@ public final class Main {
                         // очищается память; при ошибке записи старое состояние
                         // остаётся неизменным в обоих местах.
                         agent.resetConversation();
-                        ui.showSystem("Начата новая беседа. История очищена.");
+                        updatePromptLabels(ui, agent, demoRef);
+                        ui.showSystem("✓ Начата новая беседа. История очищена.");
                     } catch (ConversationStoreException e) {
                         ui.showError("Сброс не выполнен, история не изменена: " + e.getMessage());
                     }
                 } else {
-                    ui.showSystem("Сброс отменён. История сохранена.");
+                    ui.showSystem("Сброс отменён.");
                 }
             }
             default -> {
-                if (normalized.equals("/mode") || normalized.startsWith("/mode ")) {
+                if (normalized.equals("/help") || normalized.startsWith("/help ")) {
+                    String argument = normalized.substring("/help".length()).trim();
+                    if (argument.isEmpty()) {
+                        ui.showHelp();
+                    } else {
+                        // «/help task» и «/help /task» — обе формы работают.
+                        String commandName = argument.startsWith("/")
+                                ? argument : "/" + argument;
+                        if (TerminalUi.chatCommandHelp(commandName) == null) {
+                            ui.showSystem("Нет подробной справки по «" + argument
+                                    + "».\n  Попробуйте /help — индекс команд.");
+                        } else {
+                            ui.showCommandHelp(commandName);
+                        }
+                    }
+                } else if (normalized.equals("/mode") || normalized.startsWith("/mode ")) {
                     handleModeCommand(ui, agent, normalized);
                 } else if (normalized.equals("/limit") || normalized.startsWith("/limit ")) {
                     handleLimitCommand(ui, agent, normalized);
@@ -1818,7 +1865,7 @@ public final class Main {
         boolean demoMode = demoRef.demo != null;
         String subject = demoMode ? "временной беседы измерений" : "текущего диалога";
         if (!ui.confirmHistoryClear(subject)) {
-            ui.showSystem("Удаление отменено. История сохранена.");
+            ui.showSystem("Удаление отменено.");
             return;
         }
         try {
@@ -1827,13 +1874,12 @@ public final class Main {
                 // Журнал попыток сохраняется: между попытками появляется
                 // пометка «история очищена (/clear)».
                 demoRef.demo.markHistoryCleared();
-                ui.showSystem("История временной беседы измерений удалена.\n"
+                ui.showSystem("✓ История временной беседы измерений удалена. "
                         + "Расход и таблица режима измерений сохранены.");
             } else {
-                ui.showSystem("История текущего диалога удалена (вместе с резюме, "
-                        + "если оно было; рабочая память — задача и факты — очищена). "
-                        + "Долговременная память сохранена. Можно начать новую беседу.\n"
-                        + "Статистика расхода токенов за сессию сохранена.");
+                updatePromptLabels(ui, agent, demoRef);
+                ui.showSystem("✓ История текущего диалога удалена. "
+                        + "Долговременная память сохранена; статистика сессии сохранена.");
             }
         } catch (ConversationStoreException e) {
             ui.showError("Очистка не выполнена, история не изменена: " + e.getMessage());
@@ -1855,7 +1901,7 @@ public final class Main {
         }
         try {
             ModelSettings settings = agent.setProfile(argument);
-            ui.showSystem("Профиль изменён: " + modeSummary(settings)
+            ui.showSystem("✓ Профиль: " + modeSummary(settings)
                     + ". Действует до конца текущего запуска.");
         } catch (AgentException e) {
             ui.showError(e.getMessage());

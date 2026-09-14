@@ -24,6 +24,7 @@ import java.util.Locale;
 final class InteractiveTerminalUi implements TerminalUi {
 
     private static final String MULTILINE_PROMPT = "… › ";
+    private static final String MULTILINE_PROMPT_ASCII = "... > ";
 
     private static final String RESET = "\u001b[0m";
     private static final String BOLD = "\u001b[1m";
@@ -31,15 +32,23 @@ final class InteractiveTerminalUi implements TerminalUi {
     private static final String CYAN = "\u001b[36m";
     private static final String BLUE = "\u001b[34m";
     private static final String RED = "\u001b[31m";
+    private static final String YELLOW = "\u001b[33m";
 
     private final Terminal terminal;
     private final LineReader reader;
     private final boolean colors;
+    private final boolean ascii;
     private final String promptUser;
     private volatile ProgressSpinner activeSpinner;
 
     /** Метка активного режима в приглашении (null — обычный режим). */
     private volatile String activeModeLabel;
+
+    /** Текущая задача в приглашении (null — не задана). */
+    private volatile String promptTask;
+
+    /** Лимит длины задачи в приглашении; длиннее — обрезается с многоточием. */
+    private static final int PROMPT_TASK_MAX_LENGTH = 24;
 
     InteractiveTerminalUi() throws Exception {
         this.terminal = TerminalBuilder.builder().system(true).build();
@@ -62,7 +71,8 @@ final class InteractiveTerminalUi implements TerminalUi {
                 .build();
         // История ввода хранится только в памяти: файл истории не подключается.
         this.colors = TerminalUi.colorsEnabled();
-        this.promptUser = colors ? CYAN + "Вы ›" + RESET + " " : "Вы › ";
+        this.ascii = TerminalUi.asciiGlyphs();
+        this.promptUser = asciiPrompt("Вы ›");
         // При аварийном завершении (например, Ctrl+C во время запроса)
         // возвращаем курсор, чтобы не оставлять терминал «без курсора».
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
@@ -78,23 +88,63 @@ final class InteractiveTerminalUi implements TerminalUi {
         this.activeModeLabel = label;
     }
 
-    /** Приглашение обычного ввода с меткой активного режима, если она есть. */
+    @Override
+    public void setPromptTask(String task) {
+        this.promptTask = task == null || task.isBlank() ? null : task.trim();
+    }
+
+    /** Приглашение обычного ввода: режим и задача показываются только когда есть. */
     private String inputPrompt() {
-        if (activeModeLabel == null) {
+        StringBuilder labels = new StringBuilder();
+        if (activeModeLabel != null && !activeModeLabel.isEmpty()) {
+            labels.append('[').append(activeModeLabel).append(']');
+        }
+        if (promptTask != null) {
+            if (labels.length() > 0) {
+                labels.append(' ');
+            }
+            labels.append('[').append(truncateForPrompt(promptTask)).append(']');
+        }
+        if (labels.length() == 0) {
             return promptUser;
         }
-        String text = "Вы [" + activeModeLabel + "] ›";
+        String text = glyph("Вы " + labels + " ›");
         return colors ? CYAN + text + RESET + " " : text + " ";
     }
 
+    /**
+     * Усечение по видимой ширине: сначала сокращается задача,
+     * затем имя ветки; «›» не переносится отдельно.
+     */
+    private String truncateForPrompt(String task) {
+        int width = terminal.getWidth();
+        if (width <= 0) {
+            return task.length() <= PROMPT_TASK_MAX_LENGTH
+                    ? task : UiText.truncate(task, PROMPT_TASK_MAX_LENGTH);
+        }
+        // Резерв: «Вы [» + «] ›» + место для ввода — prompt остаётся коротким якорем.
+        int maxHeight = Math.max(6, width - 10);
+        int branchWidth = activeModeLabel == null ? 0 : UiText.visibleWidth(activeModeLabel);
+        int taskWidth = UiText.visibleWidth(task);
+        if (branchWidth + 3 + taskWidth <= maxHeight) {
+            return task;
+        }
+        // Ширина 40: иероглифы считаются как 2; минимум даёт читаемые 6 символов.
+        return UiText.truncate(task, Math.max(6, maxHeight - branchWidth - 3));
+    }
+
+    /**
+     * Компактный старт: две строки до приглашения; декоративная линия
+     * и очевидное («Начата новая беседа», «Контекст … включён») не печатаются.
+     * Статус восстановления — отдельной строкой через showSystem (Main).
+     */
     @Override
     public void showWelcome(String model) {
         PrintWriter out = terminal.writer();
-        int width = Math.min(Math.max(terminal.getWidth(), 20), 44);
         out.println();
-        out.println(BOLD + "AI Advent Agent" + RESET + dim(" · модель: " + model));
-        out.println(dim("Контекст текущей беседы включён · /help — команды · /exit — выход"));
-        out.println(dim("─".repeat(width)));
+        out.println(colors ? BOLD + "AI Advent Agent" + RESET + accent("  ·  " + model)
+                : "AI Advent Agent  ·  " + model);
+        out.println(dim("/help — команды"));
         out.flush();
     }
 
@@ -147,7 +197,7 @@ final class InteractiveTerminalUi implements TerminalUi {
     private Input readMultiline(String intro) {
         showSystem(intro);
         StringBuilder text = new StringBuilder();
-        String multilinePrompt = colors ? DIM + MULTILINE_PROMPT + RESET : MULTILINE_PROMPT;
+        String multilinePrompt = colors ? DIM + glyph(MULTILINE_PROMPT) + RESET : glyph(MULTILINE_PROMPT);
         while (true) {
             String line;
             try {
@@ -177,33 +227,89 @@ final class InteractiveTerminalUi implements TerminalUi {
         }
     }
 
+    /** Ответ агента: маркер «◆», пустая строка до/после, тело без префиксов. */
     @Override
     public void showMessage(String answer) {
         PrintWriter out = terminal.writer();
-        out.println((colors ? BOLD + BLUE : "") + "Агент" + (colors ? RESET : "") + " ─────");
+        // Пустая строка до ответа отделяет его от ввода пользователя.
+        out.println();
+        out.println(colors ? BOLD + glyph("◆") + RESET : glyph("◆"));
         // Исходное содержание ответа: переносы, отступы, Markdown; только обезвреживание.
-        out.println(AnsiSanitizer.sanitize(answer));
+        // С цветом Markdown отображается структурно (заголовки, списки, код),
+        // без цвета — как есть, чтобы не терять читаемость.
+        String sanitized = AnsiSanitizer.sanitize(answer);
+        out.println(colors ? MarkdownTerminal.render(sanitized) : sanitized);
         out.println();
         out.flush();
     }
 
+    /** Служебные сообщения: семантика маркера, цвет — добавочный канал. */
     @Override
     public void showSystem(String text) {
-        terminal.writer().println(dim(text));
+        String clean = text == null ? "" : text;
+        terminal.writer().println(colorByMarker(glyph(clean), "!", YELLOW));
         terminal.writer().flush();
+    }
+
+    /** Первый маркер строки задаёт цвет: ! → жёлтый, ✓ → зелёный, ? → акцент. */
+    private String colorByMarker(String text, String marker, String color) {
+        if (!colors || !text.startsWith(marker)) {
+            return dim(text);
+        }
+        return color + text + RESET;
     }
 
     @Override
     public void showError(String text) {
         PrintWriter out = terminal.writer();
-        out.println((colors ? RED + BOLD : "") + "Ошибка:" + (colors ? RESET : "") + " " + text);
+        // Первая строка — красный маркер «×»; следующий шаг (если есть) — dim.
+        String clean = AnsiSanitizer.sanitize(text == null ? "" : text);
+        String[] lines = clean.split("\n", 2);
+        out.println(colors ? RED + BOLD + glyph("×") + " " + lines[0] + RESET
+                : glyph("×") + " " + lines[0]);
+        if (lines.length > 1) {
+            out.println(dim(lines[1]));
+        }
         out.flush();
     }
 
     @Override
     public void showHelp() {
         PrintWriter out = terminal.writer();
-        out.print(TerminalUi.chatHelp());
+        // Индекс: заголовки групп — акцент, команды — обычный текст.
+        out.print(colors ? "Команды\n" : "Команды\n");
+        String index = TerminalUi.chatIndex(Math.max(terminal.getWidth(), 40));
+        for (String line : index.split("\n", -1)) {
+            out.println(groupHeadingsStyled(line));
+        }
+        out.flush();
+    }
+
+    /** Заголовки групп справки (не начинаются с пробела или [/↑T/<) — accent. */
+    private String groupHeadingsStyled(String line) {
+        boolean heading = !line.isBlank() && !line.startsWith(" ")
+                && !line.startsWith("/") && !line.startsWith("Tab")
+                && !line.startsWith("/help <");
+        return heading ? accent(line) : line;
+    }
+
+    /** /help <команда>: заголовок bold, разметка «Связано:» приглушена. */
+    @Override
+    public void showCommandHelp(String name) {
+        String text = TerminalUi.chatCommandHelp(name);
+        PrintWriter out = terminal.writer();
+        if (text == null) {
+            out.println(dim("Нет подробной справки по «" + name
+                    + "». Индекс команд: /help"));
+            out.flush();
+            return;
+        }
+        String[] lines = AnsiSanitizer.sanitize(text).split("\n", -1);
+        out.println();
+        out.println(colors ? BOLD + lines[0] + RESET : lines[0]);
+        for (int i = 1; i < lines.length; i++) {
+            out.println(lines[i].startsWith("Связано") ? dim(lines[i]) : lines[i]);
+        }
         out.flush();
     }
 
@@ -225,109 +331,61 @@ final class InteractiveTerminalUi implements TerminalUi {
         out.flush();
     }
 
+    /**
+     * Единый формат подтверждения: одна строка «? <вопрос> <область/необратимость>
+     * [y/N]». Только y или yes (без учёта регистра) подтверждают; Enter,
+     * пустой ввод, EOF и любой другой ответ выбирают «нет». Детали
+     * о постоянно хранимых данных — в /help <команда>.
+     */
+    private boolean confirm(String question, String consequence) {
+        String line = glyph("? " + question.strip() + (consequence.isBlank()
+                ? "" : " " + consequence.strip()) + " [y/N]");
+        try {
+            String answer = reader.readLine(colors ? DIM + line + RESET : line);
+            String trimmed = answer == null ? "" : answer.trim().toLowerCase(Locale.ROOT);
+            return trimmed.equals("y") || trimmed.equals("yes");
+        } catch (UserInterruptException | EndOfFileException e) {
+            // Ctrl+C и EOF безопасно отменяют (по умолчанию No).
+            return false;
+        }
+    }
+
     @Override
     public boolean confirmReset() {
-        try {
-            String answer = reader.readLine(colors ? DIM + "Удалить историю текущей беседы? [y/N] " + RESET
-                    : "Удалить историю текущей беседы? [y/N] ");
-            String trimmed = answer == null ? "" : answer.trim().toLowerCase(Locale.ROOT);
-            return trimmed.equals("y") || trimmed.equals("yes") || trimmed.equals("да");
-        } catch (UserInterruptException | EndOfFileException e) {
-            return false;
-        }
+        return confirm("Начать новую беседу и очистить историю текущей?",
+                "Это нельзя отменить.");
     }
 
-    /**
-     * Подтверждение удаления истории (/clear). Правила: только y или yes
-     * (без учёта регистра) подтверждают; пустой ввод, EOF и любой другой
-     * ответ отменяют операцию.
-     */
+    /** Подтверждение удаления истории (/clear). */
     @Override
     public boolean confirmHistoryClear(String subject) {
-        try {
-            PrintWriter out = terminal.writer();
-            out.println(dim("Удалить всю историю " + subject + "?"));
-            out.println(dim("Она будет очищена в памяти и в файле хранения."));
-            out.println(dim("Отменить удаление после подтверждения нельзя."));
-            out.flush();
-            String answer = reader.readLine(dim("Продолжить? [y/N] "));
-            String trimmed = answer == null ? "" : answer.trim().toLowerCase(Locale.ROOT);
-            return trimmed.equals("y") || trimmed.equals("yes");
-        } catch (UserInterruptException | EndOfFileException e) {
-            return false;
-        }
+        return confirm("Очистить историю " + subject + "?", "Это нельзя отменить.");
     }
 
-    /** Подтверждение сравнения (/context compare); только y или yes. */
+    /** Подтверждение сравнения (/context compare). */
     @Override
     public boolean confirmCompare() {
-        PrintWriter out = terminal.writer();
-        out.println(dim("Будут выполнены два запроса на одной истории: "
-                + "без сжатия и со сжатием."));
-        out.println(dim("Если резюме ещё не подготовлено, понадобится дополнительный "
-                + "запрос для его создания."));
-        out.println(dim("Это расходует средства или квоту."));
-        out.flush();
-        try {
-            String answer = reader.readLine("Продолжить? [y/N] ");
-            String trimmed = answer == null ? "" : answer.trim().toLowerCase(Locale.ROOT);
-            return trimmed.equals("y") || trimmed.equals("yes");
-        } catch (UserInterruptException | EndOfFileException e) {
-            return false;
-        }
+        return confirm("Выполнить два API-запроса (расход токенов или квоты)?", null);
     }
 
-    /** Подтверждение сравнения стратегий (/strategy compare); только y или yes. */
+    /** Подтверждение сравнения стратегий (/strategy compare). */
     @Override
     public boolean confirmStrategyCompare() {
-        PrintWriter out = terminal.writer();
-        out.println(dim("Будут выполнены запросы на одной истории для каждой стратегии "
-                + "(скользящее окно, факты, ветки)."));
-        out.println(dim("Если блок фактов пуст, понадобится дополнительный запрос "
-                + "для его подготовки."));
-        out.println(dim("Это расходует средства или квоту."));
-        out.flush();
-        try {
-            String answer = reader.readLine("Продолжить? [y/N] ");
-            String trimmed = answer == null ? "" : answer.trim().toLowerCase(Locale.ROOT);
-            return trimmed.equals("y") || trimmed.equals("yes");
-        } catch (UserInterruptException | EndOfFileException e) {
-            return false;
-        }
+        return confirm("Выполнить API-запросы для каждой стратегии? Это расход токенов.",
+                null);
     }
 
-    /** Подтверждение очистки фактов (/facts clear); только y или yes. */
+    /** Подтверждение очистки фактов (/facts clear). */
     @Override
     public boolean confirmFactsClear() {
-        PrintWriter out = terminal.writer();
-        out.println(dim("Будет удалён весь блок фактов «ключ: значение» "
-                + "(в памяти и в файле истории)."));
-        out.println(dim("Уже потраченные токены не возвращаются; факты придётся "
-                + "накапливать заново сообщениями диалога."));
-        out.flush();
-        try {
-            String answer = reader.readLine("Продолжить? [y/N] ");
-            String trimmed = answer == null ? "" : answer.trim().toLowerCase(Locale.ROOT);
-            return trimmed.equals("y") || trimmed.equals("yes");
-        } catch (UserInterruptException | EndOfFileException e) {
-            return false;
-        }
+        return confirm("Очистить весь блок фактов текущего диалога?",
+                "Это нельзя отменить.");
     }
 
-    /** Подтверждение удаления ветки (/branch delete <имя>); только y или yes. */
+    /** Подтверждение удаления ветки (/branch delete <имя>). */
     @Override
     public boolean confirmBranchDelete(String name) {
-        PrintWriter out = terminal.writer();
-        out.println(dim("Ветка «" + name + "» будет удалена (в памяти и в файле истории)."));
-        out.println(dim("История её хвоста после checkpoint потеряна безвозвратно."));
-        out.flush();
-        try {
-            String answer = reader.readLine("Продолжить? [y/N] ");
-            String trimmed = answer == null ? "" : answer.trim().toLowerCase(Locale.ROOT);
-            return trimmed.equals("y") || trimmed.equals("yes");
-        } catch (UserInterruptException | EndOfFileException e) {
-            return false;
-        }
+        return confirm("Ветка «" + name + "» необратимо удаляется.", "Продолжить?");
     }
 
     @Override
@@ -353,7 +411,22 @@ final class InteractiveTerminalUi implements TerminalUi {
         }
     }
 
+    /** Общий UI-слой: при LLM_ASCII все служебные глифы переводятся в ASCII. */
+    private String glyph(String text) {
+        return UiText.asciify(text, ascii);
+    }
+
+    private String asciiPrompt(String text) {
+        String plain = ascii ? text.replace("›", ">") : text;
+        return colors ? CYAN + plain + RESET + " " : plain + " ";
+    }
+
     private String dim(String text) {
         return colors ? DIM + text + RESET : text;
+    }
+
+    /** Акцент: только для коротких ключей — prompt, маркер ответа, заголовки. */
+    private String accent(String text) {
+        return colors ? CYAN + text + RESET : text;
     }
 }

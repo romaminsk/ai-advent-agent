@@ -850,7 +850,9 @@ public final class LlmAgent {
             }
             throw emptyAnswerError(parsed.finishReason());
         }
-        String answer = parsed.content();
+        // Ответ обезвреживается один раз до сохранения: в историю и в файл
+        // попадает чистый текст без управляющих последовательностей.
+        String answer = AnsiSanitizer.sanitize(parsed.content());
 
         // Учёт фактического расхода по usage: ровно один раз на успешный запрос.
         sessionStats.recordUsage(SessionTokenStats.Purpose.REGULAR,
@@ -1148,7 +1150,7 @@ public final class LlmAgent {
             if (memoryStore.remove(exactKey)) {
                 longTermMemory.remove(exactKey);
                 return new ForgetResult(true,
-                        "Запись «" + exactKey + "» удалена из долговременной памяти.", 1);
+                        "✓ Удалено: «" + exactKey + "».", 1);
             }
             return new ForgetResult(false,
                     "Не удалось удалить запись «" + exactKey + "» (ошибка записи файла "
@@ -1163,22 +1165,20 @@ public final class LlmAgent {
         }
         if (matches.isEmpty()) {
             return new ForgetResult(false,
-                    "Записи «" + query + "» нет в долговременной памяти. "
-                            + "Ключи записей: /memory.", 0);
+                    "Запись не найдена: «" + query + "».\n  Попробуйте /memory — список ключей.", 0);
         }
         if (matches.size() == 1) {
             String single = matches.get(0);
             if (memoryStore.remove(single)) {
                 longTermMemory.remove(single);
                 return new ForgetResult(true,
-                        "Точное совпадение не найдено; удалена запись по частичному "
-                                + "совпадению «" + single + "».", 1);
+                        "✓ Удалено: «" + single + "» (частичное совпадение).", 1);
             }
             return new ForgetResult(false,
                     "Не удалось удалить запись «" + single + "» (ошибка записи файла).", 1);
         }
         return new ForgetResult(false,
-                "По запросу «" + query + "» найдено несколько записей — уточните ключ:\n"
+                "Несколько совпадений — уточните ключ:\n"
                         + String.join("\n", matches.stream()
                         .map(k -> "  " + k)
                         .toList()), matches.size());

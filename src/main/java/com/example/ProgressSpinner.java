@@ -15,19 +15,27 @@ final class ProgressSpinner implements TerminalUi.ProgressIndicator {
 
     private static final String[] FRAMES =
             {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"};
+    private static final String[] FRAMES_ASCII =
+            {"|", "/", "-", "\\"};
     private static final String ERASE_LINE = "\r\u001b[2K";
     private static final String HIDE_CURSOR = "\u001b[?25l";
     private static final String SHOW_CURSOR = "\u001b[?25h";
 
     private final PrintWriter out;
     private final boolean enabled;
+    private final boolean ascii;
     private final AtomicBoolean running = new AtomicBoolean(true);
     private final Thread thread;
     private final long startNanos = System.nanoTime();
 
     ProgressSpinner(PrintWriter out, boolean enabled) {
+        this(out, enabled, false);
+    }
+
+    ProgressSpinner(PrintWriter out, boolean enabled, boolean asciiMode) {
         this.out = out;
         this.enabled = enabled;
+        this.ascii = asciiMode;
         if (!enabled) {
             thread = null;
             return;
@@ -37,7 +45,7 @@ final class ProgressSpinner implements TerminalUi.ProgressIndicator {
         thread = new Thread(() -> {
             int frame = 1; // кадр 0 рисуется синхронно в конструкторе
             while (running.get()) {
-                render(FRAMES[frame % FRAMES.length]);
+                render(activeFrames()[frame % activeFrames().length]);
                 frame++;
                 try {
                     Thread.sleep(120);
@@ -49,14 +57,23 @@ final class ProgressSpinner implements TerminalUi.ProgressIndicator {
         }, "agent-progress");
         thread.setDaemon(true);
         // Первый кадр отображается сразу, до первого ожидания.
-        render(FRAMES[0]);
+        render(activeFrames()[0]);
         thread.start();
+    }
+
+    /** Метка ожидания: фактическое действие известного этапа либо просто «… Думаю». */
+    private String label() {
+        return ascii ? "... Думаю " : "… Думаю ";
     }
 
     private void render(String frame) {
         long seconds = (System.nanoTime() - startNanos) / 1_000_000_000L;
-        out.print(ERASE_LINE + "Ожидаем ответ… " + seconds + " с " + frame);
+        out.print(ERASE_LINE + label() + seconds + " с " + frame);
         out.flush();
+    }
+
+    private String[] activeFrames() {
+        return ascii ? FRAMES_ASCII : FRAMES;
     }
 
     /** Для тестов: жив ли поток индикатора. */

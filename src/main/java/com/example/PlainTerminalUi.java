@@ -27,6 +27,12 @@ final class PlainTerminalUi implements TerminalUi {
     /** Метка активного режима в приглашении (null — обычный режим). */
     private String activeModeLabel;
 
+    /** Текущая задача в приглашении (null — не задана). */
+    private String promptTask;
+
+    /** Лимит длины задачи в приглашении; длиннее — обрезается с многоточием. */
+    private static final int PROMPT_TASK_MAX_LENGTH = 24;
+
     /** Обычный режим: stdin/stdout/stderr процесса. */
     PlainTerminalUi() {
         this(new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8)),
@@ -40,10 +46,11 @@ final class PlainTerminalUi implements TerminalUi {
         this.err = err;
     }
 
+    /** Компактный старт: две строки, очевидное (новая беседа/контекст) не печатается. */
     @Override
     public void showWelcome(String model) {
-        err.println("AI Advent Agent · модель: " + model);
-        err.println("Контекст текущей беседы включён · /help — команды · /exit — выход");
+        err.println("AI Advent Agent  ·  " + model);
+        err.println("/help — команды");
     }
 
     @Override
@@ -51,9 +58,32 @@ final class PlainTerminalUi implements TerminalUi {
         this.activeModeLabel = label;
     }
 
-    /** Приглашение обычного ввода с меткой активного режима, если она есть. */
+    @Override
+    public void setPromptTask(String task) {
+        this.promptTask = task == null || task.isBlank() ? null : task.trim();
+    }
+
+    /** Приглашение обычного ввода: режим и задача показываются только когда есть. */
     private String inputPrompt() {
-        return activeModeLabel == null ? "> " : "[" + activeModeLabel + "] > ";
+        StringBuilder labels = new StringBuilder();
+        if (activeModeLabel != null && !activeModeLabel.isEmpty()) {
+            labels.append('[').append(activeModeLabel).append(']');
+        }
+        if (promptTask != null) {
+            if (labels.length() > 0) {
+                labels.append(' ');
+            }
+            labels.append('[').append(truncateForPrompt(promptTask)).append(']');
+        }
+        return labels.length() == 0 ? "> " : labels + " > ";
+    }
+
+    /** Задача в приглашении обрезается до лимита с многоточием. */
+    private static String truncateForPrompt(String task) {
+        if (task.length() <= PROMPT_TASK_MAX_LENGTH) {
+            return task;
+        }
+        return task.substring(0, PROMPT_TASK_MAX_LENGTH) + "…";
     }
 
     @Override
@@ -130,28 +160,50 @@ final class PlainTerminalUi implements TerminalUi {
         }
     }
 
+    /** Ответ агента: маркер «◆», пустая строка до/после, тело без префиксов. */
     @Override
     public void showMessage(String answer) {
-        // Ответ печатается в stdout в исходном виде (только обезвреживание управляющих
-        // последовательностей); переносы, отступы и Markdown сохраняются.
-        out.println("Агент:");
+        // Ответ печатается в stdout в исходном виде (только обезвреживание
+        // управляющих последовательностей); переносы, отступы и Markdown сохраняются.
+        out.println();
+        out.println("◆");
         out.println(AnsiSanitizer.sanitize(answer));
         out.println();
     }
 
     @Override
     public void showSystem(String text) {
-        err.println(text);
+        // Маркер в тексте сообщения (✓/!/?), без ANSI в plain-режиме.
+        err.println(text == null ? "" : text);
     }
 
     @Override
     public void showError(String text) {
-        err.println("Ошибка: " + text);
+        // Первая строка — маркер «×», следующий шаг (если есть) — без префикса.
+        String clean = AnsiSanitizer.sanitize(text == null ? "" : text);
+        String[] lines = clean.split("\\n", 2);
+        err.println("× " + lines[0]);
+        if (lines.length > 1) {
+            err.println(lines[1]);
+        }
     }
 
     @Override
     public void showHelp() {
-        err.print(TerminalUi.chatHelp());
+        err.print("Команды\n");
+        err.print(TerminalUi.chatIndex(80));
+        err.println();
+    }
+
+    @Override
+    public void showCommandHelp(String name) {
+        String text = TerminalUi.chatCommandHelp(name);
+        if (text == null) {
+            err.println("Нет подробной справки по «" + name + "». Индекс команд: /help");
+            return;
+        }
+        err.println();
+        err.println(text);
     }
 
     @Override
@@ -166,73 +218,55 @@ final class PlainTerminalUi implements TerminalUi {
         }
     }
 
+    /**
+     * Единый формат подтверждения: одна строка «? <вопрос> <область/необратимость>
+     * [y/N]». Только y или yes подтверждают; Enter, пустой ввод, EOF и любой
+     * другой ответ выбирают «нет».
+     */
+    private boolean confirm(String question, String consequence) {
+        String line = "? " + question.strip() + (consequence.isBlank()
+                ? "" : " " + consequence.strip()) + " [y/N] ";
+        String answer = readLine(line);
+        String trimmed = answer == null ? "" : answer.trim().toLowerCase(java.util.Locale.ROOT);
+        return trimmed.equals("y") || trimmed.equals("yes");
+    }
+
     @Override
     public boolean confirmReset() {
-        String answer = readLine("Удалить историю текущей беседы? [y/N] ");
-        return answer != null && (answer.trim().equalsIgnoreCase("y")
-                || answer.trim().equalsIgnoreCase("yes")
-                || answer.trim().equalsIgnoreCase("да"));
+        return confirm("Начать новую беседу и очистить историю текущей?",
+                "Это нельзя отменить.");
     }
 
-    /**
-     * Подтверждение удаления истории (/clear). Только y или yes (без учёта
-     * регистра) подтверждают; пустой ввод, EOF и любой другой ответ отменяют.
-     */
+    /** Подтверждение удаления истории (/clear). */
     @Override
     public boolean confirmHistoryClear(String subject) {
-        err.println("Удалить всю историю " + subject + "?");
-        err.println("Она будет очищена в памяти и в файле хранения.");
-        err.println("Отменить удаление после подтверждения нельзя.");
-        String answer = readLine("Продолжить? [y/N] ");
-        String trimmed = answer == null ? "" : answer.trim().toLowerCase(java.util.Locale.ROOT);
-        return trimmed.equals("y") || trimmed.equals("yes");
+        return confirm("Очистить историю " + subject + "?", "Это нельзя отменить.");
     }
 
-    /** Подтверждение сравнения (/context compare); только y или yes. */
+    /** Подтверждение сравнения (/context compare). */
     @Override
     public boolean confirmCompare() {
-        err.println("Будут выполнены два запроса на одной истории: без сжатия и со сжатием.");
-        err.println("Если резюме ещё не подготовлено, понадобится дополнительный запрос "
-                + "для его создания.");
-        err.println("Это расходует средства или квоту.");
-        String answer = readLine("Продолжить? [y/N] ");
-        String trimmed = answer == null ? "" : answer.trim().toLowerCase(java.util.Locale.ROOT);
-        return trimmed.equals("y") || trimmed.equals("yes");
+        return confirm("Выполнить два API-запроса (расход токенов или квоты)?", null);
     }
 
-    /** Подтверждение сравнения стратегий (/strategy compare); только y или yes. */
+    /** Подтверждение сравнения стратегий (/strategy compare). */
     @Override
     public boolean confirmStrategyCompare() {
-        err.println("Будут выполнены запросы на одной истории для каждой стратегии "
-                + "(скользящее окно, факты, ветки).");
-        err.println("Если блок фактов пуст, понадобится дополнительный запрос "
-                + "для его подготовки.");
-        err.println("Это расходует средства или квоту.");
-        String answer = readLine("Продолжить? [y/N] ");
-        String trimmed = answer == null ? "" : answer.trim().toLowerCase(java.util.Locale.ROOT);
-        return trimmed.equals("y") || trimmed.equals("yes");
+        return confirm("Выполнить API-запросы для каждой стратегии? Это расход токенов.",
+                null);
     }
 
-    /** Подтверждение очистки фактов (/facts clear); только y или yes. */
+    /** Подтверждение очистки фактов (/facts clear). */
     @Override
     public boolean confirmFactsClear() {
-        err.println("Будет удалён весь блок фактов «ключ: значение» "
-                + "(в памяти и в файле истории).");
-        err.println("Уже потраченные токены не возвращаются; факты придётся");
-        err.println("накапливать заново сообщениями диалога.");
-        String answer = readLine("Продолжить? [y/N] ");
-        String trimmed = answer == null ? "" : answer.trim().toLowerCase(java.util.Locale.ROOT);
-        return trimmed.equals("y") || trimmed.equals("yes");
+        return confirm("Очистить весь блок фактов текущего диалога?",
+                "Это нельзя отменить.");
     }
 
-    /** Подтверждение удаления ветки (/branch delete <имя>); только y или yes. */
+    /** Подтверждение удаления ветки (/branch delete <имя>). */
     @Override
     public boolean confirmBranchDelete(String name) {
-        err.println("Ветка «" + name + "» будет удалена (в памяти и в файле истории).");
-        err.println("История её хвоста после checkpoint потеряна безвозвратно.");
-        String answer = readLine("Продолжить? [y/N] ");
-        String trimmed = answer == null ? "" : answer.trim().toLowerCase(java.util.Locale.ROOT);
-        return trimmed.equals("y") || trimmed.equals("yes");
+        return confirm("Ветка «" + name + "» необратимо удаляется.", "Продолжить?");
     }
 
     @Override

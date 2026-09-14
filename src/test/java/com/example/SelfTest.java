@@ -143,6 +143,11 @@ public final class SelfTest {
             checkSessionTokenLimitFeature();
             checkClearCommand();
             checkClearConfirmationUi();
+            checkUiPrompt();
+            checkUiMessageMarkers();
+            checkUiRedesign();
+            checkUiColorAndMarkdown();
+            checkHistoryStoreCleanText();
             checkClearDemoIsolation();
             checkClearErrorKeepsMemory();
             checkDemoTokensMode();
@@ -532,6 +537,18 @@ public final class SelfTest {
         int confirmBranchDeleteCount = 0;
         boolean confirmBranchDeleteAnswer = false;
         String confirmBranchDeleteName;
+        final List<String> promptTasks = new ArrayList<>();
+        final List<String> commandHelps = new ArrayList<>();
+
+        @Override
+        public void setPromptTask(String task) {
+            promptTasks.add(task);
+        }
+
+        @Override
+        public void showCommandHelp(String name) {
+            commandHelps.add(name);
+        }
 
         FakeUi(TerminalUi.Input... inputs) {
             this.script = List.of(inputs);
@@ -792,14 +809,14 @@ public final class SelfTest {
         expect("exit распознаётся как команда",
                 input.type() == TerminalUi.InputType.COMMAND && input.text().equals("exit"));
         expect("ответы идут в stdout, служебные сообщения — в stderr",
-                outText.contains("Агент") && outText.contains("с Markdown")
+                outText.contains("◆") && outText.contains("с Markdown")
                         && !errText.contains("с Markdown")
                         && errText.contains("AI Advent Agent")
                         && errText.contains("История диалога пуста."));
         expect("plain-режим не содержит ANSI-последовательностей",
                 !outText.contains("\u001B") && !errText.contains("\u001B"));
-        expect("приветствие plain-режима сообщает о контексте",
-                errText.contains("Контекст текущей беседы включён"));
+        expect("приветствие plain-режима компактное",
+                errText.contains("/help — команды"));
     }
 
     /** Вывод в память для проверок: и как PrintStream, и как текст. */
@@ -849,7 +866,7 @@ public final class SelfTest {
         ProgressSpinner enabled = new ProgressSpinner(new PrintWriter(enabledBuffer), true);
         enabled.close();
         String output = enabledBuffer.toString();
-        expect("спиннер показывает «Ожидаем ответ…»", output.contains("Ожидаем ответ"));
+        expect("спиннер показывает «… Думаю»", output.contains("Думаю"));
         expect("спиннер останавливается и стирает строку",
                 !enabled.isThreadAlive() && output.endsWith("\r\u001b[2K\u001b[?25h"));
     }
@@ -1725,7 +1742,7 @@ public final class SelfTest {
                             s -> s.contains("Профиль: balanced · лимит генерации: 2048")));
             expect("профиль переключается на fast с лимитом 1024",
                     modeUi.systems.stream().anyMatch(
-                            s -> s.contains("Профиль изменён: fast · лимит генерации: 1024"))
+                            s -> s.contains("Профиль: fast · лимит генерации: 1024"))
                             && ModelSettings.FAST.equals(agent.currentSettings().profile())
                             && agent.currentSettings().maxOutputTokens() == 1024);
             expect("неизвестный профиль даёт понятную ошибку",
@@ -2673,7 +2690,7 @@ public final class SelfTest {
             expect("сообщение об успехе упоминает сохранение статистики",
                     clearUi.systems.stream().anyMatch(s ->
                             s.contains("История текущего диалога удалена")
-                                    && s.contains("Статистика расхода токенов за сессию сохранена")));
+                                    && s.contains("статистика сессии сохранена")));
             expect("статистика сессии не сброшена очисткой",
                     agent.sessionStats().apiAttempts() == 1
                             && agent.sessionStats().knownTotal() == 30);
@@ -2727,10 +2744,7 @@ public final class SelfTest {
         expect("подтверждение y удаляет историю",
                 yesUi.confirmHistoryClear("текущего диалога"));
         expect("текст подтверждения объясняет правила",
-                err.text().contains("Удалить всю историю текущего диалога?")
-                        && err.text().contains("в памяти и в файле хранения")
-                        && err.text().contains("Отменить удаление после подтверждения нельзя")
-                        && err.text().contains("Продолжить? [y/N]"));
+                err.text().contains("? Очистить историю текущего диалога? Это нельзя отменить. [y/N]"));
         expect("подтверждение YES без учёта регистра",
                 new PlainTerminalUi(reader("YES\n"), capturingStream().stream,
                         capturingStream().stream).confirmHistoryClear("текущего диалога"));
@@ -2750,7 +2764,231 @@ public final class SelfTest {
         new PlainTerminalUi(reader("y\n"), capturingStream().stream, demoErr.stream)
                 .confirmHistoryClear("временной беседы измерений");
         expect("в измерениях подтверждение называет временную беседу",
-                demoErr.text().contains("Удалить всю историю временной беседы измерений?"));
+                demoErr.text().contains("Очистить историю временной беседы измерений?"));
+        CapturedStream resetErr = capturingStream();
+        new PlainTerminalUi(reader("y\n"), capturingStream().stream, resetErr.stream)
+                .confirmReset();
+        expect("подтверждение /reset в едином формате с маркером",
+                resetErr.text().contains("? Начать новую беседу и очистить историю текущей?"));
+        CapturedStream branchErr = capturingStream();
+        new PlainTerminalUi(reader("y\n"), capturingStream().stream, branchErr.stream)
+                .confirmBranchDelete("main");
+        expect("подтверждение удаления ветки называет ветку",
+                branchErr.text().contains("? Ветка «main» необратимо удаляется. Продолжить? [y/N]"));
+    }
+
+    // ---------- UI: приглашение, маркеры, справка, цвет, Markdown ----------
+
+    /** Приглашение: задача, ветка, обрезка, многострочный маркер. */
+    private static void checkUiPrompt() {
+        CapturedStream out = capturingStream();
+        CapturedStream err = capturingStream();
+
+        PlainTerminalUi taskUi = new PlainTerminalUi(reader("текст\n"), out.stream, err.stream);
+        taskUi.setPromptTask("карточка проекта");
+        taskUi.nextInput();
+        expect("приглашение показывает текущую задачу",
+                err.text().contains("[карточка проекта] > "));
+
+        err = capturingStream();
+        PlainTerminalUi longTaskUi = new PlainTerminalUi(reader("текст\n"), out.stream, err.stream);
+        String longTask = "очень длинное название задачи, которое не влезает в приглашение";
+        longTaskUi.setPromptTask(longTask);
+        longTaskUi.nextInput();
+        expect("длинная задача в приглашении обрезается с многоточием",
+                err.text().contains("…") && !err.text().contains(longTask));
+
+        err = capturingStream();
+        PlainTerminalUi clearedUi = new PlainTerminalUi(reader("текст\n"), out.stream, err.stream);
+        clearedUi.setPromptTask("задача");
+        clearedUi.setPromptTask(null);
+        clearedUi.nextInput();
+        expect("после /task clear приглашение возвращается к обычному",
+                err.text().contains("> ") && !err.text().contains("[задача]"));
+
+        err = capturingStream();
+        PlainTerminalUi labelsUi = new PlainTerminalUi(reader("текст\n"), out.stream, err.stream);
+        labelsUi.setActiveModeLabel("ветка: main");
+        labelsUi.setPromptTask("задача");
+        labelsUi.nextInput();
+        expect("приглашение показывает и режим, и задачу вместе",
+                err.text().contains("[ветка: main] [задача] > "));
+
+        err = capturingStream();
+        PlainTerminalUi mlUi = new PlainTerminalUi(reader("/multiline\nстрока\n/send\n"),
+                out.stream, err.stream);
+        mlUi.nextInput();
+        expect("в многострочном режиме приглашение — отдельный маркер",
+                err.text().contains("… › "));
+    }
+
+    /** Подтверждения успеха с маркером «✓» и подсказки в ошибках памяти. */
+    private static void checkUiMessageMarkers() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash");
+            LlmAgent agent = newMemoryAgent(config, trustedHttpClient(keyStore),
+                    new java.util.HashMap<>());
+            FakeUi taskUi = new FakeUi(
+                    TerminalUi.Input.command("/task подготовить отчёт"),
+                    TerminalUi.Input.command("/task"),
+                    TerminalUi.Input.command("/task clear"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(taskUi, agent, "glm-5.3-flash");
+            expect("сообщения об успехе короткие и с маркером «✓»",
+                    taskUi.systems.stream().anyMatch(s ->
+                            s.startsWith("✓") && s.contains("Задача задана")
+                                    && !s.contains("Долговременная"))
+                            && taskUi.systems.stream().anyMatch(s ->
+                            s.startsWith("✓") && s.contains("Задача очищена")));
+            expect("успешное сообщение не разъясняет устройство памяти (это в /help)",
+                    taskUi.systems.stream().noneMatch(s ->
+                            s.contains("подставляется в блок") || s.contains("рабочей памяти каждого")));
+            expect("задача обновляет приглашение и очищается вместе с ней",
+                    taskUi.promptTasks.contains("подготовить отчёт")
+                            && taskUi.promptTasks.contains(null));
+
+            LlmAgent memAgent = newMemoryAgent(config, trustedHttpClient(keyStore),
+                    new java.util.HashMap<>());
+            FakeUi memUi = new FakeUi(
+                    TerminalUi.Input.command("/remember Проект: Север"),
+                    TerminalUi.Input.command("/forget НесуществующийКлюч"),
+                    TerminalUi.Input.command("/forget Проект"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(memUi, memAgent, "glm-5.3-flash");
+            expect("сохранение подтверждается кратко: ключ + подсказка /memory",
+                    memUi.systems.stream().anyMatch(s ->
+                            s.startsWith("✓ Сохранено: Проект") && s.contains("/memory")));
+            expect("ошибка «запись не найдена» содержит один следующий шаг",
+                    memUi.errors.stream().anyMatch(s ->
+                            s.contains("Запись не найдена") && s.contains("Попробуйте /memory")));
+            expect("удаление подтверждается маркером и ключом записи",
+                    memUi.systems.stream().anyMatch(s ->
+                            s.startsWith("✓ Удалено: «Проект»")));
+        } finally {
+            Files.deleteIfExists(keyStore);
+        }
+
+        String help = TerminalUi.chatIndex(80);
+        expect("справка /help — компактный индекс по группам одной строкой",
+                help.contains("Память") && help.contains("Контекст")
+                        && help.contains("Статистика")
+                        && help.contains("/memory") && help.contains("/context")
+                        && help.lines().count() <= 10);
+        expect("внизу справки — подсказка /help <команда> и навигация",
+                help.contains("/help <команда>") && help.contains("Tab"));
+    }
+
+    /** Снимки редизайна: старт, prompt по ширинам, help, подтверждение, ошибка. */
+    private static void checkUiRedesign() {
+        // Старт: 2 строки, без декоративной линии и очевидного текста.
+        CapturedStream err = capturingStream();
+        new PlainTerminalUi(reader(""), capturingStream().stream, err.stream)
+                .showWelcome("test-model");
+        String welcome = err.text();
+        expect("старт до приглашения: 2 строки, без линии и баннера",
+                welcome.lines().count() == 2
+                        && welcome.contains("AI Advent Agent")
+                        && welcome.contains("test-model")
+                        && !welcome.contains("───")
+                        && !welcome.contains("Контекст текущей беседы включён")
+                        && !welcome.contains("Начата новая беседа"));
+
+        // Prompt по ширинам: 40 остаётся якорем, кириллица и wide Unicode.
+        expect("усечение по видимой ширине 40 не ломает prompt",
+                UiText.visibleWidth(UiText.truncate(
+                        "полное-название-задачи-которое-очень-длинное",
+                        40 - 10)) <= 40 - 10
+                        && UiText.truncate("продумать карточку проекта", 6).endsWith("…"));
+        expect("wide-символы считаются как 2 колонки",
+                UiText.visibleWidth("У颳颳") == 5);
+        String at40 = "[main · " + UiText.truncate("очень длинное название задачи для проверки сетки", 8) + "]";
+        expect("на ширине 40 ветка+задача не разъезжают prompt",
+                UiText.visibleWidth(at40) <= 40 - 10);
+
+        // /help <команда>: назначение, usage, примеры, эффекты, связанные.
+        String taskHelp = TerminalUi.chatCommandHelp("/task");
+        expect("/help /task содержит назначение, usage и примеры",
+                taskHelp.startsWith("/task — ") && taskHelp.contains("Использование")
+                        && taskHelp.contains("Примеры")
+                        && taskHelp.contains("Эффекты") && taskHelp.contains("Связано"));
+        expect("неизвестная команда справки даёт один шаг",
+                TerminalUi.chatCommandHelp("/несуществующая") == null);
+    }
+
+    /** Переключатель цвета LLM_COLOR и Markdown-рендеринг ответа. */
+    private static void checkUiColorAndMarkdown() {
+        expect("LLM_COLOR=never полностью отключает цвет",
+                !TerminalUi.colorsEnabled("never", null));
+        expect("LLM_COLOR=always включает цвет даже при NO_COLOR",
+                TerminalUi.colorsEnabled("always", "1"));
+        expect("LLM_COLOR=auto учитывает NO_COLOR",
+                !TerminalUi.colorsEnabled("auto", "1")
+                        && TerminalUi.colorsEnabled("auto", null));
+        expect("без переменных цвет включён (auto по умолчанию)",
+                TerminalUi.colorsEnabled(null, null));
+        expect("неизвестное значение LLM_COLOR трактуется как auto",
+                TerminalUi.colorsEnabled("мусор", "1") == TerminalUi.colorsEnabled("auto", "1"));
+
+        expect("маркер «!» не дублируется",
+                Main.warn("! текст").equals("! текст") && Main.warn("текст").equals("! текст"));
+
+        String rendered = MarkdownTerminal.render(
+                "# Заголовок\n"
+                        + "- пункт списка\n"
+                        + "**жирный** и `код` и [текст](https://example.com)\n"
+                        + "```java\n"
+                        + "int x = 5; // комментарий\n"
+                        + "```\n"
+                        + "обычный текст без разметки");
+        expect("заголовок оформляется жирным цветом",
+                rendered.contains("\u001b[1m\u001b[36mЗаголовок"));
+        expect("жирный текст оформляется ANSI-жирностью",
+                rendered.contains("\u001b[1mжирный\u001b[0m"));
+        expect("inline-код выделяется цветом",
+                rendered.contains("\u001b[36mкод\u001b[0m"));
+        expect("блок кода помечается языком",
+                rendered.contains("· java"));
+        expect("код подсвечивается: комментарий и число",
+                rendered.contains("\u001b[2m// комментарий")
+                        && rendered.contains("\u001b[36m5"));
+        String stripped = rendered.replaceAll("\u001b\\[[0-9;]*[a-zA-Z]", "");
+        expect("список отображается символом «•»",
+                stripped.contains("• пункт списка"));
+        expect("содержимое ответа при рендере не теряется",
+                stripped.contains("int x = 5; // комментарий")
+                        && stripped.contains("обычный текст без разметки"));
+    }
+
+    /** В хранимую историю и файл попадает чистый текст без ANSI. */
+    private static void checkHistoryStoreCleanText() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) ->
+                new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                        + "\"content\":\"\\u001b[31mкрасный\\u001b[0m ответ\"}}],"
+                        + "\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3}}")
+                        .getBytes(StandardCharsets.UTF_8)));
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort() + "/v1/chat/completions",
+                    "glm-5.3-flash");
+            JsonConversationStore store = tempStore();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.defaults(),
+                    trustedHttpClient(keyStore), store);
+            agent.ask("вопрос");
+            expect("история хранит чистый текст без управляющих последовательностей",
+                    agent.getHistory().size() == 2
+                            && agent.getHistory().get(1).content().contains("красный ответ")
+                            && !agent.getHistory().get(1).content().contains("\u001b"));
+            String fileText = Files.readString(store.file(), StandardCharsets.UTF_8);
+            expect("в файле истории чистый текст без ANSI-кодов",
+                    fileText.contains("красный ответ") && !fileText.contains("\u001b"));
+            store.close();
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
     }
 
     private static void checkClearDemoIsolation() throws Exception {
@@ -4176,8 +4414,8 @@ public final class SelfTest {
             expect("первый запуск процесса завершился успешно"
                             + (run1.exitCode() == 0 ? "" : " — stderr: " + run1.stderr()),
                     run1.exitCode() == 0);
-            expect("первый запуск сообщает о новой беседе",
-                    run1.stderr().contains("Начата новая беседа."));
+            expect("первый запуск не издаёт лишнего шума (новая беседа очевидна)",
+                    !run1.stderr().contains("Начата новая беседа."));
             expect("первый запуск получил ответ от локального сервера",
                     run1.stdout().contains("Ответ 1"));
 
@@ -4189,7 +4427,7 @@ public final class SelfTest {
                             + (run2.exitCode() == 0 ? "" : " — stderr: " + run2.stderr()),
                     run2.exitCode() == 0);
             expect("второй запуск сообщает о восстановлении контекста",
-                    run2.stderr().contains("Контекст восстановлен: 1 завершённых обменов."));
+                    run2.stderr().contains("Восстановлено: 1 обмен"));
             expect("второй запуск получил ответ", run2.stdout().contains("Ответ 2"));
 
             expect("второй процесс отправил ровно один запрос к API", bodies.size() == 2);
@@ -4782,7 +5020,7 @@ public final class SelfTest {
                             t.contains("Стратегия контекста: Скользящее окно")));
             expect("переключение на facts сообщается",
                     ui.systems.stream().anyMatch(t ->
-                            t.contains("Стратегия изменена: Факты")));
+                            t.contains("Стратегия: Факты")));
             expect("переключение на branching меняет настройки и показывает команды",
                     ui.systems.stream().anyMatch(t ->
                             t.contains("Ветки (история активной ветки)")));
@@ -5499,11 +5737,11 @@ public final class SelfTest {
             expect("частичное совпадение с единственной записью удаляется",
                     partial.removed()
                             && !agent.memoryView().containsKey("срок")
-                            && partial.message().contains("частичному"));
+                            && partial.message().contains("частичн"));
 
             LlmAgent.ForgetResult missing = agent.forget("несуществующе");
             expect("отсутствующий ключ даёт честное «нет записи»",
-                    !missing.removed() && missing.message().contains("нет"));
+                    !missing.removed() && missing.message().contains("не найдена"));
         } finally {
             server.stop(0);
             Files.deleteIfExists(keyStore);
@@ -5736,8 +5974,8 @@ public final class SelfTest {
             expect("/forget удаляет запись долговременной памяти",
                     agent.memoryView().get("проект") == null);
             expect("повторный /forget сообщает об отсутствии записи",
-                    forgetUi.systems.stream().anyMatch(t ->
-                            t.contains("нет в долговременной памяти")));
+                    forgetUi.errors.stream().anyMatch(t ->
+                            t.contains("Запись не найдена")));
         } finally {
             server.stop(0);
             Files.deleteIfExists(keyStore);
@@ -5838,15 +6076,15 @@ public final class SelfTest {
                     TerminalUi.Input.command("/exit"));
             Main.runLoop(ui, agent, "glm-5.3-flash");
             expect("/task без аргумента сообщает об отсутствии задачи",
-                    ui.systems.stream().anyMatch(t -> t.contains("Текущая задача не задана")));
+                    ui.systems.stream().anyMatch(t -> t.contains("Задача не задана")));
             expect("/task устанавливает задачу рабочей памяти",
                     agent.currentTask() != null
                             && agent.currentTask().contains("отчёт к среде"));
             expect("установленная задача отображается", agent.currentTask() != null);
             expect("установленная задача видна в выводе /task",
-                    ui.systems.stream().anyMatch(t -> t.contains("Текущая задача: подготовить отчёт к среде")));
+                    ui.systems.stream().anyMatch(t -> t.contains("Задача: подготовить отчёт к среде")));
             expect("подтверждение установки показано",
-                    ui.systems.stream().anyMatch(t -> t.contains("Текущая задача установлена")));
+                    ui.systems.stream().anyMatch(t -> t.contains("Задача задана")));
 
             FakeUi clearUi = new FakeUi(
                     TerminalUi.Input.command("/task clear"),
@@ -5856,7 +6094,7 @@ public final class SelfTest {
             expect("/task clear очищает задачу, не трогая факты",
                     agent.currentTask() == null
                             && clearUi.systems.stream().anyMatch(t ->
-                            t.contains("Текущая задача очищена")));
+                            t.contains("Задача очищена")));
         } finally {
             server.stop(0);
             Files.deleteIfExists(keyStore);
@@ -6061,8 +6299,8 @@ public final class SelfTest {
                 expect("по умолчанию в выводе нет «" + banned + "»",
                         !systems.contains(banned));
             }
-            expect("старт по умолчанию короткий: статусная строка есть, подробностей нет",
-                    systems.contains("Начата новая беседа.")
+            expect("старт по умолчанию короткий: пусто до приглашения, подробностей нет",
+                    ui.systems.stream().allMatch(t -> t.equals("Работа завершена. История беседы сохранена."))
                             && !systems.contains("Стратегия контекста")
                             && !systems.contains("Профиль")
                             && !systems.contains("Лимит расхода токенов"));
