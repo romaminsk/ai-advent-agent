@@ -57,6 +57,7 @@ final class InteractiveTerminalUi implements TerminalUi {
                         "/facts", "/facts refresh", "/facts clear",
                         "/branch", "/branch list", "/branch checkpoint",
                         "/branch new ", "/branch switch ", "/branch delete ",
+                        "/memory", "/remember ", "/forget ", "/task ", "/task clear",
                         "/exit", "exit", "quit"))
                 .build();
         // История ввода хранится только в памяти: файл истории не подключается.
@@ -202,30 +203,7 @@ final class InteractiveTerminalUi implements TerminalUi {
     @Override
     public void showHelp() {
         PrintWriter out = terminal.writer();
-        out.println("Команды:");
-        out.println("  /help      — справка");
-        out.println("  /history   — история текущего диалога");
-        out.println("  /tokens    — оценка токенов истории, контекста и резервов (без вызова API)");
-        out.println("  /stats     — фактический расход токенов и стоимость за сессию (без вызова API)");
-        out.println("  /limit     — лимит расхода за сессию: /limit показать, /limit <число>, /limit off");
-        out.println("  /reset     — очистить контекст и начать новую беседу");
-        out.println("  /clear     — удалить историю текущего диалога (подтверждение y/yes; статистика сессии сохраняется)");
-        out.println("  /multiline — многострочный ввод (/send — отправить, /cancel — отмена)");
-        out.println("  /paste     — вставка длинного текста одним сообщением (/send, /cancel)");
-        out.println("  /demo      — режим измерения токенов: /demo tokens, /demo stats, /demo stop");
-        out.println("  /mode      — профиль ответа: /mode показать, /mode fast|balanced|detailed");
-        out.println("  /context   — режим контекста: /context показать, /context full|summary,");
-        out.println("             /context compare <вопрос> — сравнение двух запросов (API, с подтверждением)");
-        out.println("  /summary   — резюме сжатия: /summary показать, /summary refresh — обновить (API)");
-        out.println("  /strategy  — стратегии контекста: /strategy показать,");
-        out.println("             /strategy sliding-window|facts|branching — переключить (без API),");
-        out.println("             /strategy compare <вопрос> — сравнение трёх стратегий (API, с подтверждением)");
-        out.println("  /facts     — блок фактов: /facts показать, /facts refresh — обновить (API),");
-        out.println("             /facts clear — очистить (подтверждение)");
-        out.println("  /branch    — ветки диалога: /branch list, /branch checkpoint,");
-        out.println("             /branch new <имя>, /branch switch <имя>, /branch delete <имя> (подтверждение)");
-        out.println("  /exit      — завершение (также exit, quit)");
-        out.println("Стрелки вверх/вниз — предыдущие сообщения, Tab — автодополнение команд.");
+        out.print(TerminalUi.chatHelp());
         out.flush();
     }
 

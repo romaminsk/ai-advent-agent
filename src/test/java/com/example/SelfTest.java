@@ -30,6 +30,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -84,11 +85,8 @@ public final class SelfTest {
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final char[] KEYSTORE_PASSWORD = "changeit".toCharArray();
 
-    /** Ожидаемый текст системной инструкции агента. */
-    private static final String SYSTEM_PROMPT_TEXT =
-            "Ты полезный ассистент. Учитывай историю диалога. "
-                    + "Отвечай на языке пользователя, если он не попросил иначе. "
-                    + "Если информации недостаточно, уточни вопрос.";
+    /** Ожидаемый текст системной инструкции агента (базовая часть без блоков памяти). */
+    private static final String SYSTEM_PROMPT_TEXT = ContextBuilder.BASE_SYSTEM_PROMPT;
 
     /** Детерминированный счётчик для проверок: 1 токен = 1 символ текста. */
     private static final TokenCounter LEN_COUNTER = new TokenCounter() {
@@ -186,7 +184,22 @@ public final class SelfTest {
             checkDay10OtherStoreValidation();
             checkFactsPrepLengthAbortsCompare();
             checkFactsNearLimitWarning();
+            checkMemoryLayerSeparation();
+            checkRememberKeyFormats();
+            checkForgetPartialMatches();
+            checkLegacyRememberEntries();
+            checkSystemInstructionRules();
+            checkWorkingCounterMatchesFacts();
+            checkRememberForgetMemoryCommands();
+            checkMemoryPersistsAcrossRestarts();
+            checkClearKeepsLongTermMemory();
+            checkTaskCommands();
+            checkThreeLayersInRequest();
+            checkMemoryUpdateAccountingOnce();
             checkUserFacingOutputNeutral();
+            checkDefaultRunSettings();
+            checkQuietStartupAndAnswer();
+            checkExplicitCommandsStillDetailed();
             checkDiagnosticsHiddenByDefault();
             checkTwoProcessIntegration();
         } finally {
@@ -4164,7 +4177,9 @@ public final class SelfTest {
             String followUp = "Какое кодовое слово я просил запомнить?";
             RunResult run2 = runAgentProcess(javaBin, classpath, trustStore, url, historyFile,
                     List.of(followUp, "/exit"));
-            expect("второй запуск процесса завершился успешно", run2.exitCode() == 0);
+            expect("второй запуск процесса завершился успешно"
+                            + (run2.exitCode() == 0 ? "" : " — stderr: " + run2.stderr()),
+                    run2.exitCode() == 0);
             expect("второй запуск сообщает о восстановлении контекста",
                     run2.stderr().contains("Контекст восстановлен: 1 завершённых обменов."));
             expect("второй запуск получил ответ", run2.stdout().contains("Ответ 2"));
@@ -5394,15 +5409,542 @@ public final class SelfTest {
         return root.toString();
     }
 
-    /** Пользовательский вывод не содержит упоминаний дней заданий и учёбы. */
+    // ================= Модель памяти: три слоя =================
+
+    /** Правила разбиения «ключ: значение» для /remember (Проблема 1). */
+    private static void checkRememberKeyFormats() {
+        LlmAgent.MemoryKey explicit = LlmAgent.deriveMemoryKey("проект: ЯКОРЬ-42, дедлайн 20.05");
+        expect("/remember с «:» даёт короткий ключ и полное значение",
+                explicit.key().equals("проект")
+                        && explicit.value().equals("ЯКОРЬ-42, дедлайн 20.05"));
+
+        LlmAgent.MemoryKey equalsForm = LlmAgent.deriveMemoryKey("запрет= без Spring");
+        expect("/remember с «=» тоже разбирается на ключ и значение",
+                equalsForm.key().equals("запрет") && equalsForm.value().equals("без Spring"));
+
+        // Реальный случай прогона: ключом раньше становился весь текст,
+        // и /forget Проект не находил запись.
+        LlmAgent.MemoryKey comma = LlmAgent.deriveMemoryKey(
+                "Проект \"Север-17\", Java: 21, бюджет 620 рублей, срок 20 ноября");
+        expect("/remember без явного «ключ:» выделяет ключ по запятой",
+                comma.key().equals("Проект \"Север-17\"")
+                        && comma.value().equals("Java: 21, бюджет 620 рублей, срок 20 ноября"));
+
+        LlmAgent.MemoryKey plain = LlmAgent.deriveMemoryKey("кодовое слово ЯКОРЬ");
+        expect("без разделителя и запятой ключ — первое слово записи",
+                plain.key().equals("кодовое")
+                        && plain.value().equals("слово ЯКОРЬ"));
+
+        LlmAgent.MemoryKey words = LlmAgent.deriveMemoryKey(
+                "экспериментальная настройка повышает информативность ответов модели");
+        expect("длинный текст без разделителя: ключ — первое слово, значение — остаток",
+                words.key().equals("экспериментальная")
+                        && words.value().equals(
+                        "настройка повышает информативность ответов модели"));
+    }
+
+    /** /forget по короткому и частичному ключу; неоднозначные запросы — список. */
+    private static void checkForgetPartialMatches() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) ->
+                new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                        + "\"content\":\"Ок\"}}]}").getBytes(StandardCharsets.UTF_8)));
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort()
+                            + "/v1/chat/completions", "glm-5.3-flash");
+            LlmAgent agent = newMemoryAgent(config, trustedHttpClient(keyStore),
+                    new java.util.HashMap<>());
+            agent.remember("Проект: \"Север-17\"");
+            agent.remember("Производительность: 95 кв. м");
+            agent.remember("Запреты: цитрусовые в тизерах");
+
+            // Короткий ключ находит и удаляет запись (сценарий прогона).
+            LlmAgent.ForgetResult shortKey = agent.forget("Проект");
+            expect("/forget по короткому ключу находит запись",
+                    shortKey.removed() && !agent.memoryView().containsKey("Проект"));
+
+            // Различие регистра/пробелов не мешает точному совпадению.
+            agent.remember("Бюджет: 620 рублей");
+            LlmAgent.ForgetResult caseKey = agent.forget(" бюджет ");
+            expect("/forget работает без учёта регистра и лишних пробелов",
+                    caseKey.removed() && !agent.memoryView().containsKey("Бюджет"));
+
+            // Несколько совпадений: список ключей, удаление не угадыванием.
+            agent.remember("срок: 20 ноября");
+            agent.remember("срок сдачи: 25 ноября");
+            // Запрос «сро» — не точный ключ, но подстрока обоих записей.
+            LlmAgent.ForgetResult ambiguous = agent.forget("сро");
+            expect("неоднозначный /forget перечисляет ключи и просит уточнить",
+                    !ambiguous.removed() && ambiguous.matches() == 2
+                            && ambiguous.message().contains("уточните"));
+            expect("при неоднозначности ни одна запись не удалена",
+                    agent.memoryView().containsKey("срок")
+                            && agent.memoryView().containsKey("срок сдачи"));
+
+            // Частичное совпадение с единственным кандидатом удаляется:
+            // точный ключ «срок сдачи» удалён выше, остаётся одна запись «срок».
+            LlmAgent.ForgetResult exactSecond = agent.forget("срок сдачи");
+            expect("точный ключ второй записи удаляется",
+                    exactSecond.removed());
+            LlmAgent.ForgetResult partial = agent.forget("сро");
+            expect("частичное совпадение с единственной записью удаляется",
+                    partial.removed()
+                            && !agent.memoryView().containsKey("срок")
+                            && partial.message().contains("частичному"));
+
+            LlmAgent.ForgetResult missing = agent.forget("несуществующе");
+            expect("отсутствующий ключ даёт честное «нет записи»",
+                    !missing.removed() && missing.message().contains("нет"));
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Старые записи без явного ключа читаются и показываются как есть. */
+    private static void checkLegacyRememberEntries() throws IOException {
+        Path file = Files.createTempDirectory(baseTempDir, "mem-")
+                .resolve("memory.json");
+        String legacyJson = "{\"schemaVersion\":1,\"entries\":{"
+                + "\"Запрещены Spring и базы данных, хранение в JSON\":{"
+                + "\"value\":\"Запрещены Spring и базы данных, хранение в JSON\","
+                + "\"createdAt\":\"2026-01-01T00:00:00Z\","
+                + "\"updatedAt\":\"2026-01-01T00:00:00Z\"}}}";
+        Files.write(file, legacyJson.getBytes(StandardCharsets.UTF_8));
+        MemoryStore memory = new MemoryStore(file);
+        LinkedHashMap<String, MemoryEntry> entries = memory.load();
+        expect("старая запись без явного ключа читается без потерь",
+                entries.get("Запрещены Spring и базы данных, хранение в JSON") != null
+                        && entries.get("Запрещены Spring и базы данных, хранение в JSON")
+                        .value().contains("хранение в JSON"));
+        expect("старая запись отображается как есть, без дублирования «ключ: значение»",
+                entries.values().iterator().next().renderLine()
+                        .equals("Запрещены Spring и базы данных, хранение в JSON"));
+
+        // Явная запись рядом со старой: формат «ключ: значение» в отображении.
+        memory.put("код", "ЯКОРЬ-42");
+        var merged = memory.load();
+        expect("обе формы работают: старая как есть, новая с ключом",
+                merged.get("код").renderLine().equals("код: ЯКОРЬ-42")
+                        && merged.get("Запрещены Spring и базы данных, хранение в JSON")
+                        .legacyWithoutKey());
+    }
+
+    /** Правила памяти в системной инструкции (Проблема 2). */
+    private static void checkSystemInstructionRules() {
+        String prompt = ContextBuilder.BASE_SYSTEM_PROMPT;
+        expect("инструкция: долговременная память — независимые записи",
+                prompt.contains("независимых записей"));
+        expect("инструкция: не объединять записи в один перечень",
+                prompt.contains("не объединяй"));
+        expect("инструкция: запрет выводов сверх текста записи",
+                prompt.contains("не делай выводов, которых нет"));
+        expect("инструкция: двусмысленная запись — переспросить/пометить",
+                prompt.contains("переспроси") && prompt.contains("неоднозначную"));
+        expect("инструкция: правило честности по обновлению рабочей памяти",
+                prompt.contains("не заявляй")
+                        && prompt.contains("/facts refresh"));
+    }
+
+    /**
+     * Счётчик «рабочая N пар» брёл из фактического блока (Проблема 3):
+     * заявление модели «добавлено в рабочую память» вне стратегии facts
+     * не меняет факты, и подпись показывает фактическое число.
+     */
+    private static void checkWorkingCounterMatchesFacts() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        AtomicInteger factsCalls = new AtomicInteger();
+        AtomicReference<String> lastBody = new AtomicReference<>();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            lastBody.set(requestBody);
+            if (requestBody.contains(FACTS_MARKER)) {
+                int call = factsCalls.incrementAndGet();
+                return new Response(200, ("{\"choices\":[{\"finish_reason\":\"stop\","
+                        + "\"message\":{\"role\":\"assistant\",\"content\":\""
+                        + (call == 1 ? "цель: МАЯК" : "цель: финальное ТЗ")
+                        + "\"}}],\"usage\":{\"prompt_tokens\":10,"
+                        + "\"completion_tokens\":2}}").getBytes(StandardCharsets.UTF_8));
+            }
+            // Модель заявляет добавление в рабочую память — подпись должна
+            // показать фактическое состояние блока фактов.
+            return new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                    + "\"content\":\"Ок (Добавлено в рабочую память: цель МАЯК)\"}}],"
+                    + "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20}}")
+                    .getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort()
+                            + "/v1/chat/completions", "glm-5.3-flash");
+            HttpClient client = trustedHttpClient(keyStore);
+
+            // В стратегии facts: автообновление делает факты реальными.
+            JsonConversationStore factsStore = tempStore();
+            LlmAgent factsAgent = new LlmAgent(config, ModelSettings.from(factsEnv()),
+                    client, factsStore);
+            factsAgent.ask("первое сообщение");
+            expect("в стратегии facts счётчик подписи равен числу пар фактов",
+                    Main.formatShortAnswerNote(factsAgent).contains("рабочая 1 пара")
+                            && factsAgent.factsView().size() == 1);
+            FakeUi factsCheck = new FakeUi(
+                    TerminalUi.Input.command("/facts"), TerminalUi.Input.command("/exit"));
+            Main.runLoop(factsCheck, factsAgent, "glm-5.3-flash");
+            expect("подпись совпадает с /facts после автообновления",
+                    factsAgent.factsView().get("цель").contains("МАЯК"));
+
+            // В стратегии sliding-window: факты не обновляются служебным
+            // запросом — «заявление» модели против фактического 0 пар.
+            JsonConversationStore windowStore = tempStore();
+            LlmAgent windowAgent = new LlmAgent(config, ModelSettings.defaults(),
+                    client, windowStore);
+            windowAgent.ask("сообщение в скользящем окне");
+            expect("в sliding-window факты не обновляются и счётчик показывает 0",
+                    factsCalls.get() == 1
+                            && windowAgent.factsView().isEmpty()
+                            && Main.formatShortAnswerNote(windowAgent)
+                            .contains("рабочая 0 пар"));
+            expect("системная инструкция содержит правило честности по рабочей памяти",
+                    lastBody.get() != null
+                            && lastBody.get().contains("не заявляй"));
+            windowStore.close();
+            factsStore.close();
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+
+
+    /** Агент со временными файлами истории и долговременной памяти. */
+    private static LlmAgent newMemoryAgent(Config config, HttpClient client,
+                                           Map<String, String> env) throws IOException {
+        JsonConversationStore store = tempStore();
+        MemoryStore memory = new MemoryStore(
+                Files.createTempDirectory(baseTempDir, "mem-").resolve("memory.json"));
+        return new LlmAgent(config, ModelSettings.from(env), client, store, memory);
+    }
+
+    /** Три слоя хранятся отдельно: отдельный файл, формат, валидация при чтении. */
+    private static void checkMemoryLayerSeparation() throws IOException {        Path memoryFile = Files.createTempDirectory(baseTempDir, "mem-")
+                .resolve("memory.json");
+        MemoryStore memory = new MemoryStore(memoryFile);
+
+        // Отсутствующий файл — пустая память, файл заранее не создаётся.
+        expect("отсутствующий файл памяти даёт пустую память", memory.load().isEmpty());
+        expect("при отсутствии файла памяти JSON не создаётся заранее",
+                !Files.exists(memoryFile));
+
+        MemoryEntry entry = memory.put("кодовое слово", "ЯКОРЬ-42").get("кодовое слово");
+        expect("запись памяти хранит значение и метки времени",
+                "ЯКОРЬ-42".equals(entry.value())
+                        && !entry.createdAt().isBlank() && !entry.updatedAt().isBlank());
+        expect("файл памяти отдельный от истории (memory.json)",
+                memoryFile.getFileName().toString().equals("memory.json"));
+
+        // Повторная запись того же ключа — обновление значения, createdAt сохранён.
+        String createdAt = entry.createdAt();
+        memory.put("кодовое слово", "ЯКОРЬ-43");
+        var reopened = memory.load();
+        expect("повторная запись обновляет значение, createdAt сохраняется",
+                reopened.get("кодовое слово").value().equals("ЯКОРЬ-43")
+                        && reopened.get("кодовое слово").createdAt().equals(createdAt));
+
+        // Содержимое JSON: отдельная сущность «entries», а не поле истории.
+        JsonNode saved = MAPPER.readTree(
+                Files.readString(memoryFile, StandardCharsets.UTF_8));
+        expect("файл памяти имеет собственный формат (schemaVersion 1 и entries)",
+                saved.path("schemaVersion").asInt(-1)
+                        == MemoryStore.SUPPORTED_SCHEMA_VERSION
+                        && saved.path("entries").path("кодовое слово")
+                        .path("value").asText().equals("ЯКОРЬ-43"));
+
+        // Удаление записи.
+        expect("remove удаляет существующую запись", memory.remove("кодовое слово"));
+        expect("remove не удаляет несуществующую запись", !memory.remove("нет"));
+
+        // Повреждённый файл — ошибка повреждения, файл не переписывается.
+        byte[] garbage = "это вообще не { json".getBytes(StandardCharsets.UTF_8);
+        Files.write(memoryFile, garbage);
+        try (var ignored = new java.io.ByteArrayOutputStream()) {
+            boolean reported;
+            try {
+                memory.load();
+                reported = false;
+            } catch (ConversationStoreException e) {
+                reported = e.getMessage().contains(memoryFile.toString());
+            }
+            expect("повреждённый файл памяти даёт ошибку с путём", reported);
+            expect("повреждённый файл памяти не перезаписывается",
+                    Arrays.equals(Files.readAllBytes(memoryFile), garbage));
+        }
+    }
+
+    /** /remember добавляет, /memory показывает, /forget удаляет; команды без API. */
+    private static void checkRememberForgetMemoryCommands() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        AtomicInteger hitCounter = new AtomicInteger();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            hitCounter.incrementAndGet();
+            return new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                    + "\"content\":\"Ок\"}}]}").getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort()
+                            + "/v1/chat/completions", "glm-5.3-flash");
+            LlmAgent agent = newMemoryAgent(config, trustedHttpClient(keyStore),
+                    new java.util.HashMap<>());
+            int hitsBefore = hitCounter.get();
+
+            FakeUi ui = new FakeUi(
+                    TerminalUi.Input.command("/remember проект: ЯКОРЬ-42, дедлайн 20.05"),
+                    TerminalUi.Input.command("/remember без ключа вообще"),
+                    TerminalUi.Input.command("/memory"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(ui, agent, "glm-5.3-flash");
+            expect("команды памяти не вызывают API", hitCounter.get() == hitsBefore);
+
+            expect("/remember «ключ: значение» сохраняет пару в долговременную память",
+                    agent.memoryView().get("проект") != null
+                            && agent.memoryView().get("проект").value()
+                            .equals("ЯКОРЬ-42, дедлайн 20.05"));
+            expect("/remember текста без разделителя: ключ — первое слово",
+                    agent.memoryView().get("без") != null
+                            && agent.memoryView().get("без").value()
+                            .equals("ключа вообще"));
+            expect("/memory показывает записи в виде «ключ: значение»",
+                    ui.systems.stream().anyMatch(t -> t.contains("Долговременная память")
+                            && t.contains("проект: ЯКОРЬ-42, дедлайн 20.05")));
+
+            // Второй прогон того же агента: удаление и повторная попытка.
+            FakeUi forgetUi = new FakeUi(
+                    TerminalUi.Input.command("/forget проект"),
+                    TerminalUi.Input.command("/memory"),
+                    TerminalUi.Input.command("/forget проект"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(forgetUi, agent, "glm-5.3-flash");
+            expect("/forget удаляет запись долговременной памяти",
+                    agent.memoryView().get("проект") == null);
+            expect("повторный /forget сообщает об отсутствии записи",
+                    forgetUi.systems.stream().anyMatch(t ->
+                            t.contains("нет в долговременной памяти")));
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Долговременная память переживает перезапуск: запись → новый экземпляр → чтение. */
+    private static void checkMemoryPersistsAcrossRestarts() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) ->
+                new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                        + "\"content\":\"Ок\"}}]}").getBytes(StandardCharsets.UTF_8)));
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort()
+                            + "/v1/chat/completions", "glm-5.3-flash");
+            HttpClient client = trustedHttpClient(keyStore);
+            JsonConversationStore history1 = tempStore();
+            MemoryStore memory = new MemoryStore(
+                    Files.createTempDirectory(baseTempDir, "mem-").resolve("memory.json"));
+            LlmAgent first = new LlmAgent(config, ModelSettings.defaults(),
+                    client, history1, memory);
+            first.remember("профиль: отвечает кратко, формат таблицы");
+            expect("первый экземпляр сохранил запись",
+                    first.memoryView().get("профиль") != null);
+
+            // Новый «запуск»: новый агент и новое хранилище истории,
+            // тот же файл долговременной памяти.
+            JsonConversationStore history2 = tempStore();
+            LlmAgent second = new LlmAgent(config, ModelSettings.defaults(),
+                    client, history2, memory);
+            expect("новый экземпляр агента видит долговременную память",
+                    second.memoryView().get("профиль") != null
+                            && second.memoryView().get("профиль").value()
+                            .contains("отвечает кратко"));
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+
+    /** /clear очищает краткосрочную и рабочую память, но НЕ долговременную. */
+    private static void checkClearKeepsLongTermMemory() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) ->
+                new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                        + "\"content\":\"Ок\"}}],\"usage\":{\"prompt_tokens\":10,"
+                        + "\"completion_tokens\":20}}").getBytes(StandardCharsets.UTF_8)));
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort()
+                            + "/v1/chat/completions", "glm-5.3-flash");
+            LlmAgent agent = newMemoryAgent(config, trustedHttpClient(keyStore),
+                    new java.util.HashMap<>());
+            agent.ask("вопрос перед очисткой");
+            agent.remember("кодовое слово: ЯКОРЬ-42");
+            agent.setTask("подготовить отчёт");
+
+            FakeUi ui = new FakeUi(
+                    TerminalUi.Input.command("/clear"),
+                    TerminalUi.Input.command("/exit"));
+            ui.confirmClearAnswer = true;
+            Main.runLoop(ui, agent, "glm-5.3-flash");
+
+            expect("/clear очищает краткосрочную память (историю)",
+                    agent.getHistory().isEmpty());
+            expect("/clear очищает рабочую память (задачу и факты)",
+                    agent.currentTask() == null && agent.factsView().isEmpty());
+            expect("/clear НЕ стирает долговременную память",
+                    agent.memoryView().get("кодовое слово") != null);
+            expect("сообщение /clear сообщает о сохранении долговременной памяти",
+                    ui.systems.stream().anyMatch(t ->
+                            t.contains("Долговременная память сохранена")));
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** /task задаёт и показывает задачу, /task clear очищает рабочую память задачи. */
+    private static void checkTaskCommands() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) ->
+                new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                        + "\"content\":\"Ок\"}}]}").getBytes(StandardCharsets.UTF_8)));
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort()
+                            + "/v1/chat/completions", "glm-5.3-flash");
+            LlmAgent agent = newMemoryAgent(config, trustedHttpClient(keyStore),
+                    new java.util.HashMap<>());
+
+            FakeUi ui = new FakeUi(
+                    TerminalUi.Input.command("/task"),
+                    TerminalUi.Input.command("/task подготовить отчёт к среде"),
+                    TerminalUi.Input.command("/task"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(ui, agent, "glm-5.3-flash");
+            expect("/task без аргумента сообщает об отсутствии задачи",
+                    ui.systems.stream().anyMatch(t -> t.contains("Текущая задача не задана")));
+            expect("/task устанавливает задачу рабочей памяти",
+                    agent.currentTask() != null
+                            && agent.currentTask().contains("отчёт к среде"));
+            expect("установленная задача отображается", agent.currentTask() != null);
+            expect("установленная задача видна в выводе /task",
+                    ui.systems.stream().anyMatch(t -> t.contains("Текущая задача: подготовить отчёт к среде")));
+            expect("подтверждение установки показано",
+                    ui.systems.stream().anyMatch(t -> t.contains("Текущая задача установлена")));
+
+            FakeUi clearUi = new FakeUi(
+                    TerminalUi.Input.command("/task clear"),
+                    TerminalUi.Input.command("/task"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(clearUi, agent, "glm-5.3-flash");
+            expect("/task clear очищает задачу, не трогая факты",
+                    agent.currentTask() == null
+                            && clearUi.systems.stream().anyMatch(t ->
+                            t.contains("Текущая задача очищена")));
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** В запрос подставляются все три слоя с корректными заголовками. */
+    private static void checkThreeLayersInRequest() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        AtomicReference<String> lastBody = new AtomicReference<>();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            lastBody.set(requestBody);
+            return new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                    + "\"content\":\"Ок\"}}]}").getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort()
+                            + "/v1/chat/completions", "glm-5.3-flash");
+            LlmAgent agent = newMemoryAgent(config, trustedHttpClient(keyStore),
+                    new java.util.HashMap<>());
+            agent.remember("кодовое слово: ЯКОРЬ-42");
+            agent.setTask("написать краткое резюме проекта");
+            agent.ask("первый вопрос");
+            agent.ask("второй вопрос");
+
+            JsonNode messages = MAPPER.readTree(lastBody.get()).path("messages");
+            String system = messages.get(0).path("content").asText();
+            expect("в запросе подставлены все три слоя: долговременная память",
+                    system.contains("<<<ДОЛГОВРЕМЕННАЯ ПАМЯТЬ")
+                            && system.contains("кодовое слово: ЯКОРЬ-42"));
+            expect("в запросе подставлена рабочая память с задачей",
+                    system.contains("<<<РАБОЧАЯ ПАМЯТЬ")
+                            && system.contains("Текущая задача: написать краткое резюме проекта"));
+            expect("краткосрочная история отправляется после system, без дубликатов system",
+                    messages.size() == 4
+                            && "system".equals(messages.get(0).path("role").asText())
+                            && "первый вопрос".equals(messages.get(1).path("content").asText())
+                            && "второй вопрос".equals(
+                            messages.get(messages.size() - 1).path("content").asText()));
+            expect("правило непересечения слоёв в базовой инструкции",
+                    system.contains("Слои памяти не дублируй"));
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Служебный расход обновления памяти учтён ровно один раз и входит в лимит сессии. */
+    private static void checkMemoryUpdateAccountingOnce() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            if (requestBody.contains(FACTS_MARKER)) {
+                return new Response(200, ("{\"choices\":[{\"finish_reason\":\"stop\","
+                        + "\"message\":{\"role\":\"assistant\",\"content\":\"цель: МАЯК, "
+                        + "дедлайн 20.05\"}}],\"usage\":{\"prompt_tokens\":70,"
+                        + "\"completion_tokens\":9}}").getBytes(StandardCharsets.UTF_8));
+            }
+            return new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                    + "\"content\":\"Ок\"}}],\"usage\":{\"prompt_tokens\":10,"
+                    + "\"completion_tokens\":20}}").getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort()
+                            + "/v1/chat/completions", "glm-5.3-flash");
+            JsonConversationStore store = tempStore();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.from(factsEnv()),
+                    trustedHttpClient(keyStore), store);
+            agent.ask("обновление памяти один");
+            agent.ask("обновление памяти два");
+            SessionTokenStats.Snapshot stats = agent.sessionStats();
+
+            long memoryPurposes = agent.attemptUsageLog().stream()
+                    .filter(u -> u.purpose() == SessionTokenStats.Purpose.MEMORY_UPDATE)
+                    .count();
+            expect("служебные запросы обновления памяти учтены назначением MEMORY_UPDATE",
+                    memoryPurposes == 2 && stats.factsAttempts() == 2);
+            expect("расход обновления памяти входит в итог сессии ровно один раз (без дублей)",
+                    stats.totalPromptTokens() == 20 + 140
+                            && stats.totalCompletionTokens() == 40 + 18
+                            && stats.regularAttempts() == 2
+                            && stats.knownTotal() == 218);
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
     private static void checkUserFacingOutputNeutral() throws Exception {
         Path keyStore = day9KeyStore();
         Day9Server s = startDay9Server(keyStore);
         try {
             Config config = new Config("test-key", day9Url(s), "glm-5.3-flash");
-            JsonConversationStore store = tempStore();
-            LlmAgent agent = new LlmAgent(config, ModelSettings.defaults(),
-                    trustedHttpClient(keyStore), store);
+            LlmAgent agent = newMemoryAgent(config, trustedHttpClient(keyStore),
+                    new java.util.HashMap<>());
 
             FakeUi ui = new FakeUi(
                     TerminalUi.Input.message("обычное сообщение"),
@@ -5417,6 +5959,9 @@ public final class SelfTest {
                     TerminalUi.Input.command("/strategy"),
                     TerminalUi.Input.command("/facts"),
                     TerminalUi.Input.command("/branch list"),
+                    TerminalUi.Input.command("/memory"),
+                    TerminalUi.Input.command("/task текущая работа"),
+                    TerminalUi.Input.command("/task clear"),
                     TerminalUi.Input.command("/exit"));
             Main.runLoop(ui, agent, "glm-5.3-flash");
             String text = String.join("\n", ui.systems) + "\n"
@@ -5431,10 +5976,131 @@ public final class SelfTest {
             expect("подписи стратегии нейтральные",
                     text.contains("Скользящее окно")
                             && text.contains("Факты"));
-
-            store.close();
+            // Сводка слоёв памяти сохраняется в подробном блоке после ответа
+            // (formatShortAnswerNote) и по командам; по умолчанию вывод тихий,
+            // поэтому здесь проверяется сама строка, а не экран.
+            expect("подпись слоёв памяти присутствует в подробном блоке",
+                    Main.formatShortAnswerNote(agent).contains("Память: долговременная"));
         } finally {
             s.server().stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Значения по умолчанию для запуска одной командой (Проблема 1). */
+    private static void checkDefaultRunSettings() {
+        Map<String, String> empty = Map.of();
+        expect("LLM_DIAGNOSTICS по умолчанию false (краткий вывод)",
+                !ModelSettings.from(empty).diagnostics());
+
+        Path first = JsonConversationStore.defaultHistoryFile(empty);
+        Path second = JsonConversationStore.defaultHistoryFile(empty);
+        expect("история по умолчанию: каталог ~/.ai-advent-agent, имя chat-*.json",
+                first.getParent().getFileName().toString().equals(".ai-advent-agent")
+                        && first.getFileName().toString().startsWith("chat-")
+                        && first.getFileName().toString().endsWith(".json"));
+        expect("уникальное имя файла истории на каждый запуск",
+                !first.equals(second));
+
+        Map<String, String> explicit = new java.util.HashMap<>();
+        explicit.put("LLM_HISTORY_FILE", "/tmp/selftest-history-fix.json");
+        expect("LLM_HISTORY_FILE переопределяет путь истории",
+                JsonConversationStore.defaultHistoryFile(explicit)
+                        .equals(Path.of("/tmp/selftest-history-fix.json")));
+
+        expect("память по умолчанию: ~/.ai-advent-agent/memory.json (общая)",
+                MemoryStore.defaultMemoryFile(empty)
+                        .getFileName().toString().equals("memory.json")
+                        && MemoryStore.defaultMemoryFile(empty).getParent()
+                        .getFileName().toString().equals(".ai-advent-agent"));
+        Map<String, String> explicitMemory = new java.util.HashMap<>();
+        explicitMemory.put("LLM_MEMORY_FILE", "/tmp/selftest-memory-fix.json");
+        expect("LLM_MEMORY_FILE переопределяет путь памяти",
+                MemoryStore.defaultMemoryFile(explicitMemory)
+                        .equals(Path.of("/tmp/selftest-memory-fix.json")));
+    }
+
+    /**
+     * Тихий старт и минимальный вывод по умолчанию (Проблема 2):
+     * только ответ плюс статусная строка старта; подробности — по командам.
+     */
+    private static void checkQuietStartupAndAnswer() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        AtomicInteger success = new AtomicInteger();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) ->
+                new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                        + "\"content\":\"Ответ " + success.incrementAndGet() + "\"}}],"
+                        + "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20}}")
+                        .getBytes(StandardCharsets.UTF_8)));
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort()
+                            + "/v1/chat/completions", "glm-5.3-flash");
+            LlmAgent agent = newMemoryAgent(config, trustedHttpClient(keyStore),
+                    new java.util.HashMap<>());
+            FakeUi ui = new FakeUi(
+                    TerminalUi.Input.message("короткое сообщение"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(ui, agent, "glm-5.3-flash");
+            // Ответ показан; в системных строках нет ни диагностики,
+            // ни расходов, ни подписи контекста/стратегии/слоёв памяти.
+            expect("по умолчанию после ответа только ответ",
+                    ui.messages.size() == 1 && ui.messages.get(0).contains("Ответ 1"));
+            String systems = String.join("\n", ui.systems);
+            for (String banned : new String[]{
+                    "Диагностика:", "Расход сессии", "Контекст:", "Режим контекста",
+                    "Стратегия:", "Память: долговременная", "профир", "Профиль:"}) {
+                expect("по умолчанию в выводе нет «" + banned + "»",
+                        !systems.contains(banned));
+            }
+            expect("старт по умолчанию короткий: статусная строка есть, подробностей нет",
+                    systems.contains("Начата новая беседа.")
+                            && !systems.contains("Стратегия контекста")
+                            && !systems.contains("Профиль")
+                            && !systems.contains("Лимит расхода токенов"));
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Явные команды по-прежнему показывают подробности (Проблема 2, п.4). */
+    private static void checkExplicitCommandsStillDetailed() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) ->
+                new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                        + "\"content\":\"Ок\"}}]}").getBytes(StandardCharsets.UTF_8)));
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort()
+                            + "/v1/chat/completions", "glm-5.3-flash");
+            LlmAgent agent = newMemoryAgent(config, trustedHttpClient(keyStore),
+                    new java.util.HashMap<>());
+            agent.remember("код: ЯКОРЬ-42");
+            FakeUi ui = new FakeUi(
+                    TerminalUi.Input.command("/stats"),
+                    TerminalUi.Input.command("/tokens"),
+                    TerminalUi.Input.command("/strategy"),
+                    TerminalUi.Input.command("/context"),
+                    TerminalUi.Input.command("/memory"),
+                    TerminalUi.Input.command("/limit"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(ui, agent, "glm-5.3-flash");
+            String systems = String.join("\n", ui.systems);
+            expect("/stats показывает подробности по явному запросу",
+                    systems.contains("Статистика сессии"));
+            expect("/tokens показывает оценку контекста",
+                    systems.contains("Токены (без вызова API)"));
+            expect("/strategy показывает стратегию и окно",
+                    systems.contains("Стратегия контекста"));
+            expect("/context показывает режим контекста",
+                    systems.contains("Режим контекста"));
+            expect("/memory показывает долговременную память по явному запросу",
+                    systems.contains("Долговременная память"));
+            expect("/limit показывает лимит сессии",
+                    systems.contains("Лимит расхода токенов за сессию"));
+        } finally {
+            server.stop(0);
             Files.deleteIfExists(keyStore);
         }
     }
@@ -5458,9 +6124,18 @@ public final class SelfTest {
             Main.runLoop(quietUi, quietAgent, "glm-5.3-flash");
             expect("подробная диагностика скрыта по умолчанию",
                     quietUi.systems.stream().noneMatch(t -> t.contains("Диагностика:")));
-            expect("краткая сводка присутствует",
-                    quietUi.systems.stream().anyMatch(
-                            t -> t.contains("Расход сессии")));
+            // По умолчанию после ответа — только ответ: ни «Расход сессии»,
+            // ни «Контекст:», ни «Стратегия:", ни «Режим контекста».
+            String quietText = String.join("\n", quietUi.systems);
+            expect("по умолчанию нет кратких служебных блоков после ответа",
+                    !quietText.contains("Диагностика:")
+                            && !quietText.contains("Расход сессии")
+                            && !quietText.contains("Контекст:")
+                            && !quietText.contains("Стратегия:")
+                            && !quietText.contains("Режим контекста"));
+            expect("по умолчанию после ответа показан сам ответ",
+                    quietUi.messages.size() == 1
+                            && quietUi.messages.get(0).contains("Ответ"));
             quietStore.close();
 
             Map<String, String> env = new java.util.HashMap<>();
@@ -5474,6 +6149,15 @@ public final class SelfTest {
             Main.runLoop(diagUi, diagAgent, "glm-5.3-flash");
             expect("при LLM_DIAGNOSTICS=true подробная диагностика видна",
                     diagUi.systems.stream().anyMatch(t -> t.contains("Диагностика:")));
+            String diagText = String.join("\n", diagUi.systems);
+            expect("при LLM_DIAGNOSTICS=true сохраняется весь блок отчёта",
+                    diagText.contains("Расход сессии")
+                            && diagText.contains("Контекст:")
+                            && diagText.contains("Стратегия:")
+                            && diagText.contains("Память: долговременная")
+                            && diagText.contains("Профиль:")
+                            && diagText.contains("Стратегия контекста")
+                            && diagText.contains("Режим контекста"));
             diagStore.close();
         } finally {
             s.server().stop(0);

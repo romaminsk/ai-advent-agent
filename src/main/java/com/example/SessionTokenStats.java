@@ -34,8 +34,13 @@ public final class SessionTokenStats {
         COMPARE_SUMMARY,
         /** Ручное сравнение сжатия: подготовка резюме внутри сравнения. */
         COMPARE_SUMMARY_PREP,
-        /** Обновление блока фактов (стратегия facts). */
-        FACTS_UPDATE,
+        /**
+         * Обновление памяти ассистента: служебный запрос обновления рабочей
+         * памяти (факты и задача) после ответа (auto) или /facts refresh.
+         * Учитывается отдельным назначением и входит в лимит сессии ровно
+         * один раз.
+         */
+        MEMORY_UPDATE,
         /** Сравнение стратегий: вариант sliding-window. */
         COMPARE_SLIDING,
         /** Сравнение стратегий: вариант facts. */
@@ -117,7 +122,7 @@ public final class SessionTokenStats {
         switch (purpose) {
             case REGULAR -> regularAttempts++;
             case SUMMARY -> summaryAttempts++;
-            case FACTS_UPDATE -> factsAttempts++;
+            case MEMORY_UPDATE -> factsAttempts++;
             case COMPARE_FULL, COMPARE_SUMMARY, COMPARE_SUMMARY_PREP, COMPARE_SLIDING,
                     COMPARE_FACTS, COMPARE_BRANCHING, COMPARE_FACTS_PREP -> compareAttempts++;
         }
@@ -178,7 +183,7 @@ public final class SessionTokenStats {
                     compareCompletionTokens += completionTokens;
                 }
             }
-            case FACTS_UPDATE -> {
+            case MEMORY_UPDATE -> {
                 if (promptTokens != null) {
                     factsPromptTokens += promptTokens;
                 }
