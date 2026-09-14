@@ -7,6 +7,8 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -268,9 +270,26 @@ public final class LlmAgent {
                 .build(), store);
     }
 
-    /** Пакетно-приватный конструктор для локальных тестов с собственным HttpClient. */
-    LlmAgent(Config config, ModelSettings settings, HttpClient httpClient, ConversationStore store) {
-        this(config, settings, httpClient, store, MemoryStore.openDefault());
+    /**
+     * Пакетный конструктор для локальных тестов с собственным HttpClient.
+     * Используется только тестами, поэтому долговременная память —
+     * изолированный временный файл: реальный ~/.ai-advent-agent/memory.json
+     * (общий, с живыми записями пользователя) не влияет на ожидания тестов.
+     * Изолированный MemoryStore можно подставить и явно — перегрузкой ниже.
+     */
+    LlmAgent(Config config, ModelSettings settings, HttpClient httpClient,
+             ConversationStore store) {
+        this(config, settings, httpClient, store, tempMemoryStore());
+    }
+
+    /** Временная память для тестов: никогда не читает и не пишет реальный файл. */
+    private static MemoryStore tempMemoryStore() {
+        try {
+            Path tempDir = Files.createTempDirectory("agent-test-memory-");
+            return new MemoryStore(tempDir.resolve("memory.json"));
+        } catch (IOException e) {
+            throw new IllegalStateException("Не удалось создать временную память для теста", e);
+        }
     }
 
     /** Пакетно-приватный конструктор для локальных тестов с подставным MemoryStore. */

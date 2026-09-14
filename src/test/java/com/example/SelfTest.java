@@ -209,6 +209,12 @@ public final class SelfTest {
         System.out.println("OK: все проверки пройдены (" + passed + ").");
     }
 
+    /** Агент с изолированной долговременной памятью: реальный memory.json не мешает. */
+    private static MemoryStore tempMemoryStore() throws IOException {
+        return new MemoryStore(
+                Files.createTempDirectory(baseTempDir, "mem-").resolve("memory.json"));
+    }
+
     /** Хранилище во временном каталоге: тесты никогда не трогают настоящую историю. */
     private static JsonConversationStore tempStore() throws IOException {
         Path dir = Files.createTempDirectory(baseTempDir, "hist-");
@@ -325,7 +331,7 @@ public final class SelfTest {
                 // (как в режиме full Дня 9), поэтому этот общий диалог проверяет
                 // прежние семантики после появления стратегий.
                 LlmAgent agent = new LlmAgent(config, ModelSettings.from(branchingEnv()),
-                        trustedHttpClient(keyStore), store);
+                        trustedHttpClient(keyStore), store, tempMemoryStore());
                 Path historyFile = store.file();
 
                 // --- Первый запрос: system + user ---
@@ -1479,7 +1485,8 @@ public final class SelfTest {
             env.put("LLM_RESPONSE_MODE", "fast");
             env.put("LLM_TEMPERATURE", "0.3");
             JsonConversationStore store = tempStore();
-            LlmAgent agent = new LlmAgent(config, ModelSettings.from(env), client, store);
+            LlmAgent agent = new LlmAgent(config, ModelSettings.from(env), client, store,
+                    tempMemoryStore());
             agent.ask("вопрос для проверки параметров");
             JsonNode body = MAPPER.readTree(lastBody.get());
             expect("в запросе отправляется max_tokens профиля fast (1024)",
@@ -1505,7 +1512,8 @@ public final class SelfTest {
 
             // Базовый профиль balanced: temperature не отправляется.
             JsonConversationStore store2 = tempStore();
-            LlmAgent balancedAgent = new LlmAgent(config, ModelSettings.defaults(), client, store2);
+            LlmAgent balancedAgent = new LlmAgent(config, ModelSettings.defaults(), client,
+                    store2, tempMemoryStore());
             balancedAgent.ask("вопрос для проверки базовых параметров");
             JsonNode balancedBody = MAPPER.readTree(lastBody.get());
             expect("в базовом профиле max_tokens равен 2048",
