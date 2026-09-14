@@ -76,6 +76,7 @@ public final class Main {
             ui.showSystem(describeStrategy(agent));
             ui.showSystem(describeContextMode(agent));
             ui.showSystem(describeSessionLimit(agent.currentSettings()));
+            ui.showSystem(describeMemory(agent));
             setBranchLabel(ui, agent, demoRef);
             if (agent.hasRestoredContext()) {
                 ui.showSystem("Контекст восстановлен: "
@@ -109,6 +110,15 @@ public final class Main {
                             // В режиме измерений команды относятся к её беседе.
                             LlmAgent activeAgent = activeAgent(demoRef, agent);
                             handleContextCommand(ui, activeAgent, input.text(), normalized, demoRef);
+                        } else if (normalized.equals("/memory")
+                                || normalized.equals("/task")
+                                || normalized.startsWith("/task ")
+                                || normalized.equals("/remember")
+                                || normalized.startsWith("/remember ")
+                                || normalized.equals("/forget")
+                                || normalized.startsWith("/forget ")) {
+                            LlmAgent activeAgent = activeAgent(demoRef, agent);
+                            handleMemoryCommand(ui, activeAgent, input.text(), demoRef);
                         } else {
                             // В режиме измерений команды относятся к её беседе.
                             LlmAgent activeAgent = activeAgent(demoRef, agent);
@@ -357,7 +367,130 @@ public final class Main {
         return text.toString();
     }
 
-    /** /branch: list | checkpoint | new | switch | delete. */
+    /**
+     * Команды долговременной и рабочей памяти (без вызова API):
+     * - /remember <текст> — сохранить в долговременную память (отдельный файл);
+     * - /forget <ключ> — удалить запись долговременной памяти;
+     * - /memory — показать долговременную память;
+     * - /task <текст> — задать задачу рабочей памяти;
+     * - /task clear — очистить задачу (факты рабочей памяти не трогает).
+     * Краткосрочная память (история) этими командами не изменяется.
+     */
+    private static void handleMemoryCommand(TerminalUi ui, LlmAgent agent, String raw,
+                                            DemoRef demoRef) {
+        if (demoRef.demo != null) {
+            ui.showSystem("В режиме измерения токенов команды памяти работают "
+                    + "с основной беседой. Завершите режим (/demo stop) и повторите.");
+            return;
+        }
+        if (raw.startsWith("/memory")) {
+            ui.showSystem(formatMemory(agent));
+            return;
+        }
+        if (raw.startsWith("/task")) {
+            String argument = raw.length() > "/task".length()
+                    ? raw.substring("/task".length()).trim() : "";
+            if (argument.isEmpty()) {
+                String task = agent.currentTask();
+                ui.showSystem(task == null
+                        ? "Текущая задача не задана. Задайте: /task <текст> или сформируйте "
+                        + "ее из диалога (/facts refresh обновит факты рабочей памяти)."
+                        : "Текущая задача: " + task);
+                return;
+            }
+            if (argument.equalsIgnoreCase("clear")) {
+                agent.clearTask();
+                ui.showSystem("Текущая задача очищена. Факты рабочей памяти "
+                        + "сохранены (очистка фактов: /facts clear).");
+                return;
+            }
+            try {
+                agent.setTask(argument);
+                ui.showSystem("Текущая задача установлена. Она подставляется в блок "
+                        + "рабочей памяти каждого запроса до /task clear / /clear.");
+            } catch (AgentException e) {
+                ui.showError(e.getMessage());
+            }
+            return;
+        }
+        if (raw.equalsIgnoreCase("/remember") || "/remember".equals(raw.toLowerCase(java.util.Locale.ROOT).trim())) {
+            ui.showSystem("Использование: /remember <текст>. Формат: «ключ: значение» "
+                    + "или «ключ = значение» — часть до первого «:»/«=» (не более трёх "
+                    + "слов) становится ключом. Без разделителя ключом станет первое "
+                    + "слово или фраза до первой запятой, остальное — значение. "
+                    + "Храните короткие однозначные факты: по одному факту на запись, "
+                    + "не перечислением через запятую.");
+            return;
+        }
+        if (raw.startsWith("/forget")) {
+            String argument = raw.length() > "/forget".length()
+                    ? raw.substring("/forget".length()).trim() : "";
+            if (argument.isEmpty()) {
+                ui.showSystem("Использование: /forget <ключ> — удалить запись "
+                        + "долговременной памяти; поддерживается частичное совпадение "
+                        + "(подстрока ключа), при нескольких совпадениях покажем список. "
+                        + "Список ключей: /memory.");
+                return;
+            }
+            try {
+                ui.showSystem(agent.forget(argument).message());
+            } catch (AgentException e) {
+                ui.showError(e.getMessage());
+            }
+            return;
+        }
+        // /remember <текст>
+        String argument = raw.length() > "/remember".length()
+                ? raw.substring("/remember".length()).trim() : "";
+        try {
+            agent.remember(argument);
+            ui.showSystem("Сохранено в долговременную память (переживает /clear, /reset "
+                    + "и перезапуск; файл отдельный от истории). Список записей: /memory.");
+        } catch (AgentException e) {
+            ui.showError(e.getMessage());
+        }
+    }
+
+    /** Текст /memory: записи долговременной памяти с метками времени. */
+    static String formatMemory(LlmAgent agent) {
+        var entries = agent.memoryView();
+        StringBuilder text = new StringBuilder(
+                "Долговременная память (профиль, решения и знания; переживает /clear, "
+                        + "/reset и перезапуск):");
+        if (entries.isEmpty()) {
+            text.append("\n  записей нет. Сохраняйте явно: /remember <текст>.");
+        } else {
+            text.append("\n  записей: ").append(entries.size());
+            for (var entry : entries.entrySet()) {
+                // «ключ: значение» — пользователь видит, по какому ключу
+                // удалять (/forget). Записи без явного ключа (старый формат)
+                // показываются как есть, без дублирования текста.
+                text.append("\n  ").append(entry.getValue().renderLine())
+                        .append("\n    (изменено: ").append(entry.getValue().updatedAt())
+                        .append(", добавлено: ").append(entry.getValue().createdAt()).append(")");
+            }
+        }
+        return text.toString();
+    }
+
+    /**
+     * Русская форма числа: «1 запись», «2 записи», «5 записей» и т.п.
+     * формы: одна, несколько (2–4), много (0, 5–20).
+     */
+    static String plural(long count, String one, String few, String many) {
+        long abs = Math.abs(count);
+        long mod10 = abs % 10;
+        long mod100 = abs % 100;
+        if (mod10 == 1 && mod100 != 11) {
+            return one;
+        }
+        if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) {
+            return few;
+        }
+        return many;
+    }
+
+
     private static void handleBranchCommand(TerminalUi ui, LlmAgent agent, String normalized,
                                             DemoRef demoRef) {
         String argument = normalized.length() > "/branch".length()
@@ -725,6 +858,15 @@ public final class Main {
                 + " (LLM_SESSION_TOKEN_LIMIT) — информационное уведомление при превышении.";
     }
 
+    /** Краткое описание слоёв памяти при запуске: где хранится каждый слой. */
+    static String describeMemory(LlmAgent agent) {
+        return "Память: краткосрочная — история беседы · рабочая — задача и факты · "
+                + "долговременная — " + agent.longTermMemoryCount() + " "
+                + plural(agent.longTermMemoryCount(), "запись", "записи", "записей")
+                + " в отдельном файле " + agent.memoryFile()
+                + " (не стирается /clear). Команды: /remember, /forget, /memory, /task.";
+    }
+
     /**
      * Краткие заметки после ответа: предупреждение об урезанном контексте,
      * о возможном обрезании по лимиту, информационное сообщение о превышении
@@ -785,12 +927,23 @@ public final class Main {
         ModelSettings settings = agent.currentSettings();
         RequestDiagnostics d = agent.getLastDiagnostics();
         StringBuilder text = new StringBuilder();
-        Long factsNanos = agent.lastFactsCallNanos();
-        boolean factsSpent = factsNanos != null
-                && agent.currentSettings().contextStrategy() == ContextStrategy.FACTS;
+        // Слои памяти, подставленные в запрос (кратко; подробно — при
+        // LLM_DIAGNOSTICS=true в разрезе(formatDiagnostics)).
+        text.append("Память: долговременная ").append(agent.longTermMemoryCount())
+                .append(" ").append(plural(agent.longTermMemoryCount(),
+                        "запись", "записи", "записей"))
+                .append(" · рабочая ").append(agent.factsView().size())
+                .append(" ").append(plural(agent.factsView().size(),
+                        "пара", "пары", "пар"))
+                .append(" · история ").append(agent.getHistory().size())
+                .append(" ").append(plural(agent.getHistory().size(),
+                        "сообщение", "сообщения", "сообщений"));
+        if (agent.currentTask() != null) {
+            text.append(" · задача задана");
+        }
         if (settings.inputPricePer1M() != null && settings.outputPricePer1M() != null
                 && stats.requestsWithUsage() > 0) {
-            text.append("Стоимость: ≈")
+            text.append("\n  Стоимость: ≈")
                     .append(TokenCost.formatUsd(TokenCost.total(
                             TokenCost.perMillion(settings.inputPricePer1M(),
                                     stats.totalPromptTokens()),
@@ -1039,6 +1192,10 @@ public final class Main {
         text.append("\n  из них обычные ответы: попыток ").append(stats.regularAttempts())
                 .append(" · вход ").append(usageTotals(stats.regularPromptTokens(), stats))
                 .append(" · выход ").append(usageTotals(stats.regularCompletionTokens(), stats));
+        text.append("\n  обновление памяти (факты и задача): попыток ")
+                .append(stats.factsAttempts())
+                .append(" · вход ").append(usageTotals(stats.factsPromptTokens(), stats))
+                .append(" · выход ").append(usageTotals(stats.factsCompletionTokens(), stats));
         text.append("\n  суммаризация: попыток ").append(stats.summaryAttempts())
                 .append(" · вход ").append(usageTotals(stats.summaryPromptTokens(), stats))
                 .append(" · выход ").append(usageTotals(stats.summaryCompletionTokens(), stats));
@@ -1663,7 +1820,8 @@ public final class Main {
                         + "Расход и таблица режима измерений сохранены.");
             } else {
                 ui.showSystem("История текущего диалога удалена (вместе с резюме, "
-                        + "если оно было). Можно начать новую беседу.\n"
+                        + "если оно было; рабочая память — задача и факты — очищена). "
+                        + "Долговременная память сохранена. Можно начать новую беседу.\n"
                         + "Статистика расхода токенов за сессию сохранена.");
             }
         } catch (ConversationStoreException e) {
@@ -1709,7 +1867,7 @@ public final class Main {
         out.println("LLM_SESSION_TOKEN_LIMIT (информационный лимит сессии),");
         out.println("LLM_CONTEXT_MODE (full/summary), LLM_CONTEXT_KEEP_LAST_MESSAGES,");
         out.println("LLM_SUMMARY_BATCH_MESSAGES, LLM_SUMMARY_MAX_OUTPUT_TOKENS,");
-        out.println("LLM_DIAGNOSTICS, LLM_HISTORY_FILE");
+        out.println("LLM_DIAGNOSTICS, LLM_HISTORY_FILE, LLM_MEMORY_FILE");
         out.println("(при запуске через launcher загружаются из локального .env проекта).");
         out.println();
         out.println("История беседы хранится в JSON (~/.ai-advent-agent/conversation.json");

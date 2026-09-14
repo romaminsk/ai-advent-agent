@@ -151,29 +151,7 @@ final class PlainTerminalUi implements TerminalUi {
 
     @Override
     public void showHelp() {
-        err.println("Команды:");
-        err.println("  /help      — справка");
-        err.println("  /history   — история текущего диалога");
-        err.println("  /tokens    — оценка токенов истории, контекста и резервов (без вызова API)");
-        err.println("  /stats     — фактический расход токенов и стоимость за сессию (без вызова API)");
-        err.println("  /limit     — лимит расхода за сессию: /limit показать, /limit <число>, /limit off");
-        err.println("  /reset     — очистить контекст и начать новую беседу");
-        err.println("  /clear     — удалить историю текущего диалога (подтверждение y/yes; статистика сессии сохраняется)");
-        err.println("  /multiline — многострочный ввод (/send — отправить, /cancel — отмена)");
-        err.println("  /paste     — вставка длинного текста одним сообщением (/send, /cancel)");
-        err.println("  /demo      — режим измерения токенов: /demo tokens, /demo stats, /demo stop");
-        err.println("  /mode      — профиль ответа: /mode показать, /mode fast|balanced|detailed");
-        err.println("  /context   — режим контекста: /context показать, /context full|summary,");
-        err.println("             /context compare <вопрос> — сравнение двух запросов (API, с подтверждением)");
-        err.println("  /summary   — резюме сжатия: /summary показать, /summary refresh — обновить (API)");
-        err.println("  /strategy  — стратегии контекста: /strategy показать,");
-        err.println("             /strategy sliding-window|facts|branching — переключить (без API),");
-        err.println("             /strategy compare <вопрос> — сравнение трёх стратегий (API, с подтверждением)");
-        err.println("  /facts     — блок фактов: /facts показать, /facts refresh — обновить (API),");
-        err.println("             /facts clear — очистить (подтверждение)");
-        err.println("  /branch    — ветки диалога: /branch list, /branch checkpoint,");
-        err.println("             /branch new <имя>, /branch switch <имя>, /branch delete <имя> (подтверждение)");
-        err.println("  /exit      — завершение (также exit, quit)");
+        err.print(TerminalUi.chatHelp());
     }
 
     @Override
