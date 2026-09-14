@@ -197,6 +197,9 @@ public final class SelfTest {
             checkThreeLayersInRequest();
             checkMemoryUpdateAccountingOnce();
             checkUserFacingOutputNeutral();
+            checkDefaultRunSettings();
+            checkQuietStartupAndAnswer();
+            checkExplicitCommandsStillDetailed();
             checkDiagnosticsHiddenByDefault();
             checkTwoProcessIntegration();
         } finally {
@@ -4174,7 +4177,9 @@ public final class SelfTest {
             String followUp = "Какое кодовое слово я просил запомнить?";
             RunResult run2 = runAgentProcess(javaBin, classpath, trustStore, url, historyFile,
                     List.of(followUp, "/exit"));
-            expect("второй запуск процесса завершился успешно", run2.exitCode() == 0);
+            expect("второй запуск процесса завершился успешно"
+                            + (run2.exitCode() == 0 ? "" : " — stderr: " + run2.stderr()),
+                    run2.exitCode() == 0);
             expect("второй запуск сообщает о восстановлении контекста",
                     run2.stderr().contains("Контекст восстановлен: 1 завершённых обменов."));
             expect("второй запуск получил ответ", run2.stdout().contains("Ответ 2"));
@@ -5971,10 +5976,131 @@ public final class SelfTest {
             expect("подписи стратегии нейтральные",
                     text.contains("Скользящее окно")
                             && text.contains("Факты"));
-            expect("вывод слоёв памяти после ответа показан",
-                    text.contains("Память: долговременная"));
+            // Сводка слоёв памяти сохраняется в подробном блоке после ответа
+            // (formatShortAnswerNote) и по командам; по умолчанию вывод тихий,
+            // поэтому здесь проверяется сама строка, а не экран.
+            expect("подпись слоёв памяти присутствует в подробном блоке",
+                    Main.formatShortAnswerNote(agent).contains("Память: долговременная"));
         } finally {
             s.server().stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Значения по умолчанию для запуска одной командой (Проблема 1). */
+    private static void checkDefaultRunSettings() {
+        Map<String, String> empty = Map.of();
+        expect("LLM_DIAGNOSTICS по умолчанию false (краткий вывод)",
+                !ModelSettings.from(empty).diagnostics());
+
+        Path first = JsonConversationStore.defaultHistoryFile(empty);
+        Path second = JsonConversationStore.defaultHistoryFile(empty);
+        expect("история по умолчанию: каталог ~/.ai-advent-agent, имя chat-*.json",
+                first.getParent().getFileName().toString().equals(".ai-advent-agent")
+                        && first.getFileName().toString().startsWith("chat-")
+                        && first.getFileName().toString().endsWith(".json"));
+        expect("уникальное имя файла истории на каждый запуск",
+                !first.equals(second));
+
+        Map<String, String> explicit = new java.util.HashMap<>();
+        explicit.put("LLM_HISTORY_FILE", "/tmp/selftest-history-fix.json");
+        expect("LLM_HISTORY_FILE переопределяет путь истории",
+                JsonConversationStore.defaultHistoryFile(explicit)
+                        .equals(Path.of("/tmp/selftest-history-fix.json")));
+
+        expect("память по умолчанию: ~/.ai-advent-agent/memory.json (общая)",
+                MemoryStore.defaultMemoryFile(empty)
+                        .getFileName().toString().equals("memory.json")
+                        && MemoryStore.defaultMemoryFile(empty).getParent()
+                        .getFileName().toString().equals(".ai-advent-agent"));
+        Map<String, String> explicitMemory = new java.util.HashMap<>();
+        explicitMemory.put("LLM_MEMORY_FILE", "/tmp/selftest-memory-fix.json");
+        expect("LLM_MEMORY_FILE переопределяет путь памяти",
+                MemoryStore.defaultMemoryFile(explicitMemory)
+                        .equals(Path.of("/tmp/selftest-memory-fix.json")));
+    }
+
+    /**
+     * Тихий старт и минимальный вывод по умолчанию (Проблема 2):
+     * только ответ плюс статусная строка старта; подробности — по командам.
+     */
+    private static void checkQuietStartupAndAnswer() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        AtomicInteger success = new AtomicInteger();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) ->
+                new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                        + "\"content\":\"Ответ " + success.incrementAndGet() + "\"}}],"
+                        + "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20}}")
+                        .getBytes(StandardCharsets.UTF_8)));
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort()
+                            + "/v1/chat/completions", "glm-5.3-flash");
+            LlmAgent agent = newMemoryAgent(config, trustedHttpClient(keyStore),
+                    new java.util.HashMap<>());
+            FakeUi ui = new FakeUi(
+                    TerminalUi.Input.message("короткое сообщение"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(ui, agent, "glm-5.3-flash");
+            // Ответ показан; в системных строках нет ни диагностики,
+            // ни расходов, ни подписи контекста/стратегии/слоёв памяти.
+            expect("по умолчанию после ответа только ответ",
+                    ui.messages.size() == 1 && ui.messages.get(0).contains("Ответ 1"));
+            String systems = String.join("\n", ui.systems);
+            for (String banned : new String[]{
+                    "Диагностика:", "Расход сессии", "Контекст:", "Режим контекста",
+                    "Стратегия:", "Память: долговременная", "профир", "Профиль:"}) {
+                expect("по умолчанию в выводе нет «" + banned + "»",
+                        !systems.contains(banned));
+            }
+            expect("старт по умолчанию короткий: статусная строка есть, подробностей нет",
+                    systems.contains("Начата новая беседа.")
+                            && !systems.contains("Стратегия контекста")
+                            && !systems.contains("Профиль")
+                            && !systems.contains("Лимит расхода токенов"));
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Явные команды по-прежнему показывают подробности (Проблема 2, п.4). */
+    private static void checkExplicitCommandsStillDetailed() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) ->
+                new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                        + "\"content\":\"Ок\"}}]}").getBytes(StandardCharsets.UTF_8)));
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort()
+                            + "/v1/chat/completions", "glm-5.3-flash");
+            LlmAgent agent = newMemoryAgent(config, trustedHttpClient(keyStore),
+                    new java.util.HashMap<>());
+            agent.remember("код: ЯКОРЬ-42");
+            FakeUi ui = new FakeUi(
+                    TerminalUi.Input.command("/stats"),
+                    TerminalUi.Input.command("/tokens"),
+                    TerminalUi.Input.command("/strategy"),
+                    TerminalUi.Input.command("/context"),
+                    TerminalUi.Input.command("/memory"),
+                    TerminalUi.Input.command("/limit"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(ui, agent, "glm-5.3-flash");
+            String systems = String.join("\n", ui.systems);
+            expect("/stats показывает подробности по явному запросу",
+                    systems.contains("Статистика сессии"));
+            expect("/tokens показывает оценку контекста",
+                    systems.contains("Токены (без вызова API)"));
+            expect("/strategy показывает стратегию и окно",
+                    systems.contains("Стратегия контекста"));
+            expect("/context показывает режим контекста",
+                    systems.contains("Режим контекста"));
+            expect("/memory показывает долговременную память по явному запросу",
+                    systems.contains("Долговременная память"));
+            expect("/limit показывает лимит сессии",
+                    systems.contains("Лимит расхода токенов за сессию"));
+        } finally {
+            server.stop(0);
             Files.deleteIfExists(keyStore);
         }
     }
@@ -5998,9 +6124,18 @@ public final class SelfTest {
             Main.runLoop(quietUi, quietAgent, "glm-5.3-flash");
             expect("подробная диагностика скрыта по умолчанию",
                     quietUi.systems.stream().noneMatch(t -> t.contains("Диагностика:")));
-            expect("краткая сводка присутствует",
-                    quietUi.systems.stream().anyMatch(
-                            t -> t.contains("Расход сессии")));
+            // По умолчанию после ответа — только ответ: ни «Расход сессии»,
+            // ни «Контекст:», ни «Стратегия:", ни «Режим контекста».
+            String quietText = String.join("\n", quietUi.systems);
+            expect("по умолчанию нет кратких служебных блоков после ответа",
+                    !quietText.contains("Диагностика:")
+                            && !quietText.contains("Расход сессии")
+                            && !quietText.contains("Контекст:")
+                            && !quietText.contains("Стратегия:")
+                            && !quietText.contains("Режим контекста"));
+            expect("по умолчанию после ответа показан сам ответ",
+                    quietUi.messages.size() == 1
+                            && quietUi.messages.get(0).contains("Ответ"));
             quietStore.close();
 
             Map<String, String> env = new java.util.HashMap<>();
@@ -6014,6 +6149,15 @@ public final class SelfTest {
             Main.runLoop(diagUi, diagAgent, "glm-5.3-flash");
             expect("при LLM_DIAGNOSTICS=true подробная диагностика видна",
                     diagUi.systems.stream().anyMatch(t -> t.contains("Диагностика:")));
+            String diagText = String.join("\n", diagUi.systems);
+            expect("при LLM_DIAGNOSTICS=true сохраняется весь блок отчёта",
+                    diagText.contains("Расход сессии")
+                            && diagText.contains("Контекст:")
+                            && diagText.contains("Стратегия:")
+                            && diagText.contains("Память: долговременная")
+                            && diagText.contains("Профиль:")
+                            && diagText.contains("Стратегия контекста")
+                            && diagText.contains("Режим контекста"));
             diagStore.close();
         } finally {
             s.server().stop(0);

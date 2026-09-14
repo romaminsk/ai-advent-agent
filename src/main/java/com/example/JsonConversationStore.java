@@ -27,10 +27,11 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * JSON-хранилище контекста беседы. По умолчанию файл истории —
- * ~/.ai-advent-agent/conversation.json (путь не зависит от текущего каталога
- * запуска); путь можно заменить абсолютным путём через переменную окружения
- * LLM_HISTORY_FILE.
+ * JSON-хранилище контекста беседы. По умолчанию файл истории создаётся в
+ * ~/.ai-advent-agent/ с уникальным именем на каждый запуск
+ * («chat-<дата-время>.json»: сессии не затирают друг друга, запуск не требует
+ * переменных окружения); путь можно задать абсолютным путём через переменную
+ * окружения LLM_HISTORY_FILE.
  *
  * Обязанности только этого класса — работа с файлом истории:
  * - создание родительского каталога (на POSIX — с правами только владельца);
@@ -68,7 +69,6 @@ public final class JsonConversationStore implements ConversationStore {
     public static final int DAY9_SCHEMA_VERSION = 2;
 
     private static final String DEFAULT_DIR_NAME = ".ai-advent-agent";
-    private static final String DEFAULT_FILE_NAME = "conversation.json";
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final Path file;
@@ -101,17 +101,27 @@ public final class JsonConversationStore implements ConversationStore {
     }
 
     /**
-     * Открывает хранилище с путём по умолчанию либо заданным переменной
-     * окружения LLM_HISTORY_FILE (только абсолютный путь: относительный
-     * сделал бы историю разной в зависимости от каталога запуска).
+     * Открывает хранилище по умолчанию либо с путём из переменной окружения
+     * LLM_HISTORY_FILE (только абсолютный путь: относительный сделал бы
+     * историю разной в зависимости от каталога запуска).
      */
     public static JsonConversationStore openDefault() {
-        String configured = System.getenv("LLM_HISTORY_FILE");
-        Path historyFile;
-        if (configured == null || configured.isBlank()) {
-            historyFile = Path.of(System.getProperty("user.home"),
-                    DEFAULT_DIR_NAME, DEFAULT_FILE_NAME);
-        } else {
+        return new JsonConversationStore(defaultHistoryFile(System.getenv()));
+    }
+
+    /**
+     * Путь файла истории по умолчанию (для тестов передаётся набор переменных
+     * окружения; {@link #openDefault()} передаёт System.getenv).
+     *
+     * Если LLM_HISTORY_FILE не задана — файл создаётся в ~/.ai-advent-agent/
+     * с именем «chat-<дата-время>.json», уникальным на каждый запуск: сессии
+     * не затирают друг друга, запуск работает без переменных окружения.
+     * Файл долговременной памяти при этом общий (~/.ai-advent-agent/
+     * memory.json) и переживает запуски.
+     */
+    static Path defaultHistoryFile(java.util.Map<String, String> env) {
+        String configured = env.get("LLM_HISTORY_FILE");
+        if (configured != null && !configured.isBlank()) {
             Path specified;
             try {
                 specified = Path.of(configured);
@@ -125,9 +135,18 @@ public final class JsonConversationStore implements ConversationStore {
                                 + ". Укажите абсолютный путь, чтобы история не зависела "
                                 + "от каталога, из которого запущено приложение.");
             }
-            historyFile = specified;
+            return specified;
         }
-        return new JsonConversationStore(historyFile);
+        // Без переменной — уникальное имя на каждый запуск: дата-время
+        // с миллисекундами плюс суффикс от System.nanoTime(), чтобы
+        // совпадения даже при высокой частоте запусков не влияли.
+        java.time.format.DateTimeFormatter stamp = java.time.format.DateTimeFormatter
+                .ofPattern("yyyyMMdd-HHmmss-SSS", java.util.Locale.ROOT);
+        java.time.LocalDateTime now = java.time.LocalDateTime.now();
+        String nanoSuffix = String.format(java.util.Locale.ROOT, "%04x",
+                System.nanoTime() & 0xFFFF);
+        Path dir = Path.of(System.getProperty("user.home"), DEFAULT_DIR_NAME);
+        return dir.resolve("chat-" + now.format(stamp) + "-" + nanoSuffix + ".json");
     }
 
     /** Путь к основному файлу истории (для диагностики и тестов). */

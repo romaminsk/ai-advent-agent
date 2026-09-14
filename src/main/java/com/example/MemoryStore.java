@@ -83,28 +83,34 @@ public final class MemoryStore {
      * сделал бы память зависимой от каталога запуска).
      */
     public static MemoryStore openDefault() {
-        String configured = System.getenv("LLM_MEMORY_FILE");
-        Path memoryFile;
+        return new MemoryStore(defaultMemoryFile(System.getenv()));
+    }
+
+    /**
+     * Путь файла долговременной памяти по умолчанию (для тестов передаётся
+     * набор переменных окружения): LLM_MEMORY_FILE с абсолютным путём либо
+     * общий файл ~/.ai-advent-agent/memory.json, который переживает запуски.
+     */
+    static Path defaultMemoryFile(java.util.Map<String, String> env) {
+        String configured = env.get("LLM_MEMORY_FILE");
         if (configured == null || configured.isBlank()) {
-            memoryFile = Path.of(System.getProperty("user.home"),
+            return Path.of(System.getProperty("user.home"),
                     DEFAULT_DIR_NAME, DEFAULT_FILE_NAME);
-        } else {
-            Path specified;
-            try {
-                specified = Path.of(configured);
-            } catch (InvalidPathException e) {
-                throw new ConversationStoreException(
-                        "LLM_MEMORY_FILE содержит некорректный путь: " + configured, e);
-            }
-            if (!specified.isAbsolute()) {
-                throw new ConversationStoreException(
-                        "LLM_MEMORY_FILE содержит относительный путь: " + configured
-                                + ". Укажите абсолютный путь, чтобы память не зависела "
-                                + "от каталога, из которого запущено приложение.");
-            }
-            memoryFile = specified;
         }
-        return new MemoryStore(memoryFile);
+        Path specified;
+        try {
+            specified = Path.of(configured);
+        } catch (InvalidPathException e) {
+            throw new ConversationStoreException(
+                    "LLM_MEMORY_FILE содержит некорректный путь: " + configured, e);
+        }
+        if (!specified.isAbsolute()) {
+            throw new ConversationStoreException(
+                    "LLM_MEMORY_FILE содержит относительный путь: " + configured
+                            + ". Укажите абсолютный путь, чтобы память не зависела "
+                            + "от каталога, из которого запущено приложение.");
+        }
+        return specified;
     }
 
     /** Путь к файлу памяти (для диагностики и тестов). */

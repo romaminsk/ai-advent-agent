@@ -72,11 +72,16 @@ public final class Main {
             ui.showWelcome(model);
             // Ход долгих операций (суммаризация) — в терминал во время запроса.
             agent.setProgressListener(ui::showSystem);
-            ui.showSystem(describeMode(agent.currentSettings()));
-            ui.showSystem(describeStrategy(agent));
-            ui.showSystem(describeContextMode(agent));
-            ui.showSystem(describeSessionLimit(agent.currentSettings()));
-            ui.showSystem(describeMemory(agent));
+            // Краткий старт: приветствие и одна строка статуса. Подробности
+            // (профиль, стратегия, режим контекста, лимит, слои памяти) —
+            // при LLM_DIAGNOSTICS=true или по явным командам.
+            if (agent.currentSettings().diagnostics()) {
+                ui.showSystem(describeMode(agent.currentSettings()));
+                ui.showSystem(describeStrategy(agent));
+                ui.showSystem(describeContextMode(agent));
+                ui.showSystem(describeSessionLimit(agent.currentSettings()));
+                ui.showSystem(describeMemory(agent));
+            }
             setBranchLabel(ui, agent, demoRef);
             if (agent.hasRestoredContext()) {
                 ui.showSystem("Контекст восстановлен: "
@@ -868,34 +873,42 @@ public final class Main {
     }
 
     /**
-     * Краткие заметки после ответа: предупреждение об урезанном контексте,
-     * о возможном обрезании по лимиту, информационное сообщение о превышении
-     * лимита сессии (независимо от LLM_DIAGNOSTICS) и диагностика.
+     * Служебные заметки после ответа.
+     *
+     * По умолчанию (LLM_DIAGNOSTICS=false) вывод минимальный: только ответ
+     * агента; из служебного — лишь сообщения, влияющие на решение
+     * пользователя: предупреждение об обрезании по лимиту генерации
+     * и информационное сообщение о превышении лимита сессии. Вся
+     * статистика и диагностика доступны по явным командам (/stats,
+     * /tokens, /context) или включаются LLM_DIAGNOSTICS=true.
+     *
+     * В подробном режиме — полный блок: контекст запроса, заметки о
+     * стратегии и сжатии, диагностика (времена этапов, usage, стоимость).
      * Не содержит текстов переписки и секретов — только счётчики и метрики.
      */
     private static void showAnswerNotes(TerminalUi ui, LlmAgent agent, String model) {
-        // Подробные служебные заметки (о сжатии, выгоде и т.п.) показываются
-        // только в подробном режиме диагностики; прочтение обязательное —
-        // это однократное потребление, а не потеря данных.
+        boolean verbose = agent.currentSettings().diagnostics();
+        // Подробные служебные заметки однократные: потребление обязательно,
+        // чтобы заметки одной операции не «неожиданно» появлялись позже.
         List<String> contextNotes = agent.consumeContextNotes();
         RequestDiagnostics diagnostics = agent.getLastDiagnostics();
 
-        // По умолчанию — краткий и понятный блок: контекст запроса,
-        // реальные входные/выходные токены, расход сессии и стоимость.
+        if (!verbose) {
+            String limitNotice = agent.consumeSessionLimitNotice();
+            if (limitNotice != null) {
+                ui.showSystem(limitNotice);
+            }
+            return;
+        }
+
+        // Подробный режим: контекст, сводка, заметки, диагностика.
         String caption = agent.lastRequestContextCaption();
         if (caption != null) {
             ui.showSystem("Контекст: " + caption);
         }
         ui.showSystem(formatShortAnswerNote(agent));
         for (String note : contextNotes) {
-            boolean userFacing = note.startsWith("Стратегия:")
-                    || note.startsWith("Блок фактов")
-                    || note.startsWith("Не удалось обновить факты")
-                    || note.startsWith("Факты обновлены в памяти")
-                    || note.startsWith("Выбрана ветка");
-            if (userFacing || agent.currentSettings().diagnostics()) {
-                ui.showSystem(note);
-            }
+            ui.showSystem(note);
         }
         String limitNotice = agent.consumeSessionLimitNotice();
         if (limitNotice != null) {
@@ -910,11 +923,9 @@ public final class Main {
             ui.showSystem("Ответ мог быть обрезан по лимиту генерации. Для более подробного "
                     + "ответа задайте LLM_MAX_OUTPUT_TOKENS или выберите /mode detailed.");
         }
-        if (agent.currentSettings().diagnostics()) {
-            ui.showSystem(formatContextNotes(agent));
-            ui.showSystem(formatDiagnostics(diagnostics, model, agent.sessionStats(),
-                    agent.currentSettings()));
-        }
+        ui.showSystem(formatContextNotes(agent));
+        ui.showSystem(formatDiagnostics(diagnostics, model, agent.sessionStats(),
+                agent.currentSettings()));
     }
 
     /**
@@ -1870,9 +1881,10 @@ public final class Main {
         out.println("LLM_DIAGNOSTICS, LLM_HISTORY_FILE, LLM_MEMORY_FILE");
         out.println("(при запуске через launcher загружаются из локального .env проекта).");
         out.println();
-        out.println("История беседы хранится в JSON (~/.ai-advent-agent/conversation.json");
-        out.println("по умолчанию) и восстанавливается при следующем запуске;");
-        out.println("переменная LLM_HISTORY_FILE задаёт другой абсолютный путь.");
+        out.println("История беседы хранится в JSON в ~/.ai-advent-agent/");
+        out.println("(по умолчанию — новый файл chat-<дата-время>.json на каждый запуск);");
+        out.println("переменная LLM_HISTORY_FILE задаёт фиксированный абсолютный путь, ");
+        out.println("LLM_MEMORY_FILE — общий файл долговременной памяти (memory.json).");
         out.println();
         out.println("Команды чата: /help, /history, /tokens, /stats, /limit, /reset, /clear,");
         out.println("/context [full|summary], /context compare <вопрос>, /summary [refresh],");
