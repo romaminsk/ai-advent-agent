@@ -1,6 +1,7 @@
 package com.example;
 
 import java.math.BigDecimal;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -43,7 +44,14 @@ public final class Main {
         // --help обработан выше: он не создаёт и не блокирует историю
         // и не требует API-ключа.
         try (JsonConversationStore store = JsonConversationStore.openDefault()) {
-            LlmAgent agent = new LlmAgent(config, ModelSettings.fromEnv(), store);
+            // Боевая точка создания агента: долговременная память и профиль
+            // подключаются к реальным файлам (~/.ai-advent-agent/memory.json
+            // и ~/.ai-advent-agent/profile.json, переменные LLM_MEMORY_FILE и
+            // LLM_PROFILE_FILE) и переживают /clear, /reset и перезапуск.
+            // Тестовые конструкторы LlmAgent (временные файлы) боевым
+            // кодом не используются.
+            LlmAgent agent = new LlmAgent(config, ModelSettings.fromEnv(), store,
+                    MemoryStore.openDefault(), ProfileStore.openDefault());
             TerminalUi ui = TerminalUi.create(plainRequested);
             try {
                 exitCode = runLoop(ui, agent, config.model());
@@ -132,6 +140,15 @@ public final class Main {
                                 || normalized.startsWith("/forget ")) {
                             LlmAgent activeAgent = activeAgent(demoRef, agent);
                             handleMemoryCommand(ui, activeAgent, input.text(), demoRef);
+                        } else if (normalized.equals("/profile")
+                                || normalized.startsWith("/profile ")
+                                || normalized.equals("/skill")
+                                || normalized.startsWith("/skill ")
+                                || normalized.equals("/pipeline")
+                                || normalized.startsWith("/pipeline ")) {
+                            LlmAgent activeAgent = activeAgent(demoRef, agent);
+                            handleProfileCommands(ui, activeAgent, input.text(), normalized,
+                                    demoRef);
                         } else {
                             // В режиме измерений команды относятся к её беседе.
                             LlmAgent activeAgent = activeAgent(demoRef, agent);
@@ -469,6 +486,307 @@ public final class Main {
         } catch (AgentException e) {
             ui.showError(e.getMessage());
         }
+    }
+
+    // ================= Профиль пользователя, скиллы, пайплайны =================
+
+    /**
+     * Диспетчер команд профиля (без вызова API): /profile (обращение, стиль,
+     * формат, ограничения, сброс), /skill (add, list, remove) и /pipeline
+     * (задать, list, clear). В режиме измерений команды работают с основной
+     * беседой — приём, как у команд памяти.
+     */
+    private static void handleProfileCommands(TerminalUi ui, LlmAgent agent, String raw,
+                                              String normalized, DemoRef demoRef) {
+        if (demoRef.demo != null) {
+            ui.showSystem("В режиме измерения токенов команды профиля работают "
+                    + "с основной беседой. Завершите режим (/demo stop) и повторите.");
+            return;
+        }
+        if (raw.startsWith("/skill")) {
+            handleSkillCommand(ui, agent, raw);
+            return;
+        }
+        if (raw.startsWith("/pipeline")) {
+            handlePipelineCommand(ui, agent, raw, normalized);
+            return;
+        }
+        handleProfileCommand(ui, agent, raw, normalized);
+    }
+
+    /** /profile: показать профиль или задать поле; сброс — с подтверждением. */
+    private static void handleProfileCommand(TerminalUi ui, LlmAgent agent, String raw,
+                                             String normalized) {
+        String argument = normalized.length() > "/profile".length()
+                ? valueAfterPrefix(raw, "/profile")
+                : "";
+        if (argument.isEmpty()) {
+            ui.showSystem(formatProfile(agent));
+            return;
+        }
+        try {
+            if (argument.startsWith("name ")) {
+                String value = argument.substring("name ".length()).trim();
+                agent.setProfileName(value);
+                ui.showSystem("✓ Профиль обновлён: name → «" + value + "».");
+                return;
+            }
+            if (argument.startsWith("style ")) {
+                String value = argument.substring("style ".length()).trim();
+                agent.setProfileStyle(value);
+                ui.showSystem("✓ Профиль обновлён: style → «" + value + "».");
+                return;
+            }
+            if (argument.startsWith("format ")) {
+                String value = argument.substring("format ".length()).trim();
+                agent.setProfileFormat(value);
+                ui.showSystem("✓ Профиль обновлён: format → «" + value + "».");
+                return;
+            }
+            if (argument.equals("constraint")) {
+                ui.showSystem("Использование: /profile constraint <ограничение>, "
+                        + "/profile constraint clear — удалить все ограничения.");
+                return;
+            }
+            if (argument.equals("constraint clear")) {
+                agent.clearProfileConstraints();
+                ui.showSystem("✓ Профиль обновлён: constraint — все ограничения "
+                        + "удалены.");
+                return;
+            }
+            if (argument.startsWith("constraint ")) {
+                String value = argument.substring("constraint ".length()).trim();
+                agent.addProfileConstraint(value);
+                ui.showSystem("✓ Профиль обновлён: constraint → «" + value + "».");
+                return;
+            }
+            if (argument.equals("clear")) {
+                if (!ui.confirmProfileClear("профиль пользователя")) {
+                    ui.showSystem("Удаление отменено.");
+                    return;
+                }
+                agent.clearProfile();
+                ui.showSystem("✓ Профиль сброшен. Все поля заданы заново командами "
+                        + "/profile. Скиллы и пайплайны тоже сброшены.");
+                return;
+            }
+            ui.showSystem("Использование: /profile [name|style|format|constraint|clear]. "
+                    + "Подробности: /help /profile.");
+        } catch (AgentException e) {
+            ui.showError(e.getMessage());
+        }
+    }
+
+    /** /skill add <имя> <описание>; /skill list; /skill remove <имя>. */
+    private static void handleSkillCommand(TerminalUi ui, LlmAgent agent, String raw) {
+        String argument = valueAfterPrefix(raw, "/skill");
+        try {
+            if (argument.isEmpty() || argument.equals("list")) {
+                ui.showSystem(formatSkills(agent));
+                return;
+            }
+            if (argument.startsWith("add ")) {
+                String rest = argument.substring("add ".length()).trim();
+                if (rest.isEmpty()) {
+                    ui.showSystem("Использование: /skill add <имя> <описание>.");
+                    return;
+                }
+                String name;
+                String description;
+                if (rest.startsWith("\"") || rest.startsWith("«")) {
+                    // Имя в кавычках: /skill add "карточка фичи" описание.
+                    String closing = rest.startsWith("\"") ? "\"" : "»";
+                    int end = rest.indexOf(closing, 1);
+                    if (end < 0) {
+                        ui.showSystem("Имя скилла без закрывающей кавычки. "
+                                + "Использование: /skill add <имя> <описание>.");
+                        return;
+                    }
+                    name = rest.substring(1, end).trim();
+                    description = rest.substring(end + 1).trim();
+                } else {
+                    int nameEnd = rest.indexOf(' ');
+                    if (nameEnd <= 0) {
+                        ui.showSystem("Использование: /skill add <имя> <описание>.");
+                        return;
+                    }
+                    name = rest.substring(0, nameEnd).trim();
+                    description = rest.substring(nameEnd).trim();
+                }
+                agent.skillAdd(name, stripOptionalQuotes(description));
+                ui.showSystem("✓ Скилл «" + name + "» сохранён. Пайплайн для скиллов: "
+                        + "/pipeline <триггер> <скиллы>.");
+                return;
+            }
+            if (argument.startsWith("remove ")) {
+                String name = stripOptionalQuotes(
+                        argument.substring("remove ".length()).trim());
+                if (agent.skillRemove(name)) {
+                    ui.showSystem("✓ Скилл «" + name + "» удалён. Он также вычищен "
+                            + "из пайплайнов.");
+                } else {
+                    ui.showError("Скилл не найден: «" + name + "». Список: /skill list.");
+                }
+                return;
+            }
+            ui.showSystem("Использование: /skill [add <имя> <описание>|list|remove <имя>]. "
+                    + "Подробности: /help /skill.");
+        } catch (AgentException e) {
+            ui.showError(e.getMessage());
+        }
+    }
+
+    /**
+     * /pipeline <триггер> <скилл1,скилл2,…>; /pipeline list; /pipeline clear.
+     * Триггер может быть в кавычках и содержать пробелы; скиллы — через запятую.
+     */
+    private static void handlePipelineCommand(TerminalUi ui, LlmAgent agent, String raw,
+                                              String normalized) {
+        // Кавычки в значении не снимаем целиком: триггер и список скиллов
+        // разбираются отдельно.
+        String argument = raw.length() > "/pipeline".length()
+                ? raw.substring("/pipeline".length()).trim()
+                : "";
+        try {
+            if (argument.isEmpty() || argument.equals("list")) {
+                ui.showSystem(formatPipelines(agent));
+                return;
+            }
+            if (argument.equals("clear")) {
+                if (!ui.confirmProfileClear("все пайплайны")) {
+                    ui.showSystem("Удаление отменено.");
+                    return;
+                }
+                agent.pipelinesClear();
+                ui.showSystem("✓ Пайплайны очищены. Скиллы сохранены (/skill list).");
+                return;
+            }
+            int triggerEnd = argument.lastIndexOf('"');
+            if (argument.startsWith("\"")) {
+                // Триггер в кавычках: /pipeline "напиши фичу" скилл1,скилл2
+                int closing = argument.indexOf('"', 1);
+                if (closing < 0) {
+                    ui.showSystem("Триггер пайплайна без кавычки. Использование: "
+                            + "/pipeline <триггер> <скилл1,скилл2,…>.");
+                    return;
+                }
+                String trigger = argument.substring(1, closing).trim();
+                String rest = argument.substring(closing + 1).trim();
+                setPipelineFromArgument(ui, agent, trigger, rest);
+            } else {
+                int comma = argument.indexOf(',');
+                if (comma < 0 || comma >= argument.length() - 1) {
+                    ui.showSystem("Использование: /pipeline <триггер> <скилл1,скилл2,…> "
+                            + "(триггер с пробелами — в кавычках). Подробности: /help /pipeline.");
+                    return;
+                }
+                setPipelineFromArgument(ui, agent,
+                        argument.substring(0, comma).trim(),
+                        argument.substring(comma + 1).trim());
+            }
+        } catch (AgentException e) {
+            ui.showError(e.getMessage());
+        }
+    }
+
+    /** Разбор списка скиллов через запятую и установка пайплайна. */
+    private static void setPipelineFromArgument(TerminalUi ui, LlmAgent agent,
+                                                String trigger, String rest) {
+        List<String> skillNames = new ArrayList<>();
+        for (String part : rest.split(",", -1)) {
+            String name = stripOptionalQuotes(part.trim());
+            if (name.isEmpty()) {
+                ui.showSystem("Использование: /pipeline <триггер> "
+                        + "<скилл1,скилл2,…> (скиллы через запятую). Список: /skill list.");
+                return;
+            }
+            skillNames.add(name);
+        }
+        agent.setPipeline(trigger, skillNames);
+        ui.showSystem("✓ Пайплайн «" + trigger + "»: "
+                + String.join(" → ", skillNames)
+                + ". Подставляется, когда запрос содержит слова триггера.");
+    }
+
+    /** Текст /profile: все поля профиля; пустые помечены как «не задано». */
+    static String formatProfile(LlmAgent agent) {
+        UserProfile profile = agent.userProfile();
+        StringBuilder text = new StringBuilder("Профиль пользователя (переживает /clear, "
+                + "/reset и перезапуск; отдельный файл). Это не /mode — /mode меняет "
+                + "лимит генерации, а профиль — работу с вами.");
+        text.append("\n  обращение: ").append(profile.name() == null
+                ? "не задано" : "«" + profile.name() + "»");
+        text.append("\n  стиль: ").append(profile.style() == null
+                ? "не задано" : profile.style());
+        text.append("\n  формат: ").append(profile.format() == null
+                ? "не задано" : profile.format());
+        text.append("\n  ограничения: ");
+        if (profile.constraints().isEmpty()) {
+            text.append("не задано");
+        } else {
+            for (String constraint : profile.constraints()) {
+                text.append("\n    - ").append(constraint);
+            }
+        }
+        if (!profile.pipelines().isEmpty()) {
+            text.append("\n  пайплайны: см. /pipeline list");
+        }
+        text.append("\n  задать: /profile name|style|format|constraint <текст>.");
+        return text.toString();
+    }
+
+    /** Текст /skill list: скиллы профиля. */
+    static String formatSkills(LlmAgent agent) {
+        var skills = agent.skillsView();
+        StringBuilder text = new StringBuilder("Скиллы профиля (назначение — типовые "
+                + "задачи; без вызова API):");
+        if (skills.isEmpty()) {
+            text.append("\n  скиллов нет. Добавить: /skill add <имя> <описание>.");
+        } else {
+            for (var skill : skills.values()) {
+                text.append("\n  «").append(skill.name()).append("»: ")
+                        .append(skill.instructions())
+                        .append("\n    (изменено: ").append(skill.updatedAt()).append(")");
+            }
+        }
+        return text.toString();
+    }
+
+    /** Текст /pipeline list: триггеры и порядок скиллов. */
+    static String formatPipelines(LlmAgent agent) {
+        var pipelines = agent.userProfile().pipelinesView();
+        StringBuilder text = new StringBuilder("Пайплайны профиля (триггер → порядок "
+                + "скиллов; без вызова API):");
+        if (pipelines.isEmpty()) {
+            text.append("\n  пайплайнов нет. Задать: /pipeline <триггер> "
+                    + "<скилл1,скилл2,…>.");
+        } else {
+            for (var entry : pipelines.entrySet()) {
+                text.append("\n  «").append(entry.getKey()).append("»: ")
+                        .append(String.join(" → ", entry.getValue()));
+            }
+        }
+        return text.toString();
+    }
+
+    /** Часть команды после префикса, без учёта кавычек в значении. */
+    private static String valueAfterPrefix(String raw, String prefix) {
+        String value = raw.length() > prefix.length()
+                ? raw.substring(prefix.length()).trim() : "";
+        return stripOptionalQuotes(value);
+    }
+
+    /** Снимает одну пару кавычек «"…"», если значение в них целиком. */
+    private static String stripOptionalQuotes(String value) {
+        if (value.length() >= 2
+                && value.startsWith("\"") && value.endsWith("\"")) {
+            return value.substring(1, value.length() - 1).trim();
+        }
+        if (value.length() >= 4
+                && value.startsWith("«") && value.endsWith("»")) {
+            return value.substring(1, value.length() - 1).trim();
+        }
+        return value;
     }
 
     /** Текст /memory: записи долговременной памяти с метками времени. */
@@ -1924,7 +2242,7 @@ public final class Main {
         out.println("LLM_SESSION_TOKEN_LIMIT (информационный лимит сессии),");
         out.println("LLM_CONTEXT_MODE (full/summary), LLM_CONTEXT_KEEP_LAST_MESSAGES,");
         out.println("LLM_SUMMARY_BATCH_MESSAGES, LLM_SUMMARY_MAX_OUTPUT_TOKENS,");
-        out.println("LLM_DIAGNOSTICS, LLM_HISTORY_FILE, LLM_MEMORY_FILE");
+        out.println("LLM_DIAGNOSTICS, LLM_HISTORY_FILE, LLM_MEMORY_FILE, LLM_PROFILE_FILE");
         out.println("(при запуске через launcher загружаются из локального .env проекта).");
         out.println();
         out.println("История беседы хранится в JSON в ~/.ai-advent-agent/");
@@ -1933,6 +2251,7 @@ public final class Main {
         out.println("LLM_MEMORY_FILE — общий файл долговременной памяти (memory.json).");
         out.println();
         out.println("Команды чата: /help, /history, /tokens, /stats, /limit, /reset, /clear,");
+        out.println("/profile, /skill, /pipeline, /memory, /remember, /forget, /task,");
         out.println("/context [full|summary], /context compare <вопрос>, /summary [refresh],");
         out.println("/multiline, /exit (также exit, quit).");
     }

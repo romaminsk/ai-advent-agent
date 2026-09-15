@@ -388,6 +388,12 @@ final class InteractiveTerminalUi implements TerminalUi {
         return confirm("Ветка «" + name + "» необратимо удаляется.", "Продолжить?");
     }
 
+    /** Подтверждение необратимого удаления /profile clear, /pipeline clear. */
+    @Override
+    public boolean confirmProfileClear(String subject) {
+        return confirm("Сбросить " + subject + "?", "Это нельзя отменить.");
+    }
+
     @Override
     public ProgressIndicator startProgress() {
         ProgressSpinner spinner = new ProgressSpinner(terminal.writer(), true);
