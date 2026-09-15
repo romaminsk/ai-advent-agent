@@ -109,6 +109,13 @@ public interface TerminalUi extends AutoCloseable {
      */
     boolean confirmBranchDelete(String name);
 
+    /**
+     * Подтверждение необратимого удаления (/profile clear или /pipeline clear):
+     * subject — «профиль пользователя» или «все пайплайны». true — только
+     * y или yes.
+     */
+    boolean confirmProfileClear(String subject);
+
     /** Индикатор на время HTTP-запроса; используйте в try-with-resources. */
     ProgressIndicator startProgress();
 
@@ -145,6 +152,7 @@ public interface TerminalUi extends AutoCloseable {
         record Row(String group, String commands) {}
         Row[] rows = {
                 new Row("Память", "/memory /remember /forget /task /history"),
+                new Row("Профиль", "/profile /skill /pipeline"),
                 new Row("Контекст", "/context /summary /strategy /facts /branch"),
                 new Row("Диалог", "/clear /reset"),
                 new Row("Режимы", "/mode /multiline /paste /demo"),
@@ -273,6 +281,68 @@ public interface TerminalUi extends AutoCloseable {
                       факты рабочей памяти /task clear не трогает.
 
                     Связано: /facts, /clear.""";
+            case "/profile" -> """
+                    /profile — профиль пользователя (обращение, стиль, формат, ограничения)
+
+                    Использование
+                      /profile
+                      /profile name <обращение>
+                      /profile style <стиль>
+                      /profile format <формат>
+                      /profile constraint <ограничение>
+                      /profile constraint clear
+                      /profile clear
+
+                    Примеры
+                      /profile name Алексей
+                      /profile style кратко, по делу
+                      /profile constraint не используй смайлики
+
+                    Эффекты
+                      профиль подставляется в каждый запрос блоком
+                      «ПРОФИЛЬ ПОЛЬЗОВАТЕЛЬ»; переживает /clear, /reset
+                      и перезапуск (отдельный файл profile.json).
+                      /profile clear сбрасывает целиком (с подтверждением).
+                      Не вызывает API.
+
+                    Это не /mode: /mode меняет лимит генерации.
+
+                    Связано: /remember, /skill, /pipeline.""";
+            case "/skill" -> """
+                    /skill — скиллы профиля: инструкции для типовых задач
+
+                    Использование
+                      /skill add <имя> <описание>
+                      /skill list
+                      /skill remove <имя>
+
+                    Примеры
+                      /skill add "карточка фичи" название, цель, критерии приёмки, шаги
+
+                    Эффекты
+                      скиллы хранятся в профиле и подставляются в запрос
+                      пайплайном (/pipeline); remove также вычищает скилл
+                      из пайплайнов. Не вызывает API.
+
+                    Связано: /profile, /pipeline.""";
+            case "/pipeline" -> """
+                    /pipeline — пайплайн скиллов для триггера
+
+                    Использование
+                      /pipeline <триггер> <скилл1,скилл2,…>
+                      /pipeline list
+                      /pipeline clear
+
+                    Примеры
+                      /pipeline "напиши фичу" "карточка фичи, критерии, шаги"
+
+                    Эффекты
+                      если текст запроса содержит слова триггера, в system-
+                      сообщение подставляются скиллы в заданном порядке;
+                      роли отдельных агентов не вызываются — это подстановка
+                      упорядоченных инструкций. Не вызывает API.
+
+                    Связано: /skill, /profile.""";
             case "/clear" -> """
                     /clear — удалить историю текущего диалога
 

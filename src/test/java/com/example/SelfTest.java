@@ -191,6 +191,12 @@ public final class SelfTest {
             checkFactsNearLimitWarning();
             checkMemoryLayerSeparation();
             checkRememberKeyFormats();
+            checkProfileStoreLifecycle();
+            checkProfileSubcommandUi();
+            checkProfileBlockInSystemMessage();
+            checkProfileBlockAcrossRestartsAndClear();
+            checkSkillsAndPipelines();
+            checkPipelineSubstitutionInRequest();
             checkForgetPartialMatches();
             checkLegacyRememberEntries();
             checkSystemInstructionRules();
@@ -207,6 +213,7 @@ public final class SelfTest {
             checkExplicitCommandsStillDetailed();
             checkDiagnosticsHiddenByDefault();
             checkTwoProcessIntegration();
+            checkProfilePersistenceAcrossProcesses();
         } finally {
             deleteRecursively(baseTempDir);
         }
@@ -537,6 +544,9 @@ public final class SelfTest {
         int confirmBranchDeleteCount = 0;
         boolean confirmBranchDeleteAnswer = false;
         String confirmBranchDeleteName;
+        int confirmProfileClearCount = 0;
+        boolean confirmProfileClearAnswer = false;
+        String confirmProfileClearSubject;
         final List<String> promptTasks = new ArrayList<>();
         final List<String> commandHelps = new ArrayList<>();
 
@@ -627,6 +637,13 @@ public final class SelfTest {
             confirmBranchDeleteCount++;
             confirmBranchDeleteName = name;
             return confirmBranchDeleteAnswer;
+        }
+
+        @Override
+        public boolean confirmProfileClear(String subject) {
+            confirmProfileClearCount++;
+            confirmProfileClearSubject = subject;
+            return confirmProfileClearAnswer;
         }
 
         @Override
@@ -4385,8 +4402,7 @@ public final class SelfTest {
 
     // ---------- Интеграционный тест: два последовательных запуска процесса ----------
 
-    private record RunResult(int exitCode, String stdout, String stderr) {
-    }
+    private record RunResult(int exitCode, String stdout, String stderr) {    }
 
     private static void checkTwoProcessIntegration() throws Exception {
         Path keyStore = createSelfSignedKeyStore();
@@ -4454,6 +4470,74 @@ public final class SelfTest {
      * указывает на загрузчик Maven, поэтому классы проекта и зависимости
      * определяются по фактическим code source загруженных классов.
      */
+    /**
+     * Персонализация переживает перезапуск: боевой путь создания агента
+     * (используемый Main) подключает ProfileStore.openDefault() и
+     * MemoryStore.openDefault() — профиль пишется в файл LLM_PROFILE_FILE
+     * (а не во временный каталог) и читается новым запуском; долговременная
+     * память — в LLM_MEMORY_FILE. Команды /profile и /remember API не
+     * вызывают, поэтому тестовый сервер не нужен.
+     */
+    private static void checkProfilePersistenceAcrossProcesses() throws Exception {
+        String javaBin = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+        String classpath = buildClasspath();
+        // URL валиден по форме (HTTPS), эндпоинт недоступен — но API не вызывается.
+        String apiUrl = "https://127.0.0.1:1/v1/chat/completions";
+        Path profileFile = Files.createTempDirectory(baseTempDir, "prof-live-")
+                .resolve("profile.json");
+        Path memoryFile = Files.createTempDirectory(baseTempDir, "mem-live-")
+                .resolve("memory.json");
+        Path historyFile = Files.createTempDirectory(baseTempDir, "hist-live-")
+                .resolve("conversation.json");
+        Map<String, String> env = new java.util.HashMap<>();
+        env.put("LLM_PROFILE_FILE", profileFile.toAbsolutePath().toString());
+        env.put("LLM_MEMORY_FILE", memoryFile.toAbsolutePath().toString());
+
+        // Первый «запуск»: задают имя, стиль, ограничение, скилл, пайплайн и память.
+        RunResult run1 = runAgentProcess(javaBin, classpath, null, apiUrl, historyFile,
+                List.of(
+                        "/profile name ЯКОРЬ-42",
+                        "/profile style кратко, по делу",
+                        "/profile constraint только русский",
+                        "/skill add \"карточка фичи\" название, цель, критерии, шаги",
+                        "/pipeline \"напиши фичу\" карточка фичи",
+                        "/remember код: ЯКОРЬ-42",
+                        "/exit"),
+                env);
+        expect("первый запуск персистенции профиля завершился успешно"
+                        + (run1.exitCode() == 0 ? "" : " — stderr: " + run1.stderr()),
+                run1.exitCode() == 0);
+        expect("боевой путь пишет в файл профиля по LLM_PROFILE_FILE",
+                Files.exists(profileFile));
+        expect("файл профиля содержит заданные поля (schemaVersion 1)",
+                MAPPER.readTree(Files.readString(profileFile, StandardCharsets.UTF_8))
+                        .path("profile").path("name").asText().equals("ЯКОРЬ-42")
+                        && MAPPER.readTree(Files.readString(profileFile, StandardCharsets.UTF_8))
+                        .path("schemaVersion").asInt() == ProfileStore.SUPPORTED_SCHEMA_VERSION);
+
+        // Второй «запуск»: тот же файл LLM_PROFILE_FILE, новый процесс.
+        RunResult run2 = runAgentProcess(javaBin, classpath, null, apiUrl, historyFile,
+                List.of("/profile", "/memory", "/pipeline list", "/exit"), env);
+        expect("второй запуск персистенции профиля завершился успешно"
+                        + (run2.exitCode() == 0 ? "" : " — stderr: " + run2.stderr()),
+                run2.exitCode() == 0);
+        // PlainTerminalUi печатает ответы команд в stderr, а не stdout.
+        String secondOut = run2.stdout() + "\n" + run2.stderr();
+        expect("профиль переживает перезапуск: имя читается из файла",
+                secondOut.contains("«ЯКОРЬ-42»"));
+        expect("профиль переживает перезапуск: стиль читается",
+                secondOut.contains("кратко, по делу"));
+        expect("профиль переживает перезапуск: ограничение читается",
+                secondOut.contains("только русский"));
+        expect("скилл и пайплайн переживают перезапуск",
+                secondOut.contains("карточка фичи")
+                        && secondOut.contains("«напиши фичу»"));
+        expect("долговременная память по LLM_MEMORY_FILE переживает перезапуск",
+                secondOut.contains("код: ЯКОРЬ-42"));
+        expect("файл памяти по LLM_MEMORY_FILE существует",
+                Files.exists(memoryFile));
+    }
+
     private static String buildClasspath() throws Exception {
         List<String> entries = new ArrayList<>();
         addCodeSource(entries, SelfTest.class);                          // target/test-classes
@@ -4483,22 +4567,40 @@ public final class SelfTest {
     private static RunResult runAgentProcess(String javaBin, String classpath, Path trustStore,
                                              String apiUrl, Path historyFile,
                                              List<String> inputLines) throws Exception {
+        return runAgentProcess(javaBin, classpath, trustStore, apiUrl, historyFile,
+                inputLines, Map.of());
+    }
+
+    /** Вариант с дополнительными переменными окружения (LLM_PROFILE_FILE и т.п.). */
+    private static RunResult runAgentProcess(String javaBin, String classpath, Path trustStore,
+                                             String apiUrl, Path historyFile,
+                                             List<String> inputLines,
+                                             Map<String, String> extraEnv) throws Exception {
         Path stdin = Files.createTempFile(baseTempDir, "stdin-", ".txt");
         Files.write(stdin, (String.join("\n", inputLines) + "\n")
                 .getBytes(StandardCharsets.UTF_8));
         Path stdout = Files.createTempFile(baseTempDir, "stdout-", ".txt");
         Path stderr = Files.createTempFile(baseTempDir, "stderr-", ".txt");
-        ProcessBuilder processBuilder = new ProcessBuilder(
+        List<String> command = new ArrayList<>(List.of(
                 javaBin, "-cp", classpath,
-                "-Djavax.net.ssl.trustStore=" + trustStore.toAbsolutePath(),
-                "-Djavax.net.ssl.trustStorePassword=changeit",
-                "-Djavax.net.ssl.trustStoreType=PKCS12",
-                "com.example.Main");
+                "com.example.Main"));
+        if (trustStore != null) {
+            command = new ArrayList<>(List.of(
+                    javaBin, "-cp", classpath,
+                    "-Djavax.net.ssl.trustStore=" + trustStore.toAbsolutePath(),
+                    "-Djavax.net.ssl.trustStorePassword=changeit",
+                    "-Djavax.net.ssl.trustStoreType=PKCS12",
+                    "com.example.Main"));
+        }
+        ProcessBuilder processBuilder = new ProcessBuilder(command);
         processBuilder.environment().put("LLM_API_KEY", "test-key");
         processBuilder.environment().put("LLM_API_URL", apiUrl);
         processBuilder.environment().put("LLM_MODEL", "glm-5.3-flash");
         processBuilder.environment().put("LLM_HISTORY_FILE",
                 historyFile.toAbsolutePath().toString());
+        for (Map.Entry<String, String> extra : extraEnv.entrySet()) {
+            processBuilder.environment().put(extra.getKey(), extra.getValue());
+        }
         processBuilder.redirectInput(stdin.toFile());
         processBuilder.redirectOutput(stdout.toFile());
         processBuilder.redirectError(stderr.toFile());
@@ -5656,6 +5758,388 @@ public final class SelfTest {
     }
 
     // ================= Модель памяти: три слоя =================
+
+    // ================= Профиль пользователя =================
+
+    /** Хранилище профиля: пустой файл не создаётся, запись/чтение/валидация/перезапуск. */
+    private static void checkProfileStoreLifecycle() throws IOException {
+        Path profileFile = Files.createTempDirectory(baseTempDir, "prof-")
+                .resolve("profile.json");
+        ProfileStore profileStore = new ProfileStore(profileFile);
+
+        // Отсутствующий файл — пустой профиль, файл заранее не создаётся.
+        expect("отсутствующий файл профиля даёт пустой профиль",
+                profileStore.load().isEmpty());
+        expect("при отсутствии файла профиля JSON не создаётся заранее",
+                !Files.exists(profileFile));
+
+        // Поля сохраняются и читаются циклом «запись — чтение».
+        ProfileStore ps = new ProfileStore(profileFile);
+        ps.save(new UserProfile("Алексей", "кратко, по делу", "списками",
+                List.of("не используй смайлики", "только русский"),
+                new LinkedHashMap<>(), new LinkedHashMap<>(),
+                "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"));
+        UserProfile loaded = ps.load();
+        expect("профиль хранит обращение, стиль, формат и ограничения",
+                "Алексей".equals(loaded.name())
+                        && "кратко, по делу".equals(loaded.style())
+                        && "списками".equals(loaded.format())
+                        && loaded.constraints().contains("не используй смайлики")
+                        && loaded.constraints().contains("только русский"));
+        expect("метки времени профиля сохраняются",
+                "2026-01-01T00:00:00Z".equals(loaded.createdAt()));
+        expect("файл профиля отдельный от памяти (profile.json)",
+                profileFile.getFileName().toString().equals("profile.json"));
+
+        // Повреждённый файл — ошибка повреждения, файл не переписывается.
+        byte[] garbage = "это вообще не { json".getBytes(StandardCharsets.UTF_8);
+        Files.write(profileFile, garbage);
+        try {
+            ps.load();
+            expect("повреждённый файл профиля даёт ошибку", false);
+        } catch (ConversationStoreException e) {
+            expect("повреждённый файл профиля даёт ошибку с путём",
+                    e.getMessage().contains(profileFile.toString()));
+        }
+        expect("повреждённый файл профиля не перезаписывается",
+                Arrays.equals(Files.readAllBytes(profileFile), garbage));
+
+        // Путь по умолчанию и переменная окружения.
+        expect("профиль по умолчанию: ~/.ai-advent-agent/profile.json",
+                ProfileStore.defaultProfileFile(Map.of()).getFileName().toString()
+                        .equals("profile.json")
+                        && ProfileStore.defaultProfileFile(Map.of()).getParent()
+                        .getFileName().toString().equals(".ai-advent-agent"));
+        expect("LLM_PROFILE_FILE переопределяет путь профиля",
+                ProfileStore.defaultProfileFile(Map.of("LLM_PROFILE_FILE",
+                        "/tmp/selftest-profile-fix.json"))
+                        .equals(Path.of("/tmp/selftest-profile-fix.json")));
+        expect("относительный путь LLM_PROFILE_FILE отклоняется",
+                expectStoreError(() -> ProfileStore
+                        .defaultProfileFile(Map.of("LLM_PROFILE_FILE", "relative/path.json")))
+                        .contains("относительный"));
+
+        // Запись скиллов и пайплайнов в файл и чтение обратно.
+        var skill = ProfileSkill.create("карточка фичи",
+                "название, цель, критерии приёмки, шаги", java.time.Instant.now());
+        LinkedHashMap<String, ProfileSkill> skills = new LinkedHashMap<>();
+        skills.put(skill.name(), skill);
+        LinkedHashMap<String, List<String>> pipelines = new LinkedHashMap<>();
+        pipelines.put("напиши фичу", List.of("карточка фичи"));
+        ps.save(new UserProfile("Алексей", null, null, List.of(), skills, pipelines,
+                "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"));
+        UserProfile reloaded = ps.load();
+        expect("скиллы и пайплайны профиля перезапускаются",
+                reloaded.skills().containsKey("карточка фичи")
+                        && reloaded.skills().get("карточка фичи").instructions()
+                        .contains("критерии приёмки")
+                        && reloaded.pipelines().get("напиши фичу")
+                        .contains("карточка фичи"));
+
+        // Проверки валидации: пустые метки времени недопустимы.
+        String brokenJson = "{\"schemaVersion\":1,\"profile\":{\"name\":\"x\","
+                + "\"constraints\":[],\"createdAt\":\"2026-01-01T00:00:00Z\"}}";
+        Files.write(profileFile, brokenJson.getBytes(StandardCharsets.UTF_8));
+        boolean rejected;
+        try {
+            ps.load();
+            rejected = false;
+        } catch (ConversationStoreException e) {
+            rejected = true;
+        }
+        expect("профиль без updatedAt отклоняется", rejected);
+    }
+
+    /** Ошибка отклонения пути профиля (для expectStoreError-подобных проверок). */
+    private static String expectStoreError(Runnable action) {
+        try {
+            action.run();
+            return "";
+        } catch (RuntimeException e) {
+            return e.getMessage();
+        }
+    }
+
+    /**
+     * Блок «ПРОФИЛЬ ПОЛЬЗОВАТЕЛЬ» в system-сообщении: пустого профиля нет,
+     * заданный содержит все поля; разные значения дают разный текст.
+     */
+    private static void checkProfileBlockInSystemMessage() {
+        Map<String, MemoryEntry> emptyMemory = new LinkedHashMap<>();
+        ModelSettings settings = ModelSettings.defaults();
+
+        ChatMessage emptySystem = ContextBuilder.systemContextMessage(settings,
+                UserProfile.empty(), emptyMemory, null, Map.of(), null, null);
+        expect("пустой профиль не подставляется в system-сообщение",
+                !emptySystem.content().contains("ПРОФИЛЬ ПОЛЬЗОВАТЕЛЬ"));
+
+        ChatMessage fullSystem = ContextBuilder.systemContextMessage(settings,
+                new UserProfile("Алексей", "кратко, по делу", "списками",
+                        List.of("не используй смайлики"),
+                        new LinkedHashMap<>(), new LinkedHashMap<>(),
+                        "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+                emptyMemory, null, Map.of(), null, null);
+        String block = fullSystem.content();
+        expect("заданный профиль подставлен: заголовок блока",
+                block.contains("ПРОФИЛЬ ПОЛЬЗОВАТЕЛЬ"));
+        expect("блок профиля содержит обращение",
+                block.contains("Алексей"));
+        expect("блок профиля содержит стиль",
+                block.contains("кратко, по делу"));
+        expect("блок профиля содержит формат",
+                block.contains("списками"));
+        expect("блок профиля содержит ограничение",
+                block.contains("не используй смайлики"));
+        expect("блок профиля формулируется как инструкции",
+                ContextBuilder.renderProfile(new UserProfile("Алексей", null, null,
+                        List.of(), new LinkedHashMap<>(), new LinkedHashMap<>(),
+                        "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"))
+                        .contains("называй пользователя"));
+        expect("правило приоритета конкретного сообщения над профилем описано",
+                block.contains("следуй его сообщению"));
+
+        ChatMessage otherSystem = ContextBuilder.systemContextMessage(settings,
+                new UserProfile("Шеф", "подробно", null, List.of(),
+                        new LinkedHashMap<>(), new LinkedHashMap<>(),
+                        "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+                emptyMemory, null, Map.of(), null, null);
+        expect("разные профили дают разный текст system-сообщения",
+                !otherSystem.content().equals(fullSystem.content())
+                        && otherSystem.content().contains("Шеф")
+                        && otherSystem.content().contains("подробно"));
+    }
+
+    /**
+     * Полный прогон: профиль задан командами через FakeUi, подставлен
+     * в запрос на локальном сервере; /profile clear убирает блок.
+     */
+    private static void checkProfileBlockAcrossRestartsAndClear() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        AtomicReference<String> lastBody = new AtomicReference<>();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            lastBody.set(requestBody);
+            return new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                    + "\"content\":\"Ок\"}}]}").getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            ProfileStore profileStore = new ProfileStore(
+                    Files.createTempDirectory(baseTempDir, "prof-").resolve("profile.json"));
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort()
+                            + "/v1/chat/completions", "glm-5.3-flash");
+            LlmAgent agent = new LlmAgent(config, ModelSettings.defaults(),
+                    trustedHttpClient(keyStore), tempStore(),
+                    new MemoryStore(Files.createTempDirectory(baseTempDir, "mem-")
+                            .resolve("memory.json")), profileStore);
+
+            // Команды профиля не вызывают API и задают поля.
+            FakeUi ui = new FakeUi(
+                    TerminalUi.Input.command("/profile"),
+                    TerminalUi.Input.command("/profile name Алексей"),
+                    TerminalUi.Input.command("/profile style кратко, по делу"),
+                    TerminalUi.Input.command("/profile format списками"),
+                    TerminalUi.Input.command("/profile constraint не используй смайлики"),
+                    TerminalUi.Input.command("/profile constraint clear"),
+                    TerminalUi.Input.command("/profile constraint только русский"),
+                    TerminalUi.Input.command("/profile"));
+            Main.runLoop(ui, agent, "glm-5.3-flash");
+            expect("/profile показывает заданные поля",
+                    ui.systems.stream().anyMatch(t -> t.contains("Алексей")
+                            && t.contains("кратко, по делу") && t.contains("списками")));
+            expect("/profile помечает незаданные поля «не задано»",
+                    ui.systems.stream().anyMatch(t -> t.contains("не задано")));
+            expect("подтверждения команды в едином стиле",
+                    ui.systems.stream().anyMatch(t -> t.contains("Профиль обновлён: name"))
+                            && ui.systems.stream().anyMatch(t ->
+                            t.contains("Профиль обновлён: constraint")));
+            expect("пустые поля устанавливаются без API", agent.userProfile().name() != null);
+
+            agent.ask("привет");
+            String system = MAPPER.readTree(lastBody.get())
+                    .path("messages").get(0).path("content").asText();
+            expect("в запросе есть блок ПРОФИЛЬ ПОЛЬЗОВАТЕЛЬ",
+                    system.contains("ПРОФИЛЬ ПОЛЬЗОВАТЕЛЬ"));
+            expect("в блоке профиля есть обращение и стиль",
+                    system.contains("Алексей") && system.contains("кратко, по делу"));
+            expect("очищенное ограничение не подставляется",
+                    !system.contains("не используй смайлики"));
+            expect("оставшееся ограничение подставляется",
+                    system.contains("только русский"));
+
+            // Перезапуск: новый агент с тем же файлом профиля видит поля.
+            LlmAgent restarted = new LlmAgent(config, ModelSettings.defaults(),
+                    trustedHttpClient(keyStore), tempStore(),
+                    new MemoryStore(Files.createTempDirectory(baseTempDir, "mem-")
+                            .resolve("memory.json")), profileStore);
+            expect("профиль переживает перезапуск",
+                    "Алексей".equals(restarted.userProfile().name()));
+
+            // /profile clear убирает блок после подтверждения.
+            FakeUi clearUi = new FakeUi(
+                    TerminalUi.Input.command("/profile clear"),
+                    TerminalUi.Input.command("/exit"));
+            clearUi.confirmProfileClearAnswer = true;
+            Main.runLoop(clearUi, restarted, "glm-5.3-flash");
+            expect("/profile clear сбрасывает профиль (подтверждение работает)",
+                    restarted.userProfile().isEmpty());
+
+            restarted.ask("вопрос после сброса");
+            String clearedSystem = MAPPER.readTree(lastBody.get())
+                    .path("messages").get(0).path("content").asText();
+            expect("после /profile clear блока профиля в запросе нет",
+                    !clearedSystem.contains("ПРОФИЛЬ ПОЛЬЗОВАТЕЛЬ"));
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Команда /profile clear без подтверждения не сбрасывает профиль. */
+    private static void checkProfileSubcommandUi() throws IOException {
+        // Тонкая проверка без API: отказ подтверждения сохраняет профиль.
+        FakeUi ui = new FakeUi(TerminalUi.Input.command("/profile clear"));
+        ui.confirmProfileClearAnswer = false;
+        ProfileStore profileStore = new ProfileStore(
+                Files.createTempDirectory(baseTempDir, "prof-").resolve("profile.json"));
+        LlmAgent agent = new LlmAgent(new Config("test-key",
+                "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash"),
+                ModelSettings.defaults(),
+                java.net.http.HttpClient.newHttpClient(),
+                new JsonConversationStore(
+                        Files.createTempDirectory(baseTempDir, "hist-")
+                                .resolve("conversation.json")),
+                tempMemoryStore(), profileStore);
+        agent.setProfileName("Шеф");
+        Main.runLoop(ui, agent, "test-model");
+        expect("отказ подтверждения сохраняет профиль",
+                "Шеф".equals(agent.userProfile().name()));
+    }
+
+    /** Скиллы: /skill add/list/remove; пайплайны: задание, показ, очистка. */
+    private static void checkSkillsAndPipelines() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) ->
+                new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                        + "\"content\":\"Ок\"}}]}").getBytes(StandardCharsets.UTF_8)));
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort()
+                            + "/v1/chat/completions", "glm-5.3-flash");
+            LlmAgent agent = newMemoryAgent(config, trustedHttpClient(keyStore),
+                    new java.util.HashMap<>());
+
+            FakeUi ui = new FakeUi(
+                    TerminalUi.Input.command("/skill add \"карточка фичи\" название, цель, "
+                            + "критерии приёмки, шаги"),
+                    TerminalUi.Input.command("/skill add \"сборка корзины\" собери товары, "
+                            + "сгруппируй, посчитай сумму"),
+                    TerminalUi.Input.command("/skill list"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(ui, agent, "glm-5.3-flash");
+            expect("/skill add сохраняет скиллы",
+                    agent.skillsView().containsKey("карточка фичи")
+                            && agent.skillsView().containsKey("сборка корзины"));
+            expect("/skill list показывает скиллы",
+                    ui.systems.stream().anyMatch(t -> t.contains("карточка фичи")
+                            && t.contains("критерии приёмки")));
+
+            // Пайплайн задан командой; /pipeline list показывает.
+            FakeUi pipelineUi = new FakeUi(
+                    TerminalUi.Input.command("/pipeline \"напиши фичу\" "
+                            + "\"карточка фичи\""),
+                    TerminalUi.Input.command("/pipeline list"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(pipelineUi, agent, "glm-5.3-flash");
+            expect("/pipeline задаёт триггер и порядок скиллов",
+                    agent.userProfile().pipelinesView().get("напиши фичу")
+                            .contains("карточка фичи"));
+            expect("/pipeline list показывает пайплайн",
+                    pipelineUi.systems.stream().anyMatch(t ->
+                            t.contains("«напиши фичу»")));
+
+            // Unknown skill отклоняется с понятной ошибкой.
+            FakeUi unknownSkill = new FakeUi(
+                    TerminalUi.Input.command("/pipeline \"оплата\" неизвестный"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(unknownSkill, agent, "glm-5.3-flash");
+            expect("пайплайн с неизвестным скиллом отклоняется",
+                    unknownSkill.errors.stream().anyMatch(t ->
+                            t.contains("не найден")));
+
+            // Удаление скилла вычищает и пайплайн.
+            FakeUi removeUi = new FakeUi(
+                    TerminalUi.Input.command("/skill remove карточка фичи"),
+                    TerminalUi.Input.command("/skill list"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(removeUi, agent, "glm-5.3-flash");
+            expect("/skill remove удаляет скилл",
+                    !agent.skillsView().containsKey("карточка фичи"));
+            expect("удалённый скилл вычищен из пайплайнов",
+                    agent.userProfile().pipelinesView().containsKey("напиши фичу")
+                            == false);
+
+            // /pipeline clear требует подтверждения и чистит только пайплайны.
+            FakeUi clearPipelineUi = new FakeUi(
+                    TerminalUi.Input.command("/pipeline clear"),
+                    TerminalUi.Input.command("/pipeline list"),
+                    TerminalUi.Input.command("/exit"));
+            clearPipelineUi.confirmProfileClearAnswer = true;
+            Main.runLoop(clearPipelineUi, agent, "glm-5.3-flash");
+            expect("/pipeline clear очищает пайплайны",
+                    agent.userProfile().pipelinesView().isEmpty());
+            expect("/pipeline clear сохраняет скиллы",
+                    agent.skillsView().containsKey("сборка корзины"));
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Пайплайн подставляется в system-сообщение при совпадении триггера. */
+    private static void checkPipelineSubstitutionInRequest() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        AtomicReference<String> lastBody = new AtomicReference<>();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            lastBody.set(requestBody);
+            return new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                    + "\"content\":\"Ок\"}}]}").getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort()
+                            + "/v1/chat/completions", "glm-5.3-flash");
+            LlmAgent agent = newMemoryAgent(config, trustedHttpClient(keyStore),
+                    new java.util.HashMap<>());
+            agent.skillAdd("карточка фичи", "название, цель, критерии приёмки, шаги");
+            agent.skillAdd("критерии", "три критерия приёмки с примерами");
+            agent.setPipeline("напиши фичу", List.of("карточка фичи", "критерии"));
+
+            // Совпадение триггера — ключевые слова присутствуют в запросе.
+            List<ProfileSkill> matched = ContextBuilder.matchedPipeline(
+                    agent.userProfile(), "пожалуйста, напиши фичу входа");
+            expect("триггер распознаётся по ключевым словам среди текста запроса",
+                    matched.size() == 2
+                            && matched.get(0).name().equals("карточка фичи")
+                            && matched.get(1).name().equals("критерии"));
+
+            // Нет совпадения — пайплайн не подставляется.
+            expect("несовпадающий запрос не активирует пайплайн",
+                    ContextBuilder.matchedPipeline(agent.userProfile(), "как дела")
+                            .isEmpty());
+
+            agent.ask("напиши фичу входа");
+            String system = MAPPER.readTree(lastBody.get())
+                    .path("messages").get(0).path("content").asText();
+            expect("в запросе есть блок ПАЙПЛАЙН",
+                    system.contains("ПАЙПЛАЙН"));
+            expect("пайплайн содержит порядок и инструкции скиллов",
+                    system.contains("карточка фичи") && system.contains("критерии")
+                            && system.contains("Порядок применения"));
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
 
     /** Правила разбиения «ключ: значение» для /remember (Проблема 1). */
     private static void checkRememberKeyFormats() {

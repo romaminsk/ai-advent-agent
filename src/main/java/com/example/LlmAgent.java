@@ -113,6 +113,12 @@ public final class LlmAgent {
     private final LinkedHashMap<String, MemoryEntry> longTermMemory =
             new LinkedHashMap<>();
 
+    /** Хранилище профиля пользователя (отдельный файл). */
+    private final ProfileStore profileStore;
+
+    /** Текущий профиль пользователя (загружается при старте). */
+    private UserProfile userProfile;
+
     /** Рабочая память: текущая задача и факты (слой 2). */
     private final WorkingMemory workingMemory = new WorkingMemory();
 
@@ -292,16 +298,51 @@ public final class LlmAgent {
         }
     }
 
+    /** Временный профиль для тестов: никогда не читает и не пишет реальный файл. */
+    private static ProfileStore tempProfileStore() {
+        try {
+            Path tempDir = Files.createTempDirectory("agent-test-profile-");
+            return new ProfileStore(tempDir.resolve("profile.json"));
+        } catch (IOException e) {
+            throw new IllegalStateException("Не удалось создать временный профиль для теста", e);
+        }
+    }
+
     /** Пакетно-приватный конструктор для локальных тестов с подставным MemoryStore. */
     LlmAgent(Config config, ModelSettings settings, HttpClient httpClient,
              ConversationStore store, MemoryStore memoryStore) {
+        this(config, settings, httpClient, store, memoryStore, tempProfileStore());
+    }
+
+    /**
+     * Боевой конструктор с явно указанными хранилищами: боевая точка создания
+     * агента (Main) подключает MemoryStore.openDefault() (файл
+     * ~/.ai-advent-agent/memory.json или LLM_MEMORY_FILE) и
+     * ProfileStore.openDefault() (~/.ai-advent-agent/profile.json или
+     * LLM_PROFILE_FILE) — долговременная память и профиль переживают
+     * перезапуск. Тестовые конструкторы выше остаются изолированными
+     * (временные файлы) и реальные файлы не трогают.
+     */
+    public LlmAgent(Config config, ModelSettings settings, ConversationStore store,
+                    MemoryStore memoryStore, ProfileStore profileStore) {
+        this(config, settings, HttpClient.newBuilder()
+                .connectTimeout(CONNECT_TIMEOUT)
+                .build(), store, memoryStore, profileStore);
+    }
+
+    /** Вариант с собственным HttpClient (для подстановки тестового клиента). */
+    public LlmAgent(Config config, ModelSettings settings, HttpClient httpClient,
+                    ConversationStore store, MemoryStore memoryStore,
+                    ProfileStore profileStore) {
         this.config = config;
         this.settings = Objects.requireNonNull(settings, "settings");
         this.httpClient = httpClient;
         this.store = Objects.requireNonNull(store, "store");
         this.memoryStore = Objects.requireNonNull(memoryStore, "memoryStore");
+        this.profileStore = Objects.requireNonNull(profileStore, "profileStore");
         this.objectMapper = new ObjectMapper();
         loadLongTermMemory();
+        loadUserProfile();
         restoreFromStore();
     }
 
@@ -607,7 +648,7 @@ public final class LlmAgent {
      * отправки ({@link ModelSettings#effectiveContextMaxTurns}).
      */
     public int estimateNextContextTokens() {
-        return tokenCounter.countMessages(buildContextMessages());
+        return tokenCounter.countMessages(buildContextMessages(null));
     }
 
     /**
@@ -1210,6 +1251,165 @@ public final class LlmAgent {
     /** Путь файла долговременной памяти (для /memory и приветствия). */
     public java.nio.file.Path memoryFile() {
         return memoryStore.file();
+    }
+
+    // ================= Профиль пользователя: команды =================
+
+    /** Текущий профиль пользователя (данные для /profile без вызова API). */
+    public UserProfile userProfile() {
+        return userProfile;
+    }
+
+    /**
+     * Загружает профиль из отдельного файла. Отсутствие файла — пустой
+     * профиль, запуск не ломается; повреждённый файл — ошибка повреждения
+     * (файл не изменяется).
+     */
+    private void loadUserProfile() {
+        userProfile = profileStore.load();
+    }
+
+    /** Имя поля профиля для подтверждений («✓ Профиль обновлён: name»). */
+    private String saveProfile(UserProfile updated, String field) {
+        profileStore.save(updated);
+        userProfile = updated;
+        return field;
+    }
+
+    /** Задаёт обращение к пользователю (/profile name <текст>). */
+    public void setProfileName(String name) {
+        requireProfileField("обращение", name);
+        saveProfile(userProfile.withName(name.trim(), java.time.Instant.now()), "name");
+    }
+
+    /** Задаёт стиль ответов (/profile style <текст>). */
+    public void setProfileStyle(String style) {
+        requireProfileField("стиль", style);
+        saveProfile(userProfile.withStyle(style.trim(), java.time.Instant.now()), "style");
+    }
+
+    /** Задаёт формат ответов (/profile format <текст>). */
+    public void setProfileFormat(String format) {
+        requireProfileField("формат", format);
+        saveProfile(userProfile.withFormat(format.trim(), java.time.Instant.now()), "format");
+    }
+
+    /** Добавляет ограничение профиля (/profile constraint <текст>). */
+    public void addProfileConstraint(String constraint) {
+        requireProfileField("ограничение", constraint);
+        saveProfile(userProfile.withConstraint(constraint, java.time.Instant.now()),
+                "constraint");
+    }
+
+    /** Очищает все ограничения профиля (/profile constraint clear). */
+    public void clearProfileConstraints() {
+        saveProfile(userProfile.withoutConstraints(java.time.Instant.now()), "constraint");
+    }
+
+    /** Полный сброс профиля (/profile clear). Валидация не нужна: пустой профиль. */
+    public void clearProfile() {
+        profileStore.save(UserProfile.empty());
+        userProfile = UserProfile.empty();
+    }
+
+    /** Дубликаты ограничений не размножаются, но проверка поля единая. */
+    private static void requireProfileField(String field, String value) {
+        if (value == null || value.isBlank()) {
+            throw new AgentException(
+                    "Поле профиля «" + field + "» не может быть пустым.");
+        }
+        if (value.trim().length() > BranchData.MAX_NAME_LENGTH) {
+            throw new AgentException("Поле профиля «" + field + "» не длиннее "
+                    + BranchData.MAX_NAME_LENGTH + " символов, получено: "
+                    + value.trim().length() + ".");
+        }
+    }
+
+    // ================= Скиллы и пайплайны: команды =================
+
+    /** Добавляет или обновляет скилл (/skill add <имя> <описание>). */
+    public void skillAdd(String skillName, String instructions) {
+        if (skillName == null || skillName.isBlank()) {
+            throw new AgentException("Имя скилла обязательно: /skill add <имя> <описание>.");
+        }
+        String trimmedName = skillName.trim();
+        if (trimmedName.length() > BranchData.MAX_NAME_LENGTH) {
+            throw new AgentException("Имя скилла не длиннее "
+                    + BranchData.MAX_NAME_LENGTH + " символов, получено: "
+                    + trimmedName.length() + ".");
+        }
+        if (instructions == null || instructions.isBlank()) {
+            throw new AgentException("Описание скилла обязательно: /skill add <имя> <описание>.");
+        }
+        ProfileSkill existing = userProfile.skill(trimmedName);
+        ProfileSkill skill = existing == null
+                ? ProfileSkill.create(trimmedName, instructions, java.time.Instant.now())
+                : existing.withInstructions(instructions, java.time.Instant.now());
+        LinkedHashMap<String, ProfileSkill> skills =
+                new LinkedHashMap<>(userProfile.skills());
+        skills.put(trimmedName, skill);
+        UserProfile updated = new UserProfile(userProfile.name(), userProfile.style(),
+                userProfile.format(), userProfile.constraints(), skills,
+                userProfile.pipelines(), userProfile.createdAt(),
+                java.time.Instant.now().toString());
+        profileStore.save(updated);
+        userProfile = updated;
+    }
+
+    /** Список скиллов профиля (/skill list). */
+    public LinkedHashMap<String, ProfileSkill> skillsView() {
+        return userProfile.skillsView();
+    }
+
+    /** Удаляет скилл и вычищает его из пайплайнов; true — скилл был удалён. */
+    public boolean skillRemove(String skillName) {
+        if (skillName == null || skillName.isBlank()) {
+            throw new AgentException("Имя скилла обязательно: /skill remove <имя>.");
+        }
+        if (!userProfile.skillRemoved(skillName)) {
+            return false;
+        }
+        profileStore.save(new UserProfile(userProfile.name(), userProfile.style(),
+                userProfile.format(), userProfile.constraints(), userProfile.skills(),
+                userProfile.pipelines(), userProfile.createdAt(),
+                java.time.Instant.now().toString()));
+        return true;
+    }
+
+    /** Задаёт пайплайн для триггера; имена скиллов, которых нет, — ошибка. */
+    public void setPipeline(String trigger, List<String> skillNames) {
+        if (trigger == null || trigger.isBlank()) {
+            throw new AgentException("Триггер пайплайна обязателен: "
+                    + "/pipeline <триггер> <скилл1,скилл2,…>.");
+        }
+        String trimmedTrigger = trigger.trim();
+        if (trimmedTrigger.length() > BranchData.MAX_NAME_LENGTH) {
+            throw new AgentException("Триггер пайплайна не длиннее "
+                    + BranchData.MAX_NAME_LENGTH + " символов, получено: "
+                    + trimmedTrigger.length() + ".");
+        }
+        if (skillNames == null || skillNames.isEmpty()) {
+            throw new AgentException("Пайплайн требует хотя бы один скилл: "
+                    + "/pipeline <триггер> <скилл1,скилл2,…>. Список скиллов: /skill list.");
+        }
+        for (String skillName : skillNames) {
+            if (userProfile.skill(skillName) == null) {
+                throw new AgentException("Скилл «" + skillName + "» не найден. Создайте "
+                        + "его первой командой /skill add " + skillName.trim()
+                        + " <описание>.");
+            }
+        }
+        UserProfile updated = userProfile.withPipeline(trimmedTrigger, skillNames,
+                java.time.Instant.now());
+        profileStore.save(updated);
+        userProfile = updated;
+    }
+
+    /** Очищает все пайплайны (/pipeline clear). */
+    public void pipelinesClear() {
+        UserProfile updated = userProfile.withoutPipelines(java.time.Instant.now());
+        profileStore.save(updated);
+        userProfile = updated;
     }
 
     private LinkedHashMap<String, String> factsForSave() {
@@ -2201,21 +2401,15 @@ public final class LlmAgent {
      * и память сохраняют всю существующую политику хранения.
      */
     private List<ChatMessage> buildOutgoingMessages(String userMessage) {
-        List<ChatMessage> outgoing = buildContextMessages();
+        List<ChatMessage> outgoing = buildContextMessages(userMessage);
         outgoing.add(new ChatMessage("user", userMessage));
         return outgoing;
     }
 
-    private List<ChatMessage> buildContextMessages() {
-        return ContextBuilder.buildContextMessages(settings, history,
+    private List<ChatMessage> buildContextMessages(String userMessage) {
+        return ContextBuilder.buildContextMessages(settings, history, userProfile,
                 longTermMemory, workingMemory.task(), workingMemory.factsView(),
-                effectiveSummary());
-    }
-
-    /** System-сообщение обычного запроса (все слои памяти) — ContextBuilder. */
-    private ChatMessage systemContextMessage() {
-        return ContextBuilder.systemContextMessage(settings, longTermMemory,
-                workingMemory.task(), workingMemory.factsView(), effectiveSummary());
+                userMessage, effectiveSummary());
     }
 
     /**
