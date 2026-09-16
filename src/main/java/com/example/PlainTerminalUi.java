@@ -46,11 +46,19 @@ final class PlainTerminalUi implements TerminalUi {
         this.err = err;
     }
 
-    /** Компактный старт: две строки, очевидное (новая беседа/контекст) не печатается. */
+    /** Компактный старт: две строки; первый запуск — плюс короткий онбординг. */
     @Override
     public void showWelcome(String model) {
         err.println("AI Advent Agent  ·  " + model);
         err.println("/help — команды");
+    }
+
+    @Override
+    public void showWelcome(String model, boolean firstLaunch) {
+        showWelcome(model);
+        if (firstLaunch) {
+            err.println(TerminalUi.firstRunOnboarding());
+        }
     }
 
     @Override
@@ -190,6 +198,14 @@ final class PlainTerminalUi implements TerminalUi {
 
     @Override
     public void showHelp() {
+        err.print("Команды\n");
+        err.print(TerminalUi.shortHelp());
+        err.println();
+        err.println();
+    }
+
+    @Override
+    public void showFullHelp() {
         err.print("Команды\n");
         err.print(TerminalUi.chatIndex(80));
         err.println();

@@ -148,6 +148,22 @@ final class InteractiveTerminalUi implements TerminalUi {
         out.flush();
     }
 
+    /** Первый запуск: приветствие плюс короткий онбординг (4–5 строк). */
+    @Override
+    public void showWelcome(String model, boolean firstLaunch) {
+        showWelcome(model);
+        if (firstLaunch) {
+            PrintWriter out = terminal.writer();
+            out.println(TerminalUi.firstRunOnboarding());
+            out.flush();
+        }
+    }
+
+    @Override
+    public boolean interactiveMenus() {
+        return true;
+    }
+
     @Override
     public Input nextInput() {
         while (true) {
@@ -275,6 +291,14 @@ final class InteractiveTerminalUi implements TerminalUi {
 
     @Override
     public void showHelp() {
+        PrintWriter out = terminal.writer();
+        out.print(TerminalUi.shortHelp());
+        out.println();
+        out.flush();
+    }
+
+    @Override
+    public void showFullHelp() {
         PrintWriter out = terminal.writer();
         // Индекс: заголовки групп — акцент, команды — обычный текст.
         out.print(colors ? "Команды\n" : "Команды\n");

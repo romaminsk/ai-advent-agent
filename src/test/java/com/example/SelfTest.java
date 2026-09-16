@@ -27,6 +27,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.KeyStore;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
@@ -205,6 +206,10 @@ public final class SelfTest {
             checkMemoryPersistsAcrossRestarts();
             checkClearKeepsLongTermMemory();
             checkTaskCommands();
+            checkTaskStateMachineModel();
+            checkTaskStateCommands();
+            checkTaskStateBlockInSystemMessage();
+            checkTaskStatePauseResumeInRequest();
             checkThreeLayersInRequest();
             checkMemoryUpdateAccountingOnce();
             checkUserFacingOutputNeutral();
@@ -214,6 +219,13 @@ public final class SelfTest {
             checkDiagnosticsHiddenByDefault();
             checkTwoProcessIntegration();
             checkProfilePersistenceAcrossProcesses();
+            checkShortHelpAndFullIndex();
+            checkNextHints();
+            checkInteractiveMenus();
+            checkPlainMenusDisabledWithSyntaxHint();
+            checkTypoSuggestions();
+            checkStatusOverview();
+            checkOnboardingFirstLaunch();
         } finally {
             deleteRecursively(baseTempDir);
         }
@@ -547,8 +559,14 @@ public final class SelfTest {
         int confirmProfileClearCount = 0;
         boolean confirmProfileClearAnswer = false;
         String confirmProfileClearSubject;
+        boolean interactiveMenusEnabled = false;
         final List<String> promptTasks = new ArrayList<>();
         final List<String> commandHelps = new ArrayList<>();
+
+        @Override
+        public boolean interactiveMenus() {
+            return interactiveMenusEnabled;
+        }
 
         @Override
         public void setPromptTask(String task) {
@@ -2367,7 +2385,7 @@ public final class SelfTest {
             CapturedStream err = capturingStream();
             PlainTerminalUi helpUi = new PlainTerminalUi(reader(""), capturingStream().stream,
                     err.stream);
-            helpUi.showHelp();
+            helpUi.showFullHelp();
             expect("справка plain-режима содержит /tokens и /stats",
                     err.text().contains("/tokens") && err.text().contains("/stats"));
             store.close();
@@ -2888,11 +2906,12 @@ public final class SelfTest {
         }
 
         String help = TerminalUi.chatIndex(80);
-        expect("справка /help — компактный индекс по группам одной строкой",
+        expect("полный индекс /help all — по группам, с назначением каждой",
                 help.contains("Память") && help.contains("Контекст")
                         && help.contains("Статистика")
                         && help.contains("/memory") && help.contains("/context")
-                        && help.lines().count() <= 10);
+                        && help.contains("/status")
+                        && help.lines().count() <= 18);
         expect("внизу справки — подсказка /help <команда> и навигация",
                 help.contains("/help <команда>") && help.contains("Tab"));
     }
@@ -6356,6 +6375,12 @@ public final class SelfTest {
         return new LlmAgent(config, ModelSettings.from(env), client, store, memory);
     }
 
+    /** Временный профиль для проверок без API: реальный profile.json не трогается. */
+    private static ProfileStore tempProfileStoreForTests() throws IOException {
+        return new ProfileStore(Files.createTempDirectory(baseTempDir, "prof-")
+                .resolve("profile.json"));
+    }
+
     /** Три слоя хранятся отдельно: отдельный файл, формат, валидация при чтении. */
     private static void checkMemoryLayerSeparation() throws IOException {        Path memoryFile = Files.createTempDirectory(baseTempDir, "mem-")
                 .resolve("memory.json");
@@ -6534,6 +6559,365 @@ public final class SelfTest {
             expect("сообщение /clear сообщает о сохранении долговременной памяти",
                     ui.systems.stream().anyMatch(t ->
                             t.contains("Долговременная память сохранена")));
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /**
+     * Конечный автомат задачи (модель, без API): допустимые и недопустимые
+     * переходы этапов и статусов, пауза/продолжение без потерь, ошибки.
+     */
+    private static void checkTaskStateMachineModel() {
+        Instant now = Instant.parse("2026-01-01T00:00:00Z");
+        TaskState started = TaskState.start("подготовить отчёт к среде", now);
+        expect("start создаёт задачу: planning, active, шаг и ожидаемое действие заданы",
+                started.stage() == TaskStage.PLANNING
+                        && started.status() == TaskStatus.ACTIVE
+                        && "сформулировать план".equals(started.currentStep())
+                        && "агент предлагает план".equals(started.expectedAction())
+                        && started.completedSteps().isEmpty()
+                        && "подготовить отчёт к среде".equals(started.description())
+                        && !started.updatedAt().isBlank());
+
+        expect("переходы вперёд planning → execution → validation → done допустимы",
+                TaskStage.PLANNING.canTransitionTo(TaskStage.EXECUTION)
+                        && TaskStage.EXECUTION.canTransitionTo(TaskStage.VALIDATION)
+                        && TaskStage.VALIDATION.canTransitionTo(TaskStage.DONE));
+        expect("пропуск этапов запрещён (planning → validation/done, execution → done)",
+                !TaskStage.PLANNING.canTransitionTo(TaskStage.VALIDATION)
+                        && !TaskStage.PLANNING.canTransitionTo(TaskStage.DONE)
+                        && !TaskStage.EXECUTION.canTransitionTo(TaskStage.DONE)
+                        && !TaskStage.VALIDATION.canTransitionTo(TaskStage.PLANNING));
+        expect("DONE → planning запрещён: это новая задача, а не продолжение",
+                !TaskStage.DONE.canTransitionTo(TaskStage.PLANNING)
+                        && !TaskStage.DONE.canTransitionTo(TaskStage.EXECUTION));
+        expect("возврат validation → execution разрешён как исключение и помечен обратным",
+                TaskStage.VALIDATION.canTransitionTo(TaskStage.EXECUTION)
+                        && TaskStage.VALIDATION.isBackwardTransitionTo(TaskStage.EXECUTION)
+                        && !TaskStage.EXECUTION.isBackwardTransitionTo(TaskStage.VALIDATION));
+
+        TaskState execution = started.withStage(TaskStage.EXECUTION, null, now);
+        expect("переход на execution переносит плановый шаг в выполненные",
+                execution.stage() == TaskStage.EXECUTION
+                        && execution.currentStep() == null
+                        && execution.completedSteps().contains("сформулировать план"));
+        expect("исходное состояние не изменяется (record)", started.stage() == TaskStage.PLANNING
+                && started.currentStep() != null);
+
+        TaskState validation = execution.withStage(TaskStage.VALIDATION, null, now);
+        expect("возврат validation → execution без причины отклоняется",
+                expectError(() -> validation.withStage(TaskStage.EXECUTION, null, now))
+                        .contains("причины"));
+        TaskState back = validation.withStage(TaskStage.EXECUTION,
+                "итоговые цифры не сошлись", now);
+        expect("возврат validation → execution с причиной разрешён",
+                back.stage() == TaskStage.EXECUTION);
+        TaskState done = validation.withStage(TaskStage.DONE, null, now);
+        expect("DONE → planning даёт понятную ошибку с подсказкой /task start",
+                expectError(() -> done.withStage(TaskStage.PLANNING, null, now))
+                        .contains("/task start"));
+
+        TaskState stepped = execution.withStep("собрать цифры", now);
+        TaskState paused = stepped.withStatus(TaskStatus.PAUSED, now);
+        expect("пауза сохраняет этап, текущий шаг и выполненные шаги",
+                paused.status() == TaskStatus.PAUSED
+                        && paused.stage() == TaskStage.EXECUTION
+                        && "собрать цифры".equals(paused.currentStep())
+                        && paused.completedSteps().contains("сформулировать план"));
+        TaskState resumed = paused.withStatus(TaskStatus.ACTIVE, now);
+        expect("resume восстанавливает состояние без потерь",
+                resumedEqualsPaused(resumed, paused));
+        TaskState blocked = stepped.withStatus(TaskStatus.BLOCKED, now);
+        expect("блокировка возможна из active", blocked.status() == TaskStatus.BLOCKED);
+        expect("переход пауза → блокировка напрямую запрещён",
+                expectError(() -> paused.withStatus(TaskStatus.BLOCKED, now))
+                        .contains("не разрешён"));
+        expect("повторная пауза отклоняется с подсказкой /task resume",
+                expectError(() -> paused.withStatus(TaskStatus.PAUSED, now))
+                        .contains("/task resume"));
+        expect("unblock возвращает активный статус",
+                blocked.withStatus(TaskStatus.ACTIVE, now).status() == TaskStatus.ACTIVE);
+    }
+
+    /** Сравнение после resume и перед паузой: все поля, кроме статуса (ACTIVE после resume). */
+    private static boolean resumedEqualsPaused(TaskState resumed, TaskState paused) {
+        return resumed.stage() == paused.stage()
+                && resumed.status() == TaskStatus.ACTIVE
+                && java.util.Objects.equals(resumed.currentStep(), paused.currentStep())
+                && java.util.Objects.equals(resumed.expectedAction(), paused.expectedAction())
+                && resumed.completedSteps().equals(paused.completedSteps())
+                && java.util.Objects.equals(resumed.description(), paused.description());
+    }
+
+    /** Сообщение AgentException, если действие отклонено; "" — не отклонено. */
+    private static String expectError(java.util.function.Supplier<?> action) {
+        try {
+            action.get();
+            return "";
+        } catch (AgentException e) {
+            return e.getMessage();
+        }
+    }
+
+    /**
+     * Команды /task (без вызова API): start, stage, step, expect, pause,
+     * resume, block, unblock, status, clear; недопустимые переходы отклоняются.
+     */
+    private static void checkTaskStateCommands() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        AtomicInteger hitCounter = new AtomicInteger();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            hitCounter.incrementAndGet();
+            return new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                    + "\"content\":\"Ок\"}}]}").getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort()
+                            + "/v1/chat/completions", "glm-5.3-flash");
+            LlmAgent agent = newMemoryAgent(config, trustedHttpClient(keyStore),
+                    new java.util.HashMap<>());
+
+            FakeUi startUi = new FakeUi(
+                    TerminalUi.Input.command("/task start подготовить отчёт к среде"),
+                    TerminalUi.Input.command("/task status"),
+                    TerminalUi.Input.command("/task"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(startUi, agent, "glm-5.3-flash");
+            TaskState started = agent.taskState();
+            expect("start создаёт состояние planning/active",
+                    started.stage() == TaskStage.PLANNING
+                            && started.status() == TaskStatus.ACTIVE
+                            && "подготовить отчёт к среде".equals(started.description()));
+            expect("подтверждение start в едином стиле",
+                    startUi.systems.stream().anyMatch(t -> t.contains("✓ Задача задана")));
+            expect("/task status показывает этап, статус, шаг и ожидаемое действие",
+                    startUi.systems.stream().anyMatch(t -> t.contains("Состояние задачи")
+                            && t.contains("planning") && t.contains("active")
+                            && t.contains("сформулировать план")
+                            && t.contains("агент предлагает план")));
+            expect("короткий /task показывает описание задачи",
+                    startUi.systems.stream().anyMatch(t ->
+                            t.contains("Задача: подготовить отчёт к среде")));
+            expect("команды /task не вызывают API", hitCounter.get() == 0);
+
+            FakeUi stageUi = new FakeUi(
+                    TerminalUi.Input.command("/task stage validation"),
+                    TerminalUi.Input.command("/task stage execution"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(stageUi, agent, "glm-5.3-flash");
+            expect("пропуск этапа planning → validation отклоняется",
+                    stageUi.errors.stream().anyMatch(t -> t.contains("planning → validation")
+                            && t.contains("не разрешён")));
+            expect("ошибочный переход не меняет состояние, допустимый проходит",
+                    agent.taskState().stage() == TaskStage.EXECUTION
+                            && agent.taskState().completedSteps().contains("сформулировать план")
+                            && stageUi.systems.stream().anyMatch(t ->
+                            t.contains("✓ Задача переведена на этап execution")));
+
+            FakeUi stepsUi = new FakeUi(
+                    TerminalUi.Input.command("/task step собрать цифры"),
+                    TerminalUi.Input.command("/task expect агент готовит таблицу"),
+                    TerminalUi.Input.command("/task step свести таблицу"),
+                    TerminalUi.Input.command("/task status"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(stepsUi, agent, "glm-5.3-flash");
+            TaskState stepped = agent.taskState();
+            expect("текущий шаг задан, прежний перенесён в выполненные",
+                    "свести таблицу".equals(stepped.currentStep())
+                            && stepped.completedSteps().contains("сформулировать план")
+                            && stepped.completedSteps().contains("собрать цифры"));
+            expect("ожидаемое действие задано",
+                    "агент готовит таблицу".equals(stepped.expectedAction())
+                            && stepsUi.systems.stream().anyMatch(t ->
+                            t.contains("✓ Ожидаемое действие: «агент готовит таблицу»")));
+            expect("/task status показывает выполненные шаги",
+                    stepsUi.systems.stream().anyMatch(t -> t.contains("выполненные шаги (2)")
+                            && t.contains("- собрать цифры")));
+
+            FakeUi pauseUi = new FakeUi(
+                    TerminalUi.Input.command("/task pause"),
+                    TerminalUi.Input.command("/task resume"),
+                    TerminalUi.Input.command("/task block"),
+                    TerminalUi.Input.command("/task unblock"),
+                    TerminalUi.Input.command("/task pause"),
+                    TerminalUi.Input.command("/task resume"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(pauseUi, agent, "glm-5.3-flash");
+            TaskState resumed = agent.taskState();
+            expect("пауза и resume сохраняют и восстанавливают состояние",
+                    "ACTIVE".equals(resumed.status().name())
+                            && "свести таблицу".equals(resumed.currentStep())
+                            && "агент готовит таблицу".equals(resumed.expectedAction())
+                            && resumed.completedSteps().size() == 2
+                            && "подготовить отчёт к среде".equals(resumed.description()));
+            expect("подтверждение паузы даёт подсказку /task resume",
+                    pauseUi.systems.stream().anyMatch(t -> t.contains("на паузе")
+                            && t.contains("/task resume")));
+            expect("подтверждение блокировки даёт подсказку /task unblock",
+                    pauseUi.systems.stream().anyMatch(t -> t.contains("blocked")
+                            && t.contains("/task unblock")));
+
+            FakeUi stage2Ui = new FakeUi(
+                    TerminalUi.Input.command("/task stage validation"),
+                    TerminalUi.Input.command("/task stage execution"),
+                    TerminalUi.Input.command("/task stage execution проверка не прошла"),
+                    TerminalUi.Input.command("/task status"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(stage2Ui, agent, "glm-5.3-flash");
+            TaskState state2 = agent.taskState();
+            expect("возврат validation → execution с причиной разрешён явно",
+                    "EXECUTION".equals(state2.stage().name())
+                            && state2.expectedAction().contains("устранить: проверка не прошла"));
+            expect("возврат без причины отклонён (причина обязательна)",
+                    stage2Ui.errors.stream().anyMatch(t -> t.contains("причины")));
+
+            FakeUi doneUi = new FakeUi(
+                    TerminalUi.Input.command("/task stage validation"),
+                    TerminalUi.Input.command("/task stage done"),
+                    TerminalUi.Input.command("/task stage planning"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(doneUi, agent, "glm-5.3-flash");
+            expect("этап done подтверждается",
+                    agent.taskState().stage() == TaskStage.DONE
+                            && doneUi.systems.stream().anyMatch(t ->
+                            t.contains("✓ Задача переведена на этап done")));
+            expect("DONE → planning отклоняется: это новая задача",
+                    agent.taskState().stage() == TaskStage.DONE
+                            && doneUi.errors.stream().anyMatch(t ->
+                            t.contains("завершённая задача не продолжается")));
+
+            FakeUi clearUi = new FakeUi(
+                    TerminalUi.Input.command("/task clear"),
+                    TerminalUi.Input.command("/task"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(clearUi, agent, "glm-5.3-flash");
+            expect("/task clear стирает состояние задачи",
+                    agent.taskState() == null && agent.currentTask() == null
+                            && clearUi.systems.stream().anyMatch(t ->
+                            t.contains("✓ Задача очищена")));
+            expect("после очистки /task сообщает об отсутствии задачи",
+                    clearUi.systems.stream().anyMatch(t -> t.contains("Задача не задана")));
+            expect("команды состояния задачи по-прежнему не вызывают API",
+                    hitCounter.get() == 0);
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /**
+     * Блок «СОСТОЯНИЕ ЗАДЧИ» в system-сообщении: пустое состояние — блока нет;
+     * заданное — этап/статус/шаг/действие/выполненные; пауза и блокировка
+     * дают свои правила поведения модели.
+     */
+    private static void checkTaskStateBlockInSystemMessage() {
+        ModelSettings settings = ModelSettings.defaults();
+        UserProfile emptyProfile = UserProfile.empty();
+        Map<String, MemoryEntry> emptyMemory = new LinkedHashMap<>();
+        Instant now = Instant.parse("2026-01-01T00:00:00Z");
+
+        ChatMessage withoutTask = ContextBuilder.systemContextMessage(settings,
+                emptyProfile, emptyMemory, null, Map.of(), null, null);
+        expect("пустое состояние (задачи нет) — блока «СОСТОЯНИЕ ЗАДАЧИ» нет",
+                !withoutTask.content().contains("СОСТОЯНИЕ ЗАДАЧИ"));
+
+        TaskState active = TaskState
+                .start("подготовить отчёт к среде", now)
+                .withStage(TaskStage.EXECUTION, null, now)
+                .withStep("собрать цифры", now)
+                .withExpectedAction("агент готовит таблицу", now);
+        ChatMessage withTask = ContextBuilder.systemContextMessage(settings,
+                emptyProfile, emptyMemory, active, Map.of(), null, null);
+        String block = withTask.content();
+        expect("заданное состояние подставлено блоком с заголовком",
+                block.contains("<<<СОСТОЯНИЕ ЗАДАЧИ"));
+        expect("в блоке этап и статус как инструкции",
+                block.contains("Сейчас этап EXECUTION") && block.contains("статус ACTIVE"));
+        expect("в блоке текущий шаг и ожидаемое действие",
+                block.contains("Текущий шаг: собрать цифры")
+                        && block.contains("Ожидаемое действие: агент готовит таблицу"));
+        expect("в блоке выполненные шаги", block.contains("сформулировать план"));
+        expect("правило неповторения выполненных шагов после resume в блоке",
+                block.contains("выполненные шаги не повторяй"));
+
+        ChatMessage pausedSystem = ContextBuilder.systemContextMessage(settings,
+                emptyProfile, emptyMemory,
+                active.withStatus(TaskStatus.PAUSED, now), Map.of(), null, null);
+        String pausedBlock = pausedSystem.content();
+        expect("на паузе блок требует ждать /task resume и не продолжать выполнение",
+                pausedBlock.contains("статус PAUSED")
+                        && pausedBlock.contains("НЕ продолжай выполнение задачи")
+                        && pausedBlock.contains("/task resume"));
+        expect("формулировка паузы прежняя (подтверждена живым прогоном), не задет",
+                pausedBlock.contains("не решай сам, что")
+                        && pausedBlock.contains("задача на паузе"));
+
+        ChatMessage blockedSystem = ContextBuilder.systemContextMessage(settings,
+                emptyProfile, emptyMemory,
+                active.withStatus(TaskStatus.BLOCKED, now), Map.of(), null, null);
+        String blockedBlock = blockedSystem.content();
+        expect("в блокировке блок требует ТОЛЬКО запросить недостающее",
+                blockedBlock.contains("статус BLOCKED")
+                        && blockedBlock.contains("ТОЛЬКО запрос недостающих")
+                        && blockedBlock.contains("В ответе"));
+        expect("в блокировке явный запрет продолжать: не выполняй другие шаги, "
+                        + "не пиши код, не помечай шаги выполненными",
+                blockedBlock.contains("НЕ выполняй другие шаги задачи")
+                        && blockedBlock.contains("НЕ пиши код")
+                        && blockedBlock.contains("НЕ помечай шаги выполненными")
+                        && blockedBlock.contains("только после снятия блокировки"));
+        expect("в блокировке нет прежней слабой формулировки «запрашивай … в каждом ответе»",
+                !blockedBlock.contains("запрашивай недостающие сведения в каждом ответе"));
+    }
+
+    /**
+     * Блок состояния задачи реально уходит в запрос на локальном сервере
+     * (в том числе на паузе и после resume) и стирается /clear.
+     */
+    private static void checkTaskStatePauseResumeInRequest() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        AtomicReference<String> lastBody = new AtomicReference<>();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            lastBody.set(requestBody);
+            return new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                    + "\"content\":\"Ок\"}}]}").getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort()
+                            + "/v1/chat/completions", "glm-5.3-flash");
+            LlmAgent agent = newMemoryAgent(config, trustedHttpClient(keyStore),
+                    new java.util.HashMap<>());
+
+            agent.taskStart("подготовить отчёт к среде");
+            agent.taskStage("execution", null);
+            agent.taskStep("собрать цифры продаж");
+            agent.taskPause();
+            agent.ask("какая погода?");
+            String pausedSystem = MAPPER.readTree(lastBody.get()).path("messages")
+                    .get(0).path("content").asText();
+            expect("на паузе запрос содержит правила ожидания /task resume",
+                    pausedSystem.contains("<<<СОСТОЯНИЕ ЗАДАЧИ")
+                            && pausedSystem.contains("статус PAUSED")
+                            && pausedSystem.contains("/task resume"));
+            expect("этап и шаг задачи подставлены в запрос",
+                    pausedSystem.contains("этап EXECUTION")
+                            && pausedSystem.contains("Текущий шаг: собрать цифры продаж"));
+
+            agent.taskResume();
+            agent.ask("продолжаем работу");
+            String resumedSystem = MAPPER.readTree(lastBody.get()).path("messages")
+                    .get(0).path("content").asText();
+            expect("после resume запрос содержит активный статус и текущий шаг",
+                    resumedSystem.contains("статус ACTIVE")
+                            && resumedSystem.contains("Текущий шаг: собрать цифры продаж")
+                            && resumedSystem.contains("Выполнено ранее"));
+
+            agent.resetConversation();
+            expect("/clear стирает состояние задачи", agent.taskState() == null);
         } finally {
             server.stop(0);
             Files.deleteIfExists(keyStore);
@@ -6929,5 +7313,280 @@ public final class SelfTest {
                             && state.branches() != null
                             && state.branches().active().equals("main"));
         }
+    }
+
+    // ================= Ведущий интерфейс: справка, подсказки, меню =================
+
+    /** /help короткий (не стена), /help all полный, у групп — назначение. */
+    private static void checkShortHelpAndFullIndex() {
+        String shortHelp = TerminalUi.shortHelp();
+        String[] lines = shortHelp.split("\n", -1);
+        expect("короткая /help умещается в 8 строк", lines.length <= 8);
+        expect("короткая /help отсылает к полному списку",
+                shortHelp.contains("/help all"));
+        expect("короткая /help показывает /task start, /remember и /profile name",
+                shortHelp.contains("/task start") && shortHelp.contains("/remember")
+                        && shortHelp.contains("/profile name"));
+        expect("короткая /help сообщает количество остальных команд",
+                shortHelp.matches("(?s).*ещё \\d+ .*: /help all.*"));
+
+        String full = TerminalUi.chatIndex(80);
+        for (String group : new String[]{"Память", "Профиль", "Контекст", "Диалог",
+                "Режимы", "Статистика", "Прочее"}) {
+            expect("полный индекс содержит группу «" + group + "»",
+                    full.contains(group));
+        }
+        expect("полный индекс объясняет назначение групп",
+                full.contains("что агент помнит") && full.contains("что уходит в запрос"));
+        expect("полный индекс содержит /status", full.contains("/status"));
+
+        // Вывод plain-терминала: /help короткий, /help all полный.
+        CapturedStream out = capturingStream();
+        CapturedStream err = capturingStream();
+        new PlainTerminalUi(reader(""), out.stream, err.stream).showHelp();
+        CapturedStream outAll = capturingStream();
+        CapturedStream errAll = capturingStream();
+        new PlainTerminalUi(reader(""), outAll.stream, errAll.stream).showFullHelp();
+        String helpText = err.text();
+        String fullText = errAll.text();
+        expect("plain /help выводит короткую справку без стены групп",
+                helpText.contains("/task start") && helpText.contains("/help all")
+                        && !helpText.contains("Память"));
+        expect("plain /help all выводит полный индекс",
+                fullText.contains("Память") && fullText.contains("Статистика"));
+    }
+
+    /** Подсказка следующего шага после /task start, /profile, /skill, /remember. */
+    private static void checkNextHints() throws Exception {
+        LlmAgent agent = new LlmAgent(new Config("test-key",
+                "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash"),
+                ModelSettings.defaults(),
+                java.net.http.HttpClient.newHttpClient(),
+                new JsonConversationStore(Files.createTempDirectory(baseTempDir, "hist-")
+                        .resolve("conversation.json")),
+                tempMemoryStore(), tempProfileStoreForTests());
+
+        FakeUi ui = new FakeUi(
+                TerminalUi.Input.command("/task start сверить параметры проекта"),
+                TerminalUi.Input.command("/profile name Алексей"),
+                TerminalUi.Input.command("/remember кодовое слово: ЯКОРЬ-42"),
+                TerminalUi.Input.command("/skill add \"карточка фичи\" название, цель, шаги"),
+                TerminalUi.Input.command("/exit"));
+        ui.interactiveMenusEnabled = true; // краткая форма работает и с меню включёнными
+        Main.runLoop(ui, agent, "glm-5.3-flash");
+        String systems = String.join("\n", ui.systems);
+        expect("после /task start подсказка следующего шага (/task stage execution)",
+                ui.systems.stream().anyMatch(t -> t.contains("✓ Задача задана")
+                        && t.contains("/task stage execution")));
+        expect("после /profile name — подсказка следующих полей профиля",
+                systems.contains("/profile style|format|constraint"));
+        expect("после /remember — подсказка /memory",
+                systems.contains("Дальше: /memory — посмотреть записи"));
+        expect("после /skill add — подсказка /pipeline",
+                systems.contains("Дальше: /pipeline"));
+        expect("краткая форма /task start создала состояние",
+                agent.taskState() != null);
+    }
+
+    /** Интерактивные меню /profile и /task без аргументов (FakeUi с меню). */
+    private static void checkInteractiveMenus() throws Exception {
+        // Агент без API: команды меню не вызывают API.
+        LlmAgent agent = new LlmAgent(new Config("test-key",
+                "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash"),
+                ModelSettings.defaults(),
+                java.net.http.HttpClient.newHttpClient(),
+                new JsonConversationStore(Files.createTempDirectory(baseTempDir, "hist-")
+                        .resolve("conversation.json")),
+                tempMemoryStore(), tempProfileStoreForTests());
+
+        FakeUi profileUi = new FakeUi(
+                TerminalUi.Input.command("/profile"),
+                TerminalUi.Input.command("1"),
+                TerminalUi.Input.command("Алексей"),
+                TerminalUi.Input.command("/status"),
+                TerminalUi.Input.command("/exit"));
+        profileUi.interactiveMenusEnabled = true;
+        Main.runLoop(profileUi, agent, "glm-5.3-flash");
+        expect("/profile без аргументов открывает меню выбора поля",
+                profileUi.systems.stream().anyMatch(t ->
+                        t.contains("1) обращение 2) стиль 3) формат")));
+        expect("выбор пункта запрашивает значение",
+                profileUi.systems.stream().anyMatch(t ->
+                        t.contains("Введите обращение")));
+        expect("значение применено без памяти синтаксиса",
+                "Алексей".equals(agent.userProfile().name())
+                        && profileUi.systems.stream().anyMatch(t ->
+                        t.contains("✓ Профиль обновлён: name")));
+        expect("мусорного ввода в меню нет: выбор 1 и имя не попали в историю",
+                agent.getHistory().isEmpty());
+
+        FakeUi taskUi = new FakeUi(
+                TerminalUi.Input.command("/task"),
+                TerminalUi.Input.command("1"),
+                TerminalUi.Input.command("подготовить отчёт к среде"),
+                TerminalUi.Input.command("/task"),
+                TerminalUi.Input.command("4"),
+                TerminalUi.Input.command("/task status"),
+                TerminalUi.Input.command("/exit"));
+        taskUi.interactiveMenusEnabled = true;
+        Main.runLoop(taskUi, agent, "glm-5.3-flash");
+        expect("/task без аргументов открывает меню",
+                taskUi.systems.stream().anyMatch(t ->
+                        t.contains("1) начать 2) этап 3) шаг")));
+        expect("меню: начало задачи по номеру без синтаксиса",
+                "подготовить отчёт к среде".equals(agent.taskState().description()));
+        expect("меню: пауза по номеру 4",
+                agent.taskState().status() == TaskStatus.PAUSED
+                        && taskUi.systems.stream().anyMatch(t ->
+                        t.contains("✓ Задача на паузе")));
+        expect("меню: короткая форма по-прежнему работает штатно",
+                agent.getHistory().isEmpty());
+    }
+
+    /** В неинтерактивном (--plain) меню не запускаются: показывается синтаксис. */
+    private static void checkPlainMenusDisabledWithSyntaxHint() throws Exception {
+        LlmAgent agent = new LlmAgent(new Config("test-key",
+                "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash"),
+                ModelSettings.defaults(),
+                java.net.http.HttpClient.newHttpClient(),
+                new JsonConversationStore(Files.createTempDirectory(baseTempDir, "hist-")
+                        .resolve("conversation.json")),
+                tempMemoryStore(), tempProfileStoreForTests());
+        agent.setProfileName("Шеф");
+
+        FakeUi plainUi = new FakeUi(
+                TerminalUi.Input.command("/profile"),
+                TerminalUi.Input.command("/task"),
+                TerminalUi.Input.command("/exit"));
+        // interactiveMenusEnabled=false (по умолчанию) — как PlainTerminalUi.
+        Main.runLoop(plainUi, agent, "glm-5.3-flash");
+        String systems = String.join("\n", plainUi.systems);
+        expect("в plain-режиме нет пошагового меню профиля",
+                !systems.contains("1) обращение"));
+        expect("в plain-режиме есть подсказка точного синтаксиса",
+                systems.contains("/profile name|style|format|constraint")
+                        && systems.contains("/task start <описание>"));
+        expect("в plain-режиме меню задач не запускается",
+                !systems.contains("1) начать 2) этап"));
+        expect("профиль не изменился опросом", "Шеф".equals(agent.userProfile().name()));
+        expect("состояние задачи создано только явно", agent.taskState() == null);
+    }
+
+    /** Опечатки ведут к подсказке: неизвестная команда и неверный этап. */
+    private static void checkTypoSuggestions() throws Exception {
+        LlmAgent agent = new LlmAgent(new Config("test-key",
+                "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash"),
+                ModelSettings.defaults(),
+                java.net.http.HttpClient.newHttpClient(),
+                new JsonConversationStore(Files.createTempDirectory(baseTempDir, "hist-")
+                        .resolve("conversation.json")),
+                tempMemoryStore(), tempProfileStoreForTests());
+
+        expect("опечатка /profil ловится подсказкой /profile",
+                "/profile".equals(Main.closestCommand("/profil")));
+        expect("опечатка /таск не даёт ложного совпадения без схемы",
+                Main.closestCommand("/totally-unknown-cmd") == null);
+        FakeUi ui = new FakeUi(
+                TerminalUi.Input.command("/profil"),
+                TerminalUi.Input.command("/task start сверить параметры"),
+                TerminalUi.Input.command("/task stage foo"),
+                TerminalUi.Input.command("/exit"));
+        ui.interactiveMenusEnabled = false;
+        Main.runLoop(ui, agent, "glm-5.3-flash");
+        expect("неизвестная команда подсказывает ближайщую",
+                ui.systems.stream().anyMatch(t -> t.contains("Неизвестная команда: /profil")
+                        && t.contains("/profile")));
+        expect("неверный этап даёт список допустимых",
+                ui.errors.stream().anyMatch(t -> t.contains("Допустимые этапы")
+                        && t.contains("planning, execution, validation, done")));
+        expect("ошибочный этап не изменил состояние",
+                agent.taskState().stage() == TaskStage.PLANNING);
+    }
+
+    /** /status — обзор одним экраном, с подсказками, без вызова API. */
+    private static void checkStatusOverview() throws Exception {
+        LlmAgent agent = new LlmAgent(new Config("test-key",
+                "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash"),
+                ModelSettings.defaults(),
+                java.net.http.HttpClient.newHttpClient(),
+                new JsonConversationStore(Files.createTempDirectory(baseTempDir, "hist-")
+                        .resolve("conversation.json")),
+                tempMemoryStore(), tempProfileStoreForTests());
+        agent.remember("кодовое слово: ЯКОРЬ-42");
+        agent.setProfileName("Шеф");
+        agent.taskStart("подготовить отчёт к среде");
+
+        AtomicInteger hits = new AtomicInteger();
+        Path keyStore = createSelfSignedKeyStore();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            hits.incrementAndGet();
+            return new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                    + "\"content\":\"Ок\"}}]}").getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            FakeUi ui = new FakeUi(TerminalUi.Input.command("/status"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(ui, agent, "glm-5.3-flash");
+            expect("/status без вызова API", hits.get() == 0);
+            String systems = String.join("\n", ui.systems);
+            expect("/status показывает задачу с этапом и статусом",
+                    systems.contains("подготовить отчёт к среде")
+                            && systems.contains("этап planning")
+                            && systems.contains("статус active"));
+            expect("/status показывает профиль и память",
+                    systems.contains("обращение «Шеф»") && systems.contains("память: 1"));
+            expect("/status подсказывает, как изменить каждую строку",
+                    systems.contains("/mode fast|balanced|detailed")
+                            && systems.contains("/strategy, /context")
+                            && systems.contains("/limit")
+                            && systems.contains("/task status")
+                            && systems.contains("/stats"));
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Онбординг при первом запуске и его отсутствие на повторном. */
+    private static void checkOnboardingFirstLaunch() throws IOException {
+        ProfileStore freshProfile = new ProfileStore(
+                Files.createTempDirectory(baseTempDir, "prof-").resolve("profile.json"));
+        JsonConversationStore freshHistory = new JsonConversationStore(
+                Files.createTempDirectory(baseTempDir, "hist-")
+                        .resolve("conversation.json"));
+        LlmAgent fresh = new LlmAgent(new Config("test-key",
+                "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash"),
+                ModelSettings.defaults(),
+                java.net.http.HttpClient.newHttpClient(),
+                freshHistory, tempMemoryStore(), freshProfile);
+        expect("первый запуск: профиль отсутствует и история пуста",
+                Main.firstLaunch(fresh));
+
+        fresh.setProfileName("Шеф");
+        expect("повторный запуск: профиль сохранён — онбординга не будет",
+                !Main.firstLaunch(fresh));
+
+        String onboarding = TerminalUi.firstRunOnboarding();
+        String[] lines = onboarding.split("\n", -1);
+        expect("онбординг короткий (не больше 6 строк)", lines.length <= 6);
+        expect("онбординг показывает примеры и ссылку на /help",
+                onboarding.contains("/task start") && onboarding.contains("/remember")
+                        && onboarding.contains("Подробности: /help"));
+
+        // Метка первого запуска снята фактически: файл профиля на диске существует.
+        expect("после установки поля профиль записан (метка первого запуска снята)",
+                Files.exists(freshProfile.file()));
+
+        // Plain-терминал: онбординг только при первом запуске.
+        CapturedStream err = capturingStream();
+        new PlainTerminalUi(reader(""), capturingStream().stream, err.stream)
+                .showWelcome("test-model", true);
+        CapturedStream errAgain = capturingStream();
+        new PlainTerminalUi(reader(""), capturingStream().stream, errAgain.stream)
+                .showWelcome("test-model", false);
+        expect("онбординг показывается при первом запуске",
+                err.text().contains("Привет! Я агент с памятью и задачами."));
+        expect("повторный запуск — без онбординга",
+                !errAgain.text().contains("Привет! Я агент с памятью"));
     }
 }
