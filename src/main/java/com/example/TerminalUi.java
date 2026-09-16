@@ -43,6 +43,20 @@ public interface TerminalUi extends AutoCloseable {
     void showWelcome(String model);
 
     /**
+     * Компактный старт с признаком первого запуска: без расшифровки —
+     * просто showWelcome(model); реализация с поддержкой онбординга
+     * добавляет примеры при первом запуске (нет профиля и истории).
+     */
+    default void showWelcome(String model, boolean firstLaunch) {
+        showWelcome(model);
+    }
+
+    /** true, если терминал поддерживает пошаговые меню без точного синтаксиса. */
+    default boolean interactiveMenus() {
+        return false;
+    }
+
+    /**
      * Блокирующее чтение ввода. В многострочном режиме собирает строки
      * в один MESSAGE (до /send или /cancel); служебные строки внутри
      * многострочного режима считаются содержимым сообщения.
@@ -60,6 +74,14 @@ public interface TerminalUi extends AutoCloseable {
 
     /** Справка по командам чата (компактный индекс). */
     void showHelp();
+
+    /**
+     * Полный индекс (/help all): группы с назначением. Реализации
+     * без подробного индекса показывают обычную справку.
+     */
+    default void showFullHelp() {
+        showHelp();
+    }
 
     /**
      * Подробная справка /help <команда>: назначение, использование,
@@ -143,21 +165,38 @@ public interface TerminalUi extends AutoCloseable {
     @Override
     void close();
 
+    /** Онбординг первого запуска: короткий, 5 строк, без стены текста. */
+    static String firstRunOnboarding() {
+        return """
+                Привет! Я агент с памятью и задачами.
+                  · спросить что угодно — просто напишите текст
+                  · /task start <описание> — начну задачу и поведу по этапам
+                  · /remember <факт> — запомню надолго
+                  · /profile name <обращение> — настроюсь под вас
+                Подробности: /help""";
+    }
+
     /**
-     * Компактный индекс справки /help: группы команд в колонках,
-     * уложен примерно в один экран 80×24; при узкой ширине — вертикально.
-     * Единый для всех терминалов.
+     * Компактный индекс справки /help all: группы команд в колонках,
+     * каждая группа — с одной строкой назначения; уложен примерно
+     * в один экран 80×24; при узкой ширине — вертикально. Единый
+     * для всех терминалов.
      */
     static String chatIndex(int width) {
-        record Row(String group, String commands) {}
+        record Row(String group, String commands, String purpose) {}
         Row[] rows = {
-                new Row("Память", "/memory /remember /forget /task /history"),
-                new Row("Профиль", "/profile /skill /pipeline"),
-                new Row("Контекст", "/context /summary /strategy /facts /branch"),
-                new Row("Диалог", "/clear /reset"),
-                new Row("Режимы", "/mode /multiline /paste /demo"),
-                new Row("Статистика", "/tokens /stats /limit"),
-                new Row("Прочее", "/help /exit (также exit, quit)"),
+                new Row("Память", "/memory /remember /forget /task /history",
+                        "что агент помнит: надолго, в рамках задачи и диалога"),
+                new Row("Профиль", "/profile /skill /pipeline",
+                        "как к вам обращаться и как отвечать"),
+                new Row("Контекст", "/context /summary /strategy /facts /branch",
+                        "что уходит в запрос к модели"),
+                new Row("Диалог", "/clear /reset", "удалить текущую историю"),
+                new Row("Режимы", "/mode /multiline /paste /demo",
+                        "формат ответа, длинный ввод, измерения"),
+                new Row("Статистика", "/tokens /stats /limit /status",
+                        "расход и обзор состояния"),
+                new Row("Прочее", "/help /exit (также exit, quit)", ""),
         };
         StringBuilder out = new StringBuilder();
         for (Row row : rows) {
@@ -168,11 +207,60 @@ public interface TerminalUi extends AutoCloseable {
                 for (String c : splitCommands(row.commands())) {
                     out.append("  ").append(c).append('\n');
                 }
+                out.append('\n');
+            }
+            if (!row.purpose().isEmpty()) {
+                out.append("  ").append(row.purpose()).append('\n');
             }
         }
         out.append("/help <команда> — описание и примеры\n");
         out.append("Tab — дополнить · ↑↓ — история · Ctrl+C — отменить ввод");
         return out.toString();
+    }
+
+    /** Все команды индекса: подсчёт «ещё N» и подсказка при опечатках. */
+    static String[] chatCommandNames() {
+        return new String[]{
+                "/help", "/history", "/memory", "/remember", "/forget", "/task",
+                "/profile", "/skill", "/pipeline", "/clear", "/reset",
+                "/mode", "/multiline", "/paste", "/demo",
+                "/context", "/summary", "/strategy", "/facts", "/branch",
+                "/tokens", "/stats", "/limit", "/status", "/exit",
+        };
+    }
+
+    /**
+     * Короткая справка /help: 5 самых частых действий с примерами
+     * и отсылка к полному индексу («ещё N команд: /help all»).
+     * Не стена текста — расширение по мере надобности.
+     */
+    static String shortHelp() {
+        String[] shown = {"/task start", "/remember", "/profile name", "/status"};
+        StringBuilder out = new StringBuilder(
+                """
+                /help — что умеет агент
+                  спросить что угодно        — просто напишите текст
+                  /task start <описание>     — начать задачу (агент ведёт по этапам)
+                  /remember <факт>           — запомнить надолго
+                  /profile name <обращение>  — настроить под себя
+                  /status                    — обзор состояния одним экраном
+                """);
+        int rest = chatCommandNames().length - shown.length - 1; // без /help
+        out.append("ещё ").append(rest).append(' ')
+                .append(pluralRu(rest, "команда", "команды", "команд"))
+                .append(": /help all · /help <команда> — подробности");
+        return out.toString();
+    }
+
+    /** Русская форма числа: одна, несколько (2–4), много. */
+    private static String pluralRu(long count, String one, String few, String many) {
+        long abs = Math.abs(count);
+        long mod10 = abs % 10;
+        long mod100 = abs % 100;
+        if (mod10 == 1 && mod100 != 11) {
+            return one;
+        }
+        return mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14) ? few : many;
     }
 
     private static java.util.List<String> splitCommands(String row) {
@@ -197,17 +285,30 @@ public interface TerminalUi extends AutoCloseable {
         String name = command == null ? "" : UiText.lower(command.trim());
         return switch (name) {
             case "/help" -> """
-                    /help — справка по командам
+                    /help — справка: короткий индекс и подробности
 
                     Использование
-                      /help
-                      /help <команда>
+                      /help            — что умеет агент (коротко)
+                      /help all        — полный список по группам
+                      /help <команда>  — подробности по команде
 
                     Примеры
+                      /help all
                       /help /task
-                      /help /context
 
-                    Связано: любой /команда — короткое описание в индексе.""";
+                    Связано: любая /команда.""";
+            case "/status" -> """
+                    /status — обзор состояния одним экраном (без API)
+
+                    Использование
+                      /status
+
+                    Эффекты
+                      задача (этап/статус), профиль, память, режим ответа,
+                      контекст, лимит и расход сессии — по одной строке
+                      с подсказкой, как изменить каждую.
+
+                    Связано: /task status, /profile, /memory, /stats.""";
             case "/history" -> """
                     /history — история текущего диалога (краткосрочная память)
 
@@ -269,6 +370,7 @@ public interface TerminalUi extends AutoCloseable {
                     /task — состояние задачи: конечный автомат этапов
 
                     Использование
+                      /task                            — состояние; в интерактивном терминале — меню
                       /task start <описание>          — начать (этап planning)
                       /task <текст>                    — короткая форма задания описания
                       /task stage <этап> [причина]     — planning|execution|validation|done

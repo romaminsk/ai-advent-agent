@@ -70,6 +70,16 @@ public final class Main {
         }
     }
 
+    /**
+     * Первый запуск: нет профиля (profile.json не создавался) и нет
+     * сохранённой истории — ситуация онбординга. Повторный запуск
+     * (профиль или история есть) показывает только статусную строку.
+     */
+    static boolean firstLaunch(LlmAgent agent) {
+        return !java.nio.file.Files.exists(agent.profileFile())
+                && !agent.hasRestoredContext();
+    }
+
     /** Основной цикл чата: команды обрабатываются локально, сообщения уходят агенту.
      *  Возвращает код завершения: 0 — обычное окончание, 1 — сбой сохранения контекста.
      *  Пока активен режим измерения токенов (/demo tokens), сообщения и просмотр
@@ -77,7 +87,10 @@ public final class Main {
     static int runLoop(TerminalUi ui, LlmAgent agent, String model) {
         DemoRef demoRef = new DemoRef();
         try {
-            ui.showWelcome(model);
+            // Онбординг — только на первом запуске: нет профиля и нет истории;
+            // повторный запуск получает текущую короткую статусную строку.
+            boolean firstLaunch = firstLaunch(agent);
+            ui.showWelcome(model, firstLaunch);
             // Ход долгих операций (суммаризация) — в терминал во время запроса.
             agent.setProgressListener(ui::showSystem);
             // Краткий старт: приветствие и одна строка статуса. Подробности
@@ -461,7 +474,7 @@ public final class Main {
         try {
             agent.remember(argument);
             ui.showSystem("✓ Сохранено: " + LlmAgent.deriveMemoryKey(argument).key()
-                    + ". Список записей: /memory.");
+                    + ".\n  " + CommandHints.afterRemember());
         } catch (AgentException e) {
             ui.showError(e.getMessage());
         }
@@ -485,7 +498,15 @@ public final class Main {
                 ? argument.substring(head.length()).trim() : "";
         try {
             switch (head) {
-                case "" -> ui.showSystem(formatTaskShort(agent));
+                case "" -> {
+                    ui.showSystem(formatTaskShort(agent));
+                    if (ui.interactiveMenus()) {
+                        interactiveTaskMenu(ui, agent, demoRef);
+                    } else if (agent.taskState() != null) {
+                        ui.showSystem("Действия: /task stage|step|expect|pause|resume|"
+                                + "block|unblock|clear · меню доступно в интерактивном терминале.");
+                    }
+                }
                 case "status" -> ui.showSystem(formatTaskStatus(agent));
                 case "start" -> {
                     if (rest.isEmpty()) {
@@ -495,7 +516,8 @@ public final class Main {
                     TaskState state = agent.taskStart(rest);
                     updatePromptLabels(ui, agent, demoRef);
                     ui.showSystem("✓ Задача задана: «" + state.description()
-                            + "». Этап planning, статус active. Действует до /task clear.");
+                            + "». Этап planning, статус active.\n  "
+                            + CommandHints.afterTaskStart());
                 }
                 case "stage" -> {
                     if (rest.isEmpty()) {
@@ -507,13 +529,11 @@ public final class Main {
                     String[] parts = rest.split("\\s+", 2);
                     String reason = parts.length > 1 ? parts[1] : null;
                     TaskState state = agent.taskStage(parts[0], reason);
-                    if (state.stage() == TaskStage.DONE) {
-                        ui.showSystem("✓ Задача переведена на этап done. Начать новую: "
-                                + "/task start <описание>.");
-                    } else {
-                        ui.showSystem("✓ Задача переведена на этап "
-                                + state.stage().lowerName() + ".");
-                    }
+                    String doneNote = state.stage() == TaskStage.DONE
+                            ? "Начать новую: /task start <описание>." : "";
+                    ui.showSystem("✓ Задача переведена на этап "
+                            + state.stage().lowerName() + "."
+                            + (doneNote.isEmpty() ? "\n  " + CommandHints.afterTaskStage(state.stage()) : doneNote));
                 }
                 case "step" -> {
                     if (rest.isEmpty()) {
@@ -530,7 +550,8 @@ public final class Main {
                         return;
                     }
                     agent.taskExpect(rest);
-                    ui.showSystem("✓ Ожидаемое действие: «" + rest + "».");
+                    ui.showSystem("✓ Ожидаемое действие: «" + rest
+                            + "».\n  " + CommandHints.afterTaskStep());
                 }
                 case "pause" -> {
                     agent.taskPause();
@@ -542,7 +563,8 @@ public final class Main {
                     ui.showSystem("✓ Задача возобновлена: этап " + state.stage().lowerName()
                             + (state.currentStep() != null
                             ? ", текущий шаг «" + state.currentStep() + "»."
-                            : ", текущий шаг не задан (/task step <текст>)."));
+                            : ", текущий шаг не задан (/task step <текст>).")
+                            + "\n  Подробнее: /task status");
                 }
                 case "block" -> {
                     agent.taskBlock();
@@ -552,7 +574,8 @@ public final class Main {
                 case "unblock" -> {
                     TaskState state = agent.taskUnblock();
                     ui.showSystem("✓ Блокировка снята: задача снова активна (этап "
-                            + state.stage().lowerName() + ").");
+                            + state.stage().lowerName() + ").\n  "
+                            + CommandHints.afterTaskStage(state.stage()));
                 }
                 case "clear" -> {
                     agent.clearTask();
@@ -564,7 +587,9 @@ public final class Main {
                     // (как раньше); создаёт либо обновляет описание состояния.
                     agent.setTask(argument);
                     updatePromptLabels(ui, agent, demoRef);
-                    ui.showSystem("✓ Задача задана: «" + argument + "». Действует до /task clear.");
+                    ui.showSystem("✓ Задача задана: «" + argument
+                            + "». Действует до /task clear.\n  "
+                            + CommandHints.afterTaskStart());
                 }
             }
         } catch (AgentException e) {
@@ -581,6 +606,100 @@ public final class Main {
         return "Задача: " + state.description() + "\n  этап: " + state.stage().lowerName()
                 + " · статус: " + state.status().lowerName()
                 + "\n  полное состояние: /task status";
+    }
+
+    /**
+     * Пошаговое меню задачи (/task без аргументов, интерактивный терминал):
+     * начать, этап, шаг, пауза, продолжить, блокировка. Короткая форма
+     * (/task stage execution) — как раньше; меню открывается только
+     * без аргументов.
+     */
+    private static void interactiveTaskMenu(TerminalUi ui, LlmAgent agent, DemoRef demoRef) {
+        String choice;
+        try {
+            while (true) {
+                choice = promptStep(ui, "Задача: 1) начать 2) этап 3) шаг 4) пауза "
+                        + "5) продолжить 6) ожидание данных 7) ничего (Enter — отмена)");
+                if (choice == null) {
+                    ui.showSystem("Действие с задачей отменено.");
+                    return;
+                }
+                switch (choice.toLowerCase(java.util.Locale.ROOT)) {
+                    case "1", "1) начать", "начать", "start" -> {
+                        String description = promptStep(ui, "Опишите задачу:");
+                        if (description == null) {
+                            ui.showSystem("Действие отменено.");
+                            return;
+                        }
+                        TaskState state = agent.taskStart(description);
+                        updatePromptLabels(ui, agent, demoRef);
+                        ui.showSystem("✓ Задача задана: «" + state.description()
+                                + "». Этап planning, статус active.\n  "
+                                + CommandHints.afterTaskStart());
+                        return;
+                    }
+                    case "2", "2) этап", "этап", "stage" -> {
+                        String value = promptStep(ui, "Этап (planning|execution|validation|done)"
+                                + ", для возврата — через пробел причина:");
+                        if (value == null) {
+                            ui.showSystem("Действие отменено.");
+                            return;
+                        }
+                        String[] parts = value.split("\\s+", 2);
+                        TaskState state = agent.taskStage(parts[0],
+                                parts.length > 1 ? parts[1] : null);
+                        String stageNote = state.stage() == TaskStage.DONE
+                                ? "Начать новую: /task start <описание>."
+                                : CommandHints.afterTaskStage(state.stage());
+                        ui.showSystem("✓ Задача переведена на этап "
+                                + state.stage().lowerName() + ".\n  " + stageNote);
+                        return;
+                    }
+                    case "3", "3) шаг", "шаг", "step" -> {
+                        String step = promptStep(ui, "Введите текст текущего шага:");
+                        if (step == null) {
+                            ui.showSystem("Действие отменено.");
+                            return;
+                        }
+                        agent.taskStep(step);
+                        ui.showSystem("✓ Текущий шаг: «" + step + "».\n  "
+                                + CommandHints.afterTaskStep());
+                        return;
+                    }
+                    case "4", "4) пауза", "пауза", "pause" -> {
+                        agent.taskPause();
+                        ui.showSystem("✓ Задача на паузе: этап, шаг и выполненные шаги "
+                                + "сохранены. Продолжение: /task resume.");
+                        return;
+                    }
+                    case "5", "5) продолжить", "продолжить", "resume" -> {
+                        TaskState state = agent.taskResume();
+                        ui.showSystem("✓ Задача возобновлена: этап "
+                                + state.stage().lowerName()
+                                + (state.currentStep() != null
+                                ? ", текущий шаг «" + state.currentStep() + "»."
+                                : ", текущий шаг не задан.")
+                                + "\n  Подробнее: /task status");
+                        return;
+                    }
+                    case "6", "6) ожидание данных", "ожидание данных", "блокировка", "block" -> {
+                        agent.taskBlock();
+                        ui.showSystem("✓ Задача помечена как blocked: модель будет "
+                                + "запрашивать недостающее. Снять: /task unblock.");
+                        return;
+                    }
+                    case "7", "7) ничего", "ничего", "нет" -> {
+                        ui.showSystem("Действие с задачей отменено.");
+                        return;
+                    }
+                    default ->
+                            ui.showSystem("Не понял выбор: «" + choice
+                                    + "». Выберите 1–7 (Enter — отмена).");
+                }
+            }
+        } catch (AgentException e) {
+            ui.showError(e.getMessage());
+        }
     }
 
     /** Текст /task status: полное состояние без вызова API. */
@@ -642,6 +761,71 @@ public final class Main {
         handleProfileCommand(ui, agent, raw, normalized);
     }
 
+    /**
+     * Пошаговое меню профиля (/profile без аргументов в интерактивном
+     * терминале): выбор поля → запрос значения. Короткая форма
+     * /profile name X работает как раньше — меню открывается только
+     * без аргументов.
+     */
+    private static void interactiveProfileMenu(TerminalUi ui, LlmAgent agent) {
+        String choice = promptStep(ui, "Настроить профиль: 1) обращение 2) стиль "
+                + "3) формат 4) ограничение 5) ничего (Enter — отмена)");
+        if (choice == null) {
+            ui.showSystem("Настройка профиля отменена.");
+            return;
+        }
+        try {
+            switch (choice.toLowerCase(java.util.Locale.ROOT)) {
+                case "1", "1) обращение", "обращение", "name" -> {
+                    String value = promptStep(ui, "Введите обращение (как называть вас):");
+                    if (value == null) {
+                        ui.showSystem("Настройка отменена.");
+                        return;
+                    }
+                    agent.setProfileName(value);
+                    ui.showSystem("✓ Профиль обновлён: name → «" + value + "».\n  "
+                            + CommandHints.afterProfileField("name"));
+                }
+                case "2", "2) стиль", "стиль", "style" -> {
+                    String value = promptStep(ui, "Введите стиль ответов:");
+                    if (value == null) {
+                        ui.showSystem("Настройка профиля отменена.");
+                        return;
+                    }
+                    agent.setProfileStyle(value);
+                    ui.showSystem("✓ Профиль обновлён: style → «" + value + "».\n  "
+                            + CommandHints.afterProfileField("style"));
+                }
+                case "3", "3) формат", "формат", "format" -> {
+                    String value = promptStep(ui, "Введите формат ответов:");
+                    if (value == null) {
+                        ui.showSystem("Настройка профиля отменена.");
+                        return;
+                    }
+                    agent.setProfileFormat(value);
+                    ui.showSystem("✓ Профиль обновлён: format → «" + value + "».\n  "
+                            + CommandHints.afterProfileField("format"));
+                }
+                case "4", "4) ограничение", "ограничение", "constraint" -> {
+                    String value = promptStep(ui, "Введите ограничение (чего не делать):");
+                    if (value == null) {
+                        ui.showSystem("Настройка профиля отменена.");
+                        return;
+                    }
+                    agent.addProfileConstraint(value);
+                    ui.showSystem("✓ Профиль обновлён: constraint → «" + value + "».  "
+                            + CommandHints.afterProfileField("constraint"));
+                }
+                case "5", "5) ничего", "ничего", "нет" ->
+                        ui.showSystem("Настройка профиля отменена.");
+                default -> ui.showSystem("Не понял выбор: «" + choice
+                        + "». Использование: /profile name|style|format|constraint <текст>.");
+            }
+        } catch (AgentException e) {
+            ui.showError(e.getMessage());
+        }
+    }
+
     /** /profile: показать профиль или задать поле; сброс — с подтверждением. */
     private static void handleProfileCommand(TerminalUi ui, LlmAgent agent, String raw,
                                              String normalized) {
@@ -650,25 +834,34 @@ public final class Main {
                 : "";
         if (argument.isEmpty()) {
             ui.showSystem(formatProfile(agent));
+            if (ui.interactiveMenus()) {
+                interactiveProfileMenu(ui, agent);
+            } else {
+                ui.showSystem("Настроить: /profile name|style|format|constraint <текст> · "
+                        + "или ответьте на вопросы меню, запустив в интерактивном терминале.");
+            }
             return;
         }
         try {
             if (argument.startsWith("name ")) {
                 String value = argument.substring("name ".length()).trim();
                 agent.setProfileName(value);
-                ui.showSystem("✓ Профиль обновлён: name → «" + value + "».");
+                ui.showSystem("✓ Профиль обновлён: name → «" + value + "»."
+                        + "\n  " + CommandHints.afterProfileField("name"));
                 return;
             }
             if (argument.startsWith("style ")) {
                 String value = argument.substring("style ".length()).trim();
                 agent.setProfileStyle(value);
-                ui.showSystem("✓ Профиль обновлён: style → «" + value + "».");
+                ui.showSystem("✓ Профиль обновлён: style → «" + value + "»."
+                        + "\n  " + CommandHints.afterProfileField("style"));
                 return;
             }
             if (argument.startsWith("format ")) {
                 String value = argument.substring("format ".length()).trim();
                 agent.setProfileFormat(value);
-                ui.showSystem("✓ Профиль обновлён: format → «" + value + "».");
+                ui.showSystem("✓ Профиль обновлён: format → «" + value + "»."
+                        + "\n  " + CommandHints.afterProfileField("format"));
                 return;
             }
             if (argument.equals("constraint")) {
@@ -685,7 +878,8 @@ public final class Main {
             if (argument.startsWith("constraint ")) {
                 String value = argument.substring("constraint ".length()).trim();
                 agent.addProfileConstraint(value);
-                ui.showSystem("✓ Профиль обновлён: constraint → «" + value + "».");
+                ui.showSystem("✓ Профиль обновлён: constraint → «" + value + "»."
+                        + "\n  " + CommandHints.afterProfileField("constraint"));
                 return;
             }
             if (argument.equals("clear")) {
@@ -709,7 +903,17 @@ public final class Main {
     private static void handleSkillCommand(TerminalUi ui, LlmAgent agent, String raw) {
         String argument = valueAfterPrefix(raw, "/skill");
         try {
-            if (argument.isEmpty() || argument.equals("list")) {
+            if (argument.isEmpty()) {
+                ui.showSystem(formatSkills(agent));
+                if (ui.interactiveMenus()) {
+                    interactiveSkillMenu(ui, agent);
+                } else {
+                    ui.showSystem("Действия: /skill add <имя> <описание>, "
+                            + "/skill remove <имя> · меню доступно в интерактивном терминале.");
+                }
+                return;
+            }
+            if (argument.equals("list")) {
                 ui.showSystem(formatSkills(agent));
                 return;
             }
@@ -742,8 +946,8 @@ public final class Main {
                     description = rest.substring(nameEnd).trim();
                 }
                 agent.skillAdd(name, stripOptionalQuotes(description));
-                ui.showSystem("✓ Скилл «" + name + "» сохранён. Пайплайн для скиллов: "
-                        + "/pipeline <триггер> <скиллы>.");
+                ui.showSystem("✓ Скилл «" + name + "» сохранён.\n  "
+                        + CommandHints.afterSkillAdd());
                 return;
             }
             if (argument.startsWith("remove ")) {
@@ -765,6 +969,57 @@ public final class Main {
     }
 
     /**
+     * Пошаговое меню скиллов (/skill без аргументов, интерактивный терминал):
+     * добавить, удалить, иначе — отмена. Список уже показан при входе.
+     */
+    private static void interactiveSkillMenu(TerminalUi ui, LlmAgent agent) {
+        String choice = promptStep(ui, "Скиллы: 1) добавить 2) удалить 3) ничего (Enter — отмена)");
+        if (choice == null) {
+            ui.showSystem("Действие со скиллом отменено.");
+            return;
+        }
+        try {
+            switch (choice.toLowerCase(java.util.Locale.ROOT)) {
+                case "1", "1) добавить", "добавить", "add" -> {
+                    String name = promptStep(ui, "Имя скилла:");
+                    if (name == null) {
+                        ui.showSystem("Действие отменено.");
+                        return;
+                    }
+                    String instructions = promptStep(ui, "Инструкции скилла (что и как делать):");
+                    if (instructions == null) {
+                        ui.showSystem("Действие отменено.");
+                        return;
+                    }
+                    agent.skillAdd(name, instructions);
+                    ui.showSystem("✓ Скилл «" + name + "» сохранён.\n  "
+                            + CommandHints.afterSkillAdd());
+                }
+                case "2", "2) удалить", "удалить", "remove" -> {
+                    String name = promptStep(ui, "Имя скилла для удаления:");
+                    if (name == null) {
+                        ui.showSystem("Действие отменено.");
+                        return;
+                    }
+                    if (agent.skillRemove(stripOptionalQuotes(name))) {
+                        ui.showSystem("✓ Скилл «" + name + "» удалён. Он также вычищен "
+                                + "из пайплайнов.");
+                    } else {
+                        ui.showError("Скилл не найден: «" + name + "». Список: /skill list.");
+                    }
+                }
+                case "3", "3) ничего", "ничего", "нет" ->
+                        ui.showSystem("Действие со скиллом отменено.");
+                default -> ui.showSystem("Не понял выбор: «" + choice
+                        + "». Использование: /skill add <имя> <описание> "
+                        + "или /skill remove <имя>.");
+            }
+        } catch (AgentException e) {
+            ui.showError(e.getMessage());
+        }
+    }
+
+    /**
      * /pipeline <триггер> <скилл1,скилл2,…>; /pipeline list; /pipeline clear.
      * Триггер может быть в кавычках и содержать пробелы; скиллы — через запятую.
      */
@@ -776,7 +1031,17 @@ public final class Main {
                 ? raw.substring("/pipeline".length()).trim()
                 : "";
         try {
-            if (argument.isEmpty() || argument.equals("list")) {
+            if (argument.isEmpty()) {
+                ui.showSystem(formatPipelines(agent));
+                if (ui.interactiveMenus()) {
+                    interactivePipelineMenu(ui, agent);
+                } else {
+                    ui.showSystem("Действия: /pipeline <триггер> <скилл1,скилл2,…>, "
+                            + "/pipeline clear · меню доступно в интерактивном терминале.");
+                }
+                return;
+            }
+            if (argument.equals("list")) {
                 ui.showSystem(formatPipelines(agent));
                 return;
             }
@@ -833,7 +1098,72 @@ public final class Main {
         agent.setPipeline(trigger, skillNames);
         ui.showSystem("✓ Пайплайн «" + trigger + "»: "
                 + String.join(" → ", skillNames)
-                + ". Подставляется, когда запрос содержит слова триггера.");
+                + ".\n  " + CommandHints.afterPipeline());
+    }
+
+    /**
+     * Пошаговое меню пайплайнов (/pipeline без аргументов, интерактивный
+     * терминал): задать связку триггер → скиллы или очистить. Список
+     * уже показан при входе.
+     */
+    private static void interactivePipelineMenu(TerminalUi ui, LlmAgent agent) {
+        String choice = promptStep(ui, "Пайплайны: 1) задать 2) очистить 3) ничего (Enter — отмена)");
+        if (choice == null) {
+            ui.showSystem("Действие с пайплайном отменено.");
+            return;
+        }
+        try {
+            switch (choice.toLowerCase(java.util.Locale.ROOT)) {
+                case "1", "1) задать", "задать" -> {
+                    String trigger = promptStep(ui, "Триггер (слова запроса, например «напиши фичу»):");
+                    if (trigger == null) {
+                        ui.showSystem("Действие отменено.");
+                        return;
+                    }
+                    String skills = promptStep(ui, "Скиллы по порядку, через запятую:");
+                    if (skills == null || skills.isBlank()) {
+                        ui.showSystem("Действие отменено.");
+                        return;
+                    }
+                    List<String> names = new ArrayList<>();
+                    for (String part : skills.split(",", -1)) {
+                        String name = stripOptionalQuotes(part.trim());
+                        if (!name.isEmpty()) {
+                            names.add(name);
+                        }
+                    }
+                    agent.setPipeline(stripOptionalQuotes(trigger), names);
+                    ui.showSystem("✓ Пайплайн «" + trigger + "»: "
+                            + String.join(" → ", names) + ".\n  "
+                            + CommandHints.afterPipeline());
+                }
+                case "2", "2) очистить", "очистить" -> {
+                    if (!ui.confirmProfileClear("все пайплайны")) {
+                        ui.showSystem("Удаление отменено.");
+                        return;
+                    }
+                    agent.pipelinesClear();
+                    ui.showSystem("✓ Пайплайны очищены. Скиллы сохранены (/skill list).");
+                }
+                case "3", "3) ничего", "ничего", "нет" ->
+                        ui.showSystem("Действие с пайплайном отменено.");
+                default -> ui.showSystem("Не понял выбор: «" + choice
+                        + "». Использование: /pipeline <триггер> <скилл1,скилл2,…>.");
+            }
+        } catch (AgentException e) {
+            ui.showError(e.getMessage());
+        }
+    }
+
+    /** Один шаг пошагового меню: вопрос → ответ пользователя; null — отмена/EOF. */
+    private static String promptStep(TerminalUi ui, String question) {
+        ui.showSystem(question);
+        TerminalUi.Input input = ui.nextInput();
+        if (input.type() == TerminalUi.InputType.EOF) {
+            return null;
+        }
+        String value = input.text() == null ? "" : input.text().trim();
+        return value.isEmpty() ? null : value;
     }
 
     /** Текст /profile: все поля профиля; пустые помечены как «не задано». */
@@ -2243,11 +2573,15 @@ public final class Main {
                         ? normalized.substring("/help".length()).trim() : "";
                 if (argument.isEmpty() || UiText.lower(argument).startsWith("/help")) {
                     ui.showHelp();
+                } else if (argument.equals("all")) {
+                    // Полный индекс по группам — только по явному запросу.
+                    ui.showFullHelp();
                 } else {
                     // «/help task» и «/help /task» — обе формы положены.
                     ui.showCommandHelp(argument.startsWith("/") ? argument : "/" + argument);
                 }
             }
+            case "/status" -> ui.showSystem(formatStatus(agent));
             case "/history" -> ui.showHistory(agent.getHistory());
             case "/tokens" -> ui.showSystem(formatTokens(agent, model));
             case "/stats" -> ui.showSystem(formatStats(agent));
@@ -2274,13 +2608,16 @@ public final class Main {
                     String argument = normalized.substring("/help".length()).trim();
                     if (argument.isEmpty()) {
                         ui.showHelp();
+                    } else if (argument.equals("all")) {
+                        // Полный индекс по группам — только по явному запросу.
+                        ui.showFullHelp();
                     } else {
                         // «/help task» и «/help /task» — обе формы работают.
                         String commandName = argument.startsWith("/")
                                 ? argument : "/" + argument;
                         if (TerminalUi.chatCommandHelp(commandName) == null) {
                             ui.showSystem("Нет подробной справки по «" + argument
-                                    + "».\n  Попробуйте /help — индекс команд.");
+                                    + "».\n  Полный индекс: /help all.");
                         } else {
                             ui.showCommandHelp(commandName);
                         }
@@ -2290,11 +2627,107 @@ public final class Main {
                 } else if (normalized.equals("/limit") || normalized.startsWith("/limit ")) {
                     handleLimitCommand(ui, agent, normalized);
                 } else {
-                    ui.showSystem("Неизвестная команда. Введите /help для справки.");
+                    // Неизвестная команда — с пропуском just-in-time:
+                    // ближайшее совпадение по расстоянию Дамерау–Левенштейна.
+                    ui.showSystem(unknownCommandHint(normalized));
                 }
             }
         }
         return false;
+    }
+
+    // ================= Ведущий интерфейс: подсказки, меню, обзор =================
+
+    /**
+     * Сообщение для неизвестной команды: при близком совпадении с известной —
+     * подсказка по расстоянию Дамерау–Левенштейна, без стены вариантов.
+     */
+    private static String unknownCommandHint(String command) {
+        String best = closestCommand(command);
+        String base = "Неизвестная команда: " + command + ". Индекс: /help.";
+        if (best == null || best.equals(command)) {
+            return base;
+        }
+        return "Неизвестная команда: " + command + ". Возможно, имелось в виду "
+                + best + "? Подробности: /help " + best + " · индекс: /help.";
+    }
+
+    /** Ближайшая известная команда (δ ≤ 2); null — совпадений нет. */
+    static String closestCommand(String input) {
+        String candidate = input.trim();
+        int bestDistance = Integer.MAX_VALUE;
+        String best = null;
+        for (String name : TerminalUi.chatCommandNames()) {
+            int distance = damerauLevenshtein(candidate, name);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = name;
+            }
+        }
+        return bestDistance <= 2 ? best : null;
+    }
+
+    /** Дамерау–Левенштейн: вставка, удаление, замена и транспозиция соседних. */
+    private static int damerauLevenshtein(String a, String b) {
+        int la = a.length();
+        int lb = b.length();
+        int[][] d = new int[la + 1][lb + 1];
+        for (int i = 0; i <= la; i++) {
+            d[i][0] = i;
+        }
+        for (int j = 0; j <= lb; j++) {
+            d[0][j] = j;
+        }
+        for (int i = 1; i <= la; i++) {
+            for (int j = 1; j <= lb; j++) {
+                int cost = a.charAt(i - 1) == b.charAt(j - 1) ? 0 : 1;
+                int value = Math.min(Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1),
+                        d[i - 1][j - 1] + cost);
+                if (i > 1 && j > 1 && a.charAt(i - 1) == b.charAt(j - 2)
+                        && a.charAt(i - 2) == b.charAt(j - 1)) {
+                    value = Math.min(value, d[i - 2][j - 2] + 1);
+                }
+                d[i][j] = value;
+            }
+        }
+        return d[la][lb];
+    }
+
+    /** Обзор состояния одним экраном (/status); каждая строка — с подсказкой. */
+    static String formatStatus(LlmAgent agent) {
+        ModelSettings settings = agent.currentSettings();
+        UserProfile profile = agent.userProfile();
+        TaskState task = agent.taskState();
+        SessionTokenStats.Snapshot stats = agent.sessionStats();
+        StringBuilder text = new StringBuilder("Состояние (без вызова API):");
+        text.append("\n  задача: ").append(task == null
+                ? "нет · начать: /task start <описание>"
+                : task.description() + " · этап " + task.stage().lowerName()
+                        + " · статус " + task.status().lowerName()
+                        + " · подробно: /task status");
+        text.append("\n  профиль: обращение ").append(profile.name() == null
+                ? "не задано · /profile name <обращение>"
+                : "«" + profile.name() + "»")
+                .append(profile.style() == null ? "" : " · стиль " + profile.style())
+                .append(profile.format() == null ? "" : " · формат " + profile.format());
+        int memoryEntries = agent.longTermMemoryCount();
+        text.append("\n  память: ").append(memoryEntries).append(' ')
+                .append(plural(memoryEntries, "запись", "записи", "записей"))
+                .append(" · посмотреть: /memory");
+        text.append("\n  режим ответа: ").append(settings.profile())
+                .append(" · лимит генерации ").append(settings.maxOutputTokens())
+                .append(" · сменить: /mode fast|balanced|detailed");
+        text.append("\n  контекст: ").append(settings.contextStrategy().title())
+                .append(" · режим ").append(settings.contextMode().title())
+                .append(" · подробнее: /strategy, /context");
+        Long limit = settings.sessionTokenLimit();
+        text.append("\n  лимит сессии: ").append(limit == null
+                ? "не задан · /limit <число>"
+                : limit + " · отключить: /limit off");
+        text.append("\n  расход сессии: ").append(stats.knownTotal())
+                .append(stats.complete() ? "" : " (неполные данные)")
+                .append(" · подробнее: /stats");
+        return text.toString();
     }
 
     /**
@@ -2378,7 +2811,8 @@ public final class Main {
         out.println("переменная LLM_HISTORY_FILE задаёт фиксированный абсолютный путь, ");
         out.println("LLM_MEMORY_FILE — общий файл долговременной памяти (memory.json).");
         out.println();
-        out.println("Команды чата: /help, /history, /tokens, /stats, /limit, /reset, /clear,");
+        out.println("Команды чата: /help (коротко; /help all — полный список),");
+        out.println("/history, /status, /tokens, /stats, /limit, /reset, /clear,");
         out.println("/profile, /skill, /pipeline, /memory, /remember, /forget, /task,");
         out.println("/context [full|summary], /context compare <вопрос>, /summary [refresh],");
         out.println("/multiline, /exit (также exit, quit).");

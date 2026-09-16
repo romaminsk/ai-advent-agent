@@ -1344,6 +1344,11 @@ public final class LlmAgent {
         return memoryStore.file();
     }
 
+    /** Путь файла профиля (для признака первого запуска и диагностики). */
+    public java.nio.file.Path profileFile() {
+        return profileStore.file();
+    }
+
     // ================= Профиль пользователя: команды =================
 
     /** Текущий профиль пользователя (данные для /profile без вызова API). */

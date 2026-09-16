@@ -219,6 +219,13 @@ public final class SelfTest {
             checkDiagnosticsHiddenByDefault();
             checkTwoProcessIntegration();
             checkProfilePersistenceAcrossProcesses();
+            checkShortHelpAndFullIndex();
+            checkNextHints();
+            checkInteractiveMenus();
+            checkPlainMenusDisabledWithSyntaxHint();
+            checkTypoSuggestions();
+            checkStatusOverview();
+            checkOnboardingFirstLaunch();
         } finally {
             deleteRecursively(baseTempDir);
         }
@@ -552,8 +559,14 @@ public final class SelfTest {
         int confirmProfileClearCount = 0;
         boolean confirmProfileClearAnswer = false;
         String confirmProfileClearSubject;
+        boolean interactiveMenusEnabled = false;
         final List<String> promptTasks = new ArrayList<>();
         final List<String> commandHelps = new ArrayList<>();
+
+        @Override
+        public boolean interactiveMenus() {
+            return interactiveMenusEnabled;
+        }
 
         @Override
         public void setPromptTask(String task) {
@@ -2372,7 +2385,7 @@ public final class SelfTest {
             CapturedStream err = capturingStream();
             PlainTerminalUi helpUi = new PlainTerminalUi(reader(""), capturingStream().stream,
                     err.stream);
-            helpUi.showHelp();
+            helpUi.showFullHelp();
             expect("справка plain-режима содержит /tokens и /stats",
                     err.text().contains("/tokens") && err.text().contains("/stats"));
             store.close();
@@ -2893,11 +2906,12 @@ public final class SelfTest {
         }
 
         String help = TerminalUi.chatIndex(80);
-        expect("справка /help — компактный индекс по группам одной строкой",
+        expect("полный индекс /help all — по группам, с назначением каждой",
                 help.contains("Память") && help.contains("Контекст")
                         && help.contains("Статистика")
                         && help.contains("/memory") && help.contains("/context")
-                        && help.lines().count() <= 10);
+                        && help.contains("/status")
+                        && help.lines().count() <= 18);
         expect("внизу справки — подсказка /help <команда> и навигация",
                 help.contains("/help <команда>") && help.contains("Tab"));
     }
@@ -6361,6 +6375,12 @@ public final class SelfTest {
         return new LlmAgent(config, ModelSettings.from(env), client, store, memory);
     }
 
+    /** Временный профиль для проверок без API: реальный profile.json не трогается. */
+    private static ProfileStore tempProfileStoreForTests() throws IOException {
+        return new ProfileStore(Files.createTempDirectory(baseTempDir, "prof-")
+                .resolve("profile.json"));
+    }
+
     /** Три слоя хранятся отдельно: отдельный файл, формат, валидация при чтении. */
     private static void checkMemoryLayerSeparation() throws IOException {        Path memoryFile = Files.createTempDirectory(baseTempDir, "mem-")
                 .resolve("memory.json");
@@ -7293,5 +7313,280 @@ public final class SelfTest {
                             && state.branches() != null
                             && state.branches().active().equals("main"));
         }
+    }
+
+    // ================= Ведущий интерфейс: справка, подсказки, меню =================
+
+    /** /help короткий (не стена), /help all полный, у групп — назначение. */
+    private static void checkShortHelpAndFullIndex() {
+        String shortHelp = TerminalUi.shortHelp();
+        String[] lines = shortHelp.split("\n", -1);
+        expect("короткая /help умещается в 8 строк", lines.length <= 8);
+        expect("короткая /help отсылает к полному списку",
+                shortHelp.contains("/help all"));
+        expect("короткая /help показывает /task start, /remember и /profile name",
+                shortHelp.contains("/task start") && shortHelp.contains("/remember")
+                        && shortHelp.contains("/profile name"));
+        expect("короткая /help сообщает количество остальных команд",
+                shortHelp.matches("(?s).*ещё \\d+ .*: /help all.*"));
+
+        String full = TerminalUi.chatIndex(80);
+        for (String group : new String[]{"Память", "Профиль", "Контекст", "Диалог",
+                "Режимы", "Статистика", "Прочее"}) {
+            expect("полный индекс содержит группу «" + group + "»",
+                    full.contains(group));
+        }
+        expect("полный индекс объясняет назначение групп",
+                full.contains("что агент помнит") && full.contains("что уходит в запрос"));
+        expect("полный индекс содержит /status", full.contains("/status"));
+
+        // Вывод plain-терминала: /help короткий, /help all полный.
+        CapturedStream out = capturingStream();
+        CapturedStream err = capturingStream();
+        new PlainTerminalUi(reader(""), out.stream, err.stream).showHelp();
+        CapturedStream outAll = capturingStream();
+        CapturedStream errAll = capturingStream();
+        new PlainTerminalUi(reader(""), outAll.stream, errAll.stream).showFullHelp();
+        String helpText = err.text();
+        String fullText = errAll.text();
+        expect("plain /help выводит короткую справку без стены групп",
+                helpText.contains("/task start") && helpText.contains("/help all")
+                        && !helpText.contains("Память"));
+        expect("plain /help all выводит полный индекс",
+                fullText.contains("Память") && fullText.contains("Статистика"));
+    }
+
+    /** Подсказка следующего шага после /task start, /profile, /skill, /remember. */
+    private static void checkNextHints() throws Exception {
+        LlmAgent agent = new LlmAgent(new Config("test-key",
+                "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash"),
+                ModelSettings.defaults(),
+                java.net.http.HttpClient.newHttpClient(),
+                new JsonConversationStore(Files.createTempDirectory(baseTempDir, "hist-")
+                        .resolve("conversation.json")),
+                tempMemoryStore(), tempProfileStoreForTests());
+
+        FakeUi ui = new FakeUi(
+                TerminalUi.Input.command("/task start сверить параметры проекта"),
+                TerminalUi.Input.command("/profile name Алексей"),
+                TerminalUi.Input.command("/remember кодовое слово: ЯКОРЬ-42"),
+                TerminalUi.Input.command("/skill add \"карточка фичи\" название, цель, шаги"),
+                TerminalUi.Input.command("/exit"));
+        ui.interactiveMenusEnabled = true; // краткая форма работает и с меню включёнными
+        Main.runLoop(ui, agent, "glm-5.3-flash");
+        String systems = String.join("\n", ui.systems);
+        expect("после /task start подсказка следующего шага (/task stage execution)",
+                ui.systems.stream().anyMatch(t -> t.contains("✓ Задача задана")
+                        && t.contains("/task stage execution")));
+        expect("после /profile name — подсказка следующих полей профиля",
+                systems.contains("/profile style|format|constraint"));
+        expect("после /remember — подсказка /memory",
+                systems.contains("Дальше: /memory — посмотреть записи"));
+        expect("после /skill add — подсказка /pipeline",
+                systems.contains("Дальше: /pipeline"));
+        expect("краткая форма /task start создала состояние",
+                agent.taskState() != null);
+    }
+
+    /** Интерактивные меню /profile и /task без аргументов (FakeUi с меню). */
+    private static void checkInteractiveMenus() throws Exception {
+        // Агент без API: команды меню не вызывают API.
+        LlmAgent agent = new LlmAgent(new Config("test-key",
+                "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash"),
+                ModelSettings.defaults(),
+                java.net.http.HttpClient.newHttpClient(),
+                new JsonConversationStore(Files.createTempDirectory(baseTempDir, "hist-")
+                        .resolve("conversation.json")),
+                tempMemoryStore(), tempProfileStoreForTests());
+
+        FakeUi profileUi = new FakeUi(
+                TerminalUi.Input.command("/profile"),
+                TerminalUi.Input.command("1"),
+                TerminalUi.Input.command("Алексей"),
+                TerminalUi.Input.command("/status"),
+                TerminalUi.Input.command("/exit"));
+        profileUi.interactiveMenusEnabled = true;
+        Main.runLoop(profileUi, agent, "glm-5.3-flash");
+        expect("/profile без аргументов открывает меню выбора поля",
+                profileUi.systems.stream().anyMatch(t ->
+                        t.contains("1) обращение 2) стиль 3) формат")));
+        expect("выбор пункта запрашивает значение",
+                profileUi.systems.stream().anyMatch(t ->
+                        t.contains("Введите обращение")));
+        expect("значение применено без памяти синтаксиса",
+                "Алексей".equals(agent.userProfile().name())
+                        && profileUi.systems.stream().anyMatch(t ->
+                        t.contains("✓ Профиль обновлён: name")));
+        expect("мусорного ввода в меню нет: выбор 1 и имя не попали в историю",
+                agent.getHistory().isEmpty());
+
+        FakeUi taskUi = new FakeUi(
+                TerminalUi.Input.command("/task"),
+                TerminalUi.Input.command("1"),
+                TerminalUi.Input.command("подготовить отчёт к среде"),
+                TerminalUi.Input.command("/task"),
+                TerminalUi.Input.command("4"),
+                TerminalUi.Input.command("/task status"),
+                TerminalUi.Input.command("/exit"));
+        taskUi.interactiveMenusEnabled = true;
+        Main.runLoop(taskUi, agent, "glm-5.3-flash");
+        expect("/task без аргументов открывает меню",
+                taskUi.systems.stream().anyMatch(t ->
+                        t.contains("1) начать 2) этап 3) шаг")));
+        expect("меню: начало задачи по номеру без синтаксиса",
+                "подготовить отчёт к среде".equals(agent.taskState().description()));
+        expect("меню: пауза по номеру 4",
+                agent.taskState().status() == TaskStatus.PAUSED
+                        && taskUi.systems.stream().anyMatch(t ->
+                        t.contains("✓ Задача на паузе")));
+        expect("меню: короткая форма по-прежнему работает штатно",
+                agent.getHistory().isEmpty());
+    }
+
+    /** В неинтерактивном (--plain) меню не запускаются: показывается синтаксис. */
+    private static void checkPlainMenusDisabledWithSyntaxHint() throws Exception {
+        LlmAgent agent = new LlmAgent(new Config("test-key",
+                "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash"),
+                ModelSettings.defaults(),
+                java.net.http.HttpClient.newHttpClient(),
+                new JsonConversationStore(Files.createTempDirectory(baseTempDir, "hist-")
+                        .resolve("conversation.json")),
+                tempMemoryStore(), tempProfileStoreForTests());
+        agent.setProfileName("Шеф");
+
+        FakeUi plainUi = new FakeUi(
+                TerminalUi.Input.command("/profile"),
+                TerminalUi.Input.command("/task"),
+                TerminalUi.Input.command("/exit"));
+        // interactiveMenusEnabled=false (по умолчанию) — как PlainTerminalUi.
+        Main.runLoop(plainUi, agent, "glm-5.3-flash");
+        String systems = String.join("\n", plainUi.systems);
+        expect("в plain-режиме нет пошагового меню профиля",
+                !systems.contains("1) обращение"));
+        expect("в plain-режиме есть подсказка точного синтаксиса",
+                systems.contains("/profile name|style|format|constraint")
+                        && systems.contains("/task start <описание>"));
+        expect("в plain-режиме меню задач не запускается",
+                !systems.contains("1) начать 2) этап"));
+        expect("профиль не изменился опросом", "Шеф".equals(agent.userProfile().name()));
+        expect("состояние задачи создано только явно", agent.taskState() == null);
+    }
+
+    /** Опечатки ведут к подсказке: неизвестная команда и неверный этап. */
+    private static void checkTypoSuggestions() throws Exception {
+        LlmAgent agent = new LlmAgent(new Config("test-key",
+                "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash"),
+                ModelSettings.defaults(),
+                java.net.http.HttpClient.newHttpClient(),
+                new JsonConversationStore(Files.createTempDirectory(baseTempDir, "hist-")
+                        .resolve("conversation.json")),
+                tempMemoryStore(), tempProfileStoreForTests());
+
+        expect("опечатка /profil ловится подсказкой /profile",
+                "/profile".equals(Main.closestCommand("/profil")));
+        expect("опечатка /таск не даёт ложного совпадения без схемы",
+                Main.closestCommand("/totally-unknown-cmd") == null);
+        FakeUi ui = new FakeUi(
+                TerminalUi.Input.command("/profil"),
+                TerminalUi.Input.command("/task start сверить параметры"),
+                TerminalUi.Input.command("/task stage foo"),
+                TerminalUi.Input.command("/exit"));
+        ui.interactiveMenusEnabled = false;
+        Main.runLoop(ui, agent, "glm-5.3-flash");
+        expect("неизвестная команда подсказывает ближайщую",
+                ui.systems.stream().anyMatch(t -> t.contains("Неизвестная команда: /profil")
+                        && t.contains("/profile")));
+        expect("неверный этап даёт список допустимых",
+                ui.errors.stream().anyMatch(t -> t.contains("Допустимые этапы")
+                        && t.contains("planning, execution, validation, done")));
+        expect("ошибочный этап не изменил состояние",
+                agent.taskState().stage() == TaskStage.PLANNING);
+    }
+
+    /** /status — обзор одним экраном, с подсказками, без вызова API. */
+    private static void checkStatusOverview() throws Exception {
+        LlmAgent agent = new LlmAgent(new Config("test-key",
+                "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash"),
+                ModelSettings.defaults(),
+                java.net.http.HttpClient.newHttpClient(),
+                new JsonConversationStore(Files.createTempDirectory(baseTempDir, "hist-")
+                        .resolve("conversation.json")),
+                tempMemoryStore(), tempProfileStoreForTests());
+        agent.remember("кодовое слово: ЯКОРЬ-42");
+        agent.setProfileName("Шеф");
+        agent.taskStart("подготовить отчёт к среде");
+
+        AtomicInteger hits = new AtomicInteger();
+        Path keyStore = createSelfSignedKeyStore();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            hits.incrementAndGet();
+            return new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                    + "\"content\":\"Ок\"}}]}").getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            FakeUi ui = new FakeUi(TerminalUi.Input.command("/status"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(ui, agent, "glm-5.3-flash");
+            expect("/status без вызова API", hits.get() == 0);
+            String systems = String.join("\n", ui.systems);
+            expect("/status показывает задачу с этапом и статусом",
+                    systems.contains("подготовить отчёт к среде")
+                            && systems.contains("этап planning")
+                            && systems.contains("статус active"));
+            expect("/status показывает профиль и память",
+                    systems.contains("обращение «Шеф»") && systems.contains("память: 1"));
+            expect("/status подсказывает, как изменить каждую строку",
+                    systems.contains("/mode fast|balanced|detailed")
+                            && systems.contains("/strategy, /context")
+                            && systems.contains("/limit")
+                            && systems.contains("/task status")
+                            && systems.contains("/stats"));
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Онбординг при первом запуске и его отсутствие на повторном. */
+    private static void checkOnboardingFirstLaunch() throws IOException {
+        ProfileStore freshProfile = new ProfileStore(
+                Files.createTempDirectory(baseTempDir, "prof-").resolve("profile.json"));
+        JsonConversationStore freshHistory = new JsonConversationStore(
+                Files.createTempDirectory(baseTempDir, "hist-")
+                        .resolve("conversation.json"));
+        LlmAgent fresh = new LlmAgent(new Config("test-key",
+                "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash"),
+                ModelSettings.defaults(),
+                java.net.http.HttpClient.newHttpClient(),
+                freshHistory, tempMemoryStore(), freshProfile);
+        expect("первый запуск: профиль отсутствует и история пуста",
+                Main.firstLaunch(fresh));
+
+        fresh.setProfileName("Шеф");
+        expect("повторный запуск: профиль сохранён — онбординга не будет",
+                !Main.firstLaunch(fresh));
+
+        String onboarding = TerminalUi.firstRunOnboarding();
+        String[] lines = onboarding.split("\n", -1);
+        expect("онбординг короткий (не больше 6 строк)", lines.length <= 6);
+        expect("онбординг показывает примеры и ссылку на /help",
+                onboarding.contains("/task start") && onboarding.contains("/remember")
+                        && onboarding.contains("Подробности: /help"));
+
+        // Метка первого запуска снята фактически: файл профиля на диске существует.
+        expect("после установки поля профиль записан (метка первого запуска снята)",
+                Files.exists(freshProfile.file()));
+
+        // Plain-терминал: онбординг только при первом запуске.
+        CapturedStream err = capturingStream();
+        new PlainTerminalUi(reader(""), capturingStream().stream, err.stream)
+                .showWelcome("test-model", true);
+        CapturedStream errAgain = capturingStream();
+        new PlainTerminalUi(reader(""), capturingStream().stream, errAgain.stream)
+                .showWelcome("test-model", false);
+        expect("онбординг показывается при первом запуске",
+                err.text().contains("Привет! Я агент с памятью и задачами."));
+        expect("повторный запуск — без онбординга",
+                !errAgain.text().contains("Привет! Я агент с памятью"));
     }
 }
