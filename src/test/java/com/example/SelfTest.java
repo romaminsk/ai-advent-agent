@@ -6831,14 +6831,26 @@ public final class SelfTest {
                 pausedBlock.contains("статус PAUSED")
                         && pausedBlock.contains("НЕ продолжай выполнение задачи")
                         && pausedBlock.contains("/task resume"));
+        expect("формулировка паузы прежняя (подтверждена живым прогоном), не задет",
+                pausedBlock.contains("не решай сам, что")
+                        && pausedBlock.contains("задача на паузе"));
 
         ChatMessage blockedSystem = ContextBuilder.systemContextMessage(settings,
                 emptyProfile, emptyMemory,
                 active.withStatus(TaskStatus.BLOCKED, now), Map.of(), null, null);
         String blockedBlock = blockedSystem.content();
-        expect("в блокировке блок требует активно запрашивать недостающее",
+        expect("в блокировке блок требует ТОЛЬКО запросить недостающее",
                 blockedBlock.contains("статус BLOCKED")
-                        && blockedBlock.contains("запрашивай недостающие"));
+                        && blockedBlock.contains("ТОЛЬКО запрос недостающих")
+                        && blockedBlock.contains("В ответе"));
+        expect("в блокировке явный запрет продолжать: не выполняй другие шаги, "
+                        + "не пиши код, не помечай шаги выполненными",
+                blockedBlock.contains("НЕ выполняй другие шаги задачи")
+                        && blockedBlock.contains("НЕ пиши код")
+                        && blockedBlock.contains("НЕ помечай шаги выполненными")
+                        && blockedBlock.contains("только после снятия блокировки"));
+        expect("в блокировке нет прежней слабой формулировки «запрашивай … в каждом ответе»",
+                !blockedBlock.contains("запрашивай недостающие сведения в каждом ответе"));
     }
 
     /**
