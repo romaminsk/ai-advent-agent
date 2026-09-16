@@ -11,12 +11,14 @@ import java.util.Map;
  * и промежуточные решения.
  *
  * Рабочая память состоит из двух частей:
- * - текущая задача (задаётся явно командой /task, очищается /task clear);
+ * - формализованное состояние задачи ({@link TaskState}: этап, статус, шаг,
+  ожидаемое действие; задаётся /task start, очищается /task clear);
  * - факты «ключ: значение», обновляемые автоматически служебным запросом
  *   после ответов (режим auto) или по /facts refresh (режим manual).
  *
  * Факты хранятся отдельно от сообщений диалога и живут в файле истории
- * ({@link ConversationState}); задача — только в рамках текущего запуска.
+ * ({@link ConversationState}); состояние задачи — только в рамках текущего
+ * запуска (сессионное, как и прежняя строка задачи).
  * Внутри рабочей памяти не дублируются сведения из долговременной памяти
  * : см. правило в системной инструкции.
  */
@@ -25,27 +27,52 @@ public final class WorkingMemory {
     /** Факты «ключ: значение» (порядок сохранения). */
     private final LinkedHashMap<String, String> facts = new LinkedHashMap<>();
 
-    /** Текущая задача; null — задача не задана. */
-    private String task;
+    /** Формализованное состояние задачи; null — задача не начата. */
+    private TaskState taskState;
 
     /** Неизменяемое представление фактов (для /facts без вызова API). */
     public Map<String, String> factsView() {
         return Collections.unmodifiableMap(facts);
     }
 
-    /** Текущая задача; null — не задана. */
+    /**
+     * Формализованное состояние задачи; null — не начата. Команды управления —
+     * в {@link LlmAgent}, хранение — здесь, в рабочей памяти.
+     */
+    public TaskState taskState() {
+        return taskState;
+    }
+
+    /** Заменяет состояние задачи целиком (все команды /task, кроме clear). */
+    public void setTaskState(TaskState newState) {
+        taskState = newState;
+    }
+
+    /** Описание задачи (текст); null — задача не начата. */
     public String task() {
-        return task;
+        return taskState == null ? null : taskState.description();
     }
 
-    /** Задаёт или меняет текущую задачу (/task <текст>). */
+    /**
+     * Задаёт описание задачи (/task <текст>): без состояния создаётся
+     * начальное (planning, active), существующее состояние обновляет
+     * только описание. Пустой текст очищает задачу — как раньше.
+     */
     public void setTask(String newTask) {
-        this.task = newTask == null || newTask.isBlank() ? null : newTask.trim();
+        if (newTask == null || newTask.isBlank()) {
+            taskState = null;
+            return;
+        }
+        if (taskState == null) {
+            taskState = TaskState.start(newTask.trim(), java.time.Instant.now());
+        } else {
+            taskState = taskState.withDescription(newTask, java.time.Instant.now());
+        }
     }
 
-    /** Очищает текущую задачу (/task clear). */
+    /** Очищает состояние задачи (/task clear). */
     public void clearTask() {
-        this.task = null;
+        this.taskState = null;
     }
 
     /** Замена фактов результатом служебного запроса. */
@@ -71,9 +98,9 @@ public final class WorkingMemory {
         return FactsBlock.render(facts);
     }
 
-    /** true, если факты и задача отсутствуют — рабочая память пуста. */
+    /** true, если фактов и состояния задачи нет — рабочая память пуста. */
     public boolean isEmpty() {
-        return facts.isEmpty() && task == null;
+        return facts.isEmpty() && taskState == null;
     }
 
     /** Снимок фактов для записи в файл истории или сравнения. */
@@ -87,8 +114,8 @@ public final class WorkingMemory {
      */
     public String factsUpdateUserContent(String factsText, List<ChatMessage> messages) {
         StringBuilder text = new StringBuilder("Текущий блок задач и фактов:\n");
-        if (task != null) {
-            text.append("Текущая задача: ").append(task).append('\n');
+        if (task() != null) {
+            text.append("Текущая задача: ").append(task()).append('\n');
         }
         text.append(factsText == null || factsText.isBlank()
                 ? "(пуст — пар пока нет)"

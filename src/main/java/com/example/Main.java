@@ -417,28 +417,7 @@ public final class Main {
             return;
         }
         if (raw.startsWith("/task")) {
-            String argument = raw.length() > "/task".length()
-                    ? raw.substring("/task".length()).trim() : "";
-            if (argument.isEmpty()) {
-                String task = agent.currentTask();
-                ui.showSystem(task == null
-                        ? "Задача не задана. Задать: /task <текст>."
-                        : "Задача: " + task);
-                return;
-            }
-            if (argument.equalsIgnoreCase("clear")) {
-                agent.clearTask();
-                updatePromptLabels(ui, agent, demoRef);
-                ui.showSystem("✓ Задача очищена. Факты сохранены (очистка фактов: /facts clear).");
-                return;
-            }
-            try {
-                agent.setTask(argument);
-                updatePromptLabels(ui, agent, demoRef);
-                ui.showSystem("✓ Задача задана: «" + argument + "». Действует до /task clear.");
-            } catch (AgentException e) {
-                ui.showError(e.getMessage());
-            }
+            handleTaskCommand(ui, agent, raw, demoRef);
             return;
         }
         if (raw.equalsIgnoreCase("/remember") || "/remember".equals(raw.toLowerCase(java.util.Locale.ROOT).trim())) {
@@ -486,6 +465,155 @@ public final class Main {
         } catch (AgentException e) {
             ui.showError(e.getMessage());
         }
+    }
+
+    // ================= Состояние задачи (Task State Machine) =================
+
+    /**
+     * Диспетчер /task: формализованное состояние задачи (без вызова API).
+     * Субкоманды: start, stage, step, expect, pause, resume, block,
+     * unblock, status, clear; прочий текст — короткая форма задания
+     * описания (как раньше). Тексты описания и шагов сохраняют регистр.
+     */
+    private static void handleTaskCommand(TerminalUi ui, LlmAgent agent, String raw,
+                                          DemoRef demoRef) {
+        String argument = raw.length() > "/task".length()
+                ? raw.substring("/task".length()).trim() : "";
+        String head = argument.isEmpty() ? ""
+                : argument.split("\\s+", 2)[0].toLowerCase(java.util.Locale.ROOT);
+        String rest = argument.length() > head.length()
+                ? argument.substring(head.length()).trim() : "";
+        try {
+            switch (head) {
+                case "" -> ui.showSystem(formatTaskShort(agent));
+                case "status" -> ui.showSystem(formatTaskStatus(agent));
+                case "start" -> {
+                    if (rest.isEmpty()) {
+                        ui.showSystem("Использование: /task start <описание>.");
+                        return;
+                    }
+                    TaskState state = agent.taskStart(rest);
+                    updatePromptLabels(ui, agent, demoRef);
+                    ui.showSystem("✓ Задача задана: «" + state.description()
+                            + "». Этап planning, статус active. Действует до /task clear.");
+                }
+                case "stage" -> {
+                    if (rest.isEmpty()) {
+                        ui.showSystem("Использование: /task stage <planning|execution|"
+                                + "validation|done> [причина]. Переходы — только вперёд; "
+                                + "возврат validation → execution с причиной.");
+                        return;
+                    }
+                    String[] parts = rest.split("\\s+", 2);
+                    String reason = parts.length > 1 ? parts[1] : null;
+                    TaskState state = agent.taskStage(parts[0], reason);
+                    if (state.stage() == TaskStage.DONE) {
+                        ui.showSystem("✓ Задача переведена на этап done. Начать новую: "
+                                + "/task start <описание>.");
+                    } else {
+                        ui.showSystem("✓ Задача переведена на этап "
+                                + state.stage().lowerName() + ".");
+                    }
+                }
+                case "step" -> {
+                    if (rest.isEmpty()) {
+                        ui.showSystem("Использование: /task step <текст>. Прежний шаг "
+                                + "переносится в выполненные.");
+                        return;
+                    }
+                    agent.taskStep(rest);
+                    ui.showSystem("✓ Текущий шаг: «" + rest + "».");
+                }
+                case "expect" -> {
+                    if (rest.isEmpty()) {
+                        ui.showSystem("Использование: /task expect <текст>.");
+                        return;
+                    }
+                    agent.taskExpect(rest);
+                    ui.showSystem("✓ Ожидаемое действие: «" + rest + "».");
+                }
+                case "pause" -> {
+                    agent.taskPause();
+                    ui.showSystem("✓ Задача на паузе: этап, шаг и выполненные шаги "
+                            + "сохранены. Продолжение: /task resume.");
+                }
+                case "resume" -> {
+                    TaskState state = agent.taskResume();
+                    ui.showSystem("✓ Задача возобновлена: этап " + state.stage().lowerName()
+                            + (state.currentStep() != null
+                            ? ", текущий шаг «" + state.currentStep() + "»."
+                            : ", текущий шаг не задан (/task step <текст>)."));
+                }
+                case "block" -> {
+                    agent.taskBlock();
+                    ui.showSystem("✓ Задача помечена как blocked: ожидание внешних данных. "
+                            + "Модель будет запрашивать недостающее. Снять: /task unblock.");
+                }
+                case "unblock" -> {
+                    TaskState state = agent.taskUnblock();
+                    ui.showSystem("✓ Блокировка снята: задача снова активна (этап "
+                            + state.stage().lowerName() + ").");
+                }
+                case "clear" -> {
+                    agent.clearTask();
+                    updatePromptLabels(ui, agent, demoRef);
+                    ui.showSystem("✓ Задача очищена. Факты сохранены (очистка фактов: /facts clear).");
+                }
+                default -> {
+                    // Прочий текст — короткая форма задания описания задачи
+                    // (как раньше); создаёт либо обновляет описание состояния.
+                    agent.setTask(argument);
+                    updatePromptLabels(ui, agent, demoRef);
+                    ui.showSystem("✓ Задача задана: «" + argument + "». Действует до /task clear.");
+                }
+            }
+        } catch (AgentException e) {
+            ui.showError(e.getMessage());
+        }
+    }
+
+    /** Текст /task без аргумента: короткое текущее состояние задачи. */
+    static String formatTaskShort(LlmAgent agent) {
+        TaskState state = agent.taskState();
+        if (state == null) {
+            return "Задача не задана. Начать: /task start <описание> (коротко: /task <текст>).";
+        }
+        return "Задача: " + state.description() + "\n  этап: " + state.stage().lowerName()
+                + " · статус: " + state.status().lowerName()
+                + "\n  полное состояние: /task status";
+    }
+
+    /** Текст /task status: полное состояние без вызова API. */
+    static String formatTaskStatus(LlmAgent agent) {
+        TaskState state = agent.taskState();
+        if (state == null) {
+            return formatTaskShort(agent);
+        }
+        StringBuilder text = new StringBuilder("Состояние задачи (без вызова API):");
+        text.append("\n  описание: ").append(state.description() == null
+                ? "не задано" : state.description());
+        text.append("\n  этап: ").append(state.stage().lowerName())
+                .append(" · статус: ").append(state.status().lowerName());
+        text.append("\n  текущий шаг: ").append(state.currentStep() == null
+                ? "не задан" : state.currentStep());
+        text.append("\n  ожидаемое действие: ").append(state.expectedAction() == null
+                ? "не задано" : state.expectedAction());
+        if (state.completedSteps().isEmpty()) {
+            text.append("\n  выполненные шаги: нет");
+        } else {
+            text.append("\n  выполненные шаги (").append(state.completedSteps().size())
+                    .append("):");
+            for (String step : state.completedSteps()) {
+                text.append("\n    - ").append(step);
+            }
+        }
+        switch (state.status()) {
+            case PAUSED -> text.append("\n  пауза: выполнение заморожено, продолжение — /task resume");
+            case BLOCKED -> text.append("\n  блокировка: ожидание внешних данных, снять — /task unblock");
+            case ACTIVE -> { }
+        }
+        text.append("\n  обновлено: ").append(state.updatedAt());
+        return text.toString();
     }
 
     // ================= Профиль пользователя, скиллы, пайплайны =================

@@ -1225,9 +1225,13 @@ public final class LlmAgent {
                         .toList()), matches.size());
     }
 
+    // ================= Состояние задачи (Task State Machine) =================
+
     /**
-     * Задаёт текущую задачу рабочей памяти (/task <текст>).
-     * Задача — данные текущей задачи, не запись долговременной памяти.
+     * Задаёт описание задачи рабочей памяти (/task <текст>). Задача —
+     * данные текущей задачи, не запись долговременной памяти. Без состояния
+     * создаётся начальное (planning, active); существующее состояние
+     * обновляет только описание.
      */
     public void setTask(String task) {
         workingMemory.setTask(task);
@@ -1238,9 +1242,96 @@ public final class LlmAgent {
         workingMemory.clearTask();
     }
 
-    /** Текущая задача рабочей памяти; null — не задана. */
+    /**
+     * Текущее формализованное состояние задачи; null — задача не начата.
+     * Состояние хранится в рабочей памяти (сессионное): переживает паузу
+     * и продолжение внутри запуска, очищается /task clear и /clear.
+     */
+    public TaskState taskState() {
+        return workingMemory.taskState();
+    }
+
+    /** Текущая задача (описание); null — не задана. Совместимость со старым API. */
     public String currentTask() {
         return workingMemory.task();
+    }
+
+    /**
+     * Начинает задачу (/task start <описание>): этап planning, статус active,
+     * шаг «сформулировать план», ожидаемое действие «агент предлагает план».
+     */
+    public TaskState taskStart(String description) {
+        TaskState state = TaskState.start(description, java.time.Instant.now());
+        workingMemory.setTaskState(state);
+        return state;
+    }
+
+    /**
+     * Переводит задачу на этап (/task stage <этап> [причина]). Переходы —
+     * только вперёд; возврат validation → execution разрешён только явно
+     * и с причиной (ожидаемое действие получает «устранить: <причина>»).
+     */
+    public TaskState taskStage(String stageName, String reason) {
+        TaskState current = requireTaskState();
+        TaskStage target = TaskStage.parse(stageName);
+        TaskState updated = current.withStage(target, reason, java.time.Instant.now());
+        if (current.stage().isBackwardTransitionTo(target)) {
+            updated = updated.withExpectedAction("устранить: " + reason.trim(),
+                    java.time.Instant.now());
+        }
+        workingMemory.setTaskState(updated);
+        return updated;
+    }
+
+    /** Задаёт текущий шаг (/task step <текст>); прежний шаг — в выполненные. */
+    public TaskState taskStep(String step) {
+        TaskState updated = requireTaskState().withStep(step, java.time.Instant.now());
+        workingMemory.setTaskState(updated);
+        return updated;
+    }
+
+    /** Задаёт ожидаемое действие (/task expect <текст>). */
+    public TaskState taskExpect(String action) {
+        TaskState updated = requireTaskState().withExpectedAction(action, java.time.Instant.now());
+        workingMemory.setTaskState(updated);
+        return updated;
+    }
+
+    /** Пауза (/task pause): замораживает этап, шаг, ожидаемое действие, выполненные шаги. */
+    public TaskState taskPause() {
+        TaskState updated = requireTaskState().withStatus(TaskStatus.PAUSED, java.time.Instant.now());
+        workingMemory.setTaskState(updated);
+        return updated;
+    }
+
+    /** Продолжение (/task resume): восстанавливает сохранённое состояние без потерь. */
+    public TaskState taskResume() {
+        TaskState updated = requireTaskState().withStatus(TaskStatus.ACTIVE, java.time.Instant.now());
+        workingMemory.setTaskState(updated);
+        return updated;
+    }
+
+    /** Блокировка (/task block): задача ожидает внешних данных. */
+    public TaskState taskBlock() {
+        TaskState updated = requireTaskState().withStatus(TaskStatus.BLOCKED, java.time.Instant.now());
+        workingMemory.setTaskState(updated);
+        return updated;
+    }
+
+    /** Снятие блокировки (/task unblock). */
+    public TaskState taskUnblock() {
+        TaskState updated = requireTaskState().withStatus(TaskStatus.ACTIVE, java.time.Instant.now());
+        workingMemory.setTaskState(updated);
+        return updated;
+    }
+
+    /** Состояние задачи обязательно: команды этапов и статусов требуют начатую задачу. */
+    private TaskState requireTaskState() {
+        TaskState state = workingMemory.taskState();
+        if (state == null) {
+            throw new AgentException("Задача не начата: /task start <описание>.");
+        }
+        return state;
     }
 
     /** Число записей долговременной памяти (для сводки слоёв после ответа). */
@@ -2408,7 +2499,7 @@ public final class LlmAgent {
 
     private List<ChatMessage> buildContextMessages(String userMessage) {
         return ContextBuilder.buildContextMessages(settings, history, userProfile,
-                longTermMemory, workingMemory.task(), workingMemory.factsView(),
+                longTermMemory, workingMemory.taskState(), workingMemory.factsView(),
                 userMessage, effectiveSummary());
     }
 

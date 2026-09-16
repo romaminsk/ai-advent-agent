@@ -266,21 +266,34 @@ public interface TerminalUi extends AutoCloseable {
 
                     Связано: /memory, /remember.""";
             case "/task" -> """
-                    /task — текущая задача рабочей памяти
+                    /task — состояние задачи: конечный автомат этапов
 
                     Использование
-                      /task <текст>
-                      /task clear
+                      /task start <описание>          — начать (этап planning)
+                      /task <текст>                    — короткая форма задания описания
+                      /task stage <этап> [причина]     — planning|execution|validation|done
+                      /task step <текст>               — текущий шаг (прежний — в выполненные)
+                      /task expect <текст>             — ожидаемое действие
+                      /task pause · /task resume       — пауза и продолжение
+                      /task block · /task unblock      — ожидание внешних данных
+                      /task · /task status             — состояние
+                      /task clear                      — очистить
 
                     Примеры
-                      /task продумать карточку проекта
-                      /task clear
+                      /task start подготовить отчёт к среде
+                      /task stage execution
+                      /task stage execution не сошлись итоговые цифры
 
                     Эффекты
-                      задача подставляется в каждый запрос до /task clear;
-                      факты рабочей памяти /task clear не трогает.
+                      этапы — только вперёд planning → execution → validation → done;
+                      возврат validation → execution — с причиной; DONE → planning
+                      нельзя (это новая задача). Пауза замораживает этап, шаг и
+                      выполненные шаги; возобновление — только /task resume.
+                      Состояние подставляется в каждый запрос блоком
+                      «СОСТОЯНИЕ ЗАДАЧИ» и живёт до /task clear или /clear
+                      (текущий запуск). Не вызывает API.
 
-                    Связано: /facts, /clear.""";
+                    Связано: /facts, /memory.""";
             case "/profile" -> """
                     /profile — профиль пользователя (обращение, стиль, формат, ограничения)
 
