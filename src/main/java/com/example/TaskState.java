@@ -19,15 +19,30 @@ import java.util.List;
  * Неизменяемый record: изменяющие методы возвращают копию с новой меткой
  * updatedAt. Хранится в рабочей памяти ({@link WorkingMemory}): состояние
  * задачи — это текущая задача, живёт в рамках сессии, очищается /clear
- * и /task clear, но переживает паузу и продолжение внутри сессии.
+ * и /task clear, но переживает пауза и продолжение внутри сессии.
+ *
+ * Локальные инварианты (localInvariants) — жёсткие рамки, привязанные к
+ * этой задаче: тот же тип {@link Invariant}, что и глобальные, но живут
+ * ровно столько, сколько задача — они часть сессионного состояния
+ * TaskState, а НЕ InvariantStore (глобальное, персистентное). Локальные
+ * уточняют, но не отменяют глобальные ({@link ContextBuilder}).
  */
 public record TaskState(TaskStage stage,
                         TaskStatus status,
                         String currentStep,
                         String expectedAction,
                         List<String> completedSteps,
+                        List<Invariant> localInvariants,
                         String description,
                         String updatedAt) {
+
+    /** Совместимый конструктор без локальных инвариантов. */
+    public TaskState(TaskStage stage, TaskStatus status, String currentStep,
+                     String expectedAction, List<String> completedSteps,
+                     String description, String updatedAt) {
+        this(stage, status, currentStep, expectedAction, completedSteps,
+                List.of(), description, updatedAt);
+    }
 
     public TaskState {
         if (stage == null || status == null) {
@@ -36,6 +51,8 @@ public record TaskState(TaskStage stage,
         currentStep = blankToNull(currentStep);
         expectedAction = blankToNull(expectedAction);
         completedSteps = completedSteps == null ? List.of() : List.copyOf(completedSteps);
+        localInvariants = localInvariants == null
+                ? List.of() : List.copyOf(localInvariants);
         description = blankToNull(description);
         if (updatedAt == null || updatedAt.isBlank()) {
             throw new IllegalArgumentException("Метка времени задачи обязательна.");
@@ -94,7 +111,7 @@ public record TaskState(TaskStage stage,
             completed.add(currentStep);
         }
         return new TaskState(target, status, null, expectedAction, completed,
-                description, now.toString());
+                localInvariants, description, now.toString());
     }
 
     /** Смена статуса (ACTIVE ↔ PAUSED, ACTIVE ↔ BLOCKED; произвольные — ошибка). */
@@ -108,7 +125,7 @@ public record TaskState(TaskStage stage,
                     + "в активное состояние (/task resume, /task unblock).");
         }
         return new TaskState(stage, target, currentStep, expectedAction,
-                completedSteps, description, now.toString());
+                completedSteps, localInvariants, description, now.toString());
     }
 
     private static String sameStatusMessage(TaskStatus target) {
@@ -135,7 +152,7 @@ public record TaskState(TaskStage stage,
             completed.add(currentStep);
         }
         return new TaskState(stage, status, newStep, expectedAction, completed,
-                description, now.toString());
+                localInvariants, description, now.toString());
     }
 
     /** Задание ожидаемого действия (что должен сделать агент или пользователь дальше). */
@@ -144,7 +161,7 @@ public record TaskState(TaskStage stage,
             throw new AgentException("Текст ожидаемого действия обязателен: /task expect <текст>.");
         }
         return new TaskState(stage, status, currentStep, action, completedSteps,
-                description, now.toString());
+                localInvariants, description, now.toString());
     }
 
     /** Обновление описания задачи (этап, шаги и статус не трогаются). */
@@ -153,6 +170,56 @@ public record TaskState(TaskStage stage,
             throw new AgentException("Описание задачи не может быть пустым.");
         }
         return new TaskState(stage, status, currentStep, expectedAction,
-                completedSteps, newDescription, now.toString());
+                completedSteps, localInvariants, newDescription, now.toString());
+    }
+
+    // ================= Локальные инварианты задачи =================
+
+    /** Неизменяемое представление локальных инвариантов текущей задачи. */
+    public List<Invariant> localInvariantsView() {
+        return localInvariants;
+    }
+
+    /** Копия с добавленным локальным инвариантом (/task invariant add). */
+    public TaskState withLocalInvariant(Invariant invariant, Instant now) {
+        if (invariant == null) {
+            throw new AgentException("Пустой локальный инвариант.");
+        }
+        List<Invariant> copy = new ArrayList<>(localInvariants);
+        copy.add(invariant);
+        return new TaskState(stage, status, currentStep, expectedAction,
+                completedSteps, copy, description, now.toString());
+    }
+
+    /** Результат /task invariant remove: новое состояние и удалённая запись. */
+    record TaskInvariantRemove(TaskState state, Invariant removed) {
+    }
+
+    /**
+     * Копия без локального инварианта по его id; removed — удалённый
+     * инвариант, null — не найден (этап, шаги и статус не трогаются).
+     */
+    TaskInvariantRemove withoutLocalInvariant(String id, Instant now) {
+        Invariant removedInvariant = null;
+        List<Invariant> remaining = new ArrayList<>();
+        for (Invariant invariant : localInvariants) {
+            if (removedInvariant == null && invariant.id().equals(id)) {
+                removedInvariant = invariant;
+                continue;
+            }
+            remaining.add(invariant);
+        }
+        if (removedInvariant == null) {
+            return new TaskInvariantRemove(this, null);
+        }
+        TaskState updated = new TaskState(stage, status, currentStep, expectedAction,
+                completedSteps, remaining, description, now.toString());
+        return new TaskInvariantRemove(updated, removedInvariant);
+    }
+
+    /** Очистка всех локальных инвариантов (остальное состояние задачи не трогается). */
+    public TaskState withoutLocalInvariants(Instant now) {
+        return new TaskState(stage, status, currentStep, expectedAction,
+                completedSteps, List.of(), description, now.toString());
     }
 }

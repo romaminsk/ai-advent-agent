@@ -187,7 +187,7 @@ public final class Main {
                         // последняя линия защиты).
                         List<InvariantGuard.Conflict> invariantConflicts =
                                 InvariantGuard.check(input.text(),
-                                        activeAgent.invariantsView());
+                                        combinedInvariants(activeAgent));
                         if (!invariantConflicts.isEmpty()) {
                             ui.showSystem(formatInvariantsRefusal(invariantConflicts));
                             break;
@@ -661,8 +661,17 @@ public final class Main {
         return text.toString();
     }
 
+    /** Глобальные + локальные инварианты активной задачи (для guard и guard-текста). */
+    static List<Invariant> combinedInvariants(LlmAgent agent) {
+        List<Invariant> combined =
+                new ArrayList<>(agent.invariantsView());
+        combined.addAll(agent.taskInvariantsView());
+        return combined;
+    }
+
     /** Текст /invariant: список рамок с категориями, id и порядковыми номерами. */
-    static String formatInvariants(LlmAgent agent) {        List<Invariant> invariants = agent.invariantsView();
+    static String formatInvariants(LlmAgent agent) {
+        List<Invariant> invariants = agent.invariantsView();
         StringBuilder text = new StringBuilder("Инварианты — жёсткие ограничения, "
                 + "которые агент не нарушает (переживают /clear, /reset и перезапуск; "
                 + "отдельный файл). Задача пользователя, противоречащая рамке, "
@@ -715,6 +724,7 @@ public final class Main {
                     }
                 }
                 case "status" -> ui.showSystem(formatTaskStatus(agent));
+                case "invariant" -> handleTaskInvariantCommand(ui, agent, rest, demoRef);
                 case "start" -> {
                     if (rest.isEmpty()) {
                         ui.showSystem("Использование: /task start <описание>.");
@@ -802,6 +812,143 @@ public final class Main {
         } catch (AgentException e) {
             ui.showError(e.getMessage());
         }
+    }
+
+    /**
+     * Диспетчер /task invariant: локальные инварианты текущей задачи —
+     * жёсткие рамки, привязанные к задаче (часть TaskState, сессионное).
+     * В отличие от глобальных (/invariant, InvariantStore) живут ровно
+     * столько, сколько задача: исчезают при /task clear, /clear и перезапуске.
+     * Локальные уточняют, но не отменяют глобальные. Без вызова API.
+     */
+    private static void handleTaskInvariantCommand(TerminalUi ui, LlmAgent agent,
+                                                   String argument, DemoRef demoRef) {
+        String sub = argument.isEmpty() ? ""
+                : argument.split("\\s+", 2)[0].toLowerCase(java.util.Locale.ROOT);
+        String rest = argument.length() > sub.length()
+                ? argument.substring(sub.length()).trim() : "";
+        try {
+            if (sub.isEmpty() || sub.equals("list")) {
+                ui.showSystem(formatTaskInvariants(agent));
+                return;
+            }
+            if (sub.equals("add")) {
+                if (rest.isEmpty()) {
+                    ui.showSystem("Использование: /task invariant add <текст> "
+                            + "[architecture|stack|decision|business|other] "
+                            + "[запрещено: маркер1, маркер2].");
+                    return;
+                }
+                TaskState state = agent.taskState();
+                if (state == null) {
+                    ui.showError("Задача не начата: сначала /task start <описание>. "
+                            + "Локальные рамки привязаны к задаче.");
+                    return;
+                }
+                addTaskInvariant(ui, agent, rest);
+                return;
+            }
+            if (sub.equals("remove")) {
+                if (rest.isEmpty()) {
+                    ui.showSystem("Использование: /task invariant remove "
+                            + "<номер|id>. Локальный список: /task invariant.");
+                    return;
+                }
+                LlmAgent.TaskInvariantRemoveResult result =
+                        agent.taskInvariantRemove(rest);
+                if (result.removed()) {
+                    ui.showSystem("✓ Локальный инвариант удалён: «"
+                            + result.invariant().text() + "»"
+                            + (result.invariant().category() == null ? ""
+                            : " [" + result.invariant().category() + "]"));
+                } else {
+                    ui.showError("Локальный инвариант не найден: «" + rest + "». "
+                            + "Локальный список: /task invariant.");
+                }
+                return;
+            }
+            if (sub.equals("clear")) {
+                if (agent.taskInvariantsView().isEmpty()) {
+                    ui.showSystem("Локальных инвариантов нет. /task invariant add "
+                            + "<текст> — задать.");
+                    return;
+                }
+                if (!ui.confirmProfileClear("локальные инварианты задачи")) {
+                    ui.showSystem("Удаление отменено.");
+                    return;
+                }
+                agent.taskInvariantsClear();
+                ui.showSystem("✓ Локальные инварианты задачи очищены. Глобальные "
+                        + "(/invariant) и остальное состояние задачи не изменены.");
+                return;
+            }
+            ui.showSystem("Использование: /task invariant — список локальных рамок, "
+                    + "/task invariant add <текст> [категория] [запрещено: …], "
+                    + "/task invariant remove <номер|id>, /task invariant clear "
+                    + "(с подтверждением). Глобальные рамки: /invariant.");
+        } catch (AgentException e) {
+            ui.showError(e.getMessage());
+        }
+    }
+
+    /**
+     * Разбор «/task invariant add <текст> [категория] [запрещено: …]» —
+     * те же правила, что у глобального /invariant add.
+     */
+    private static void addTaskInvariant(TerminalUi ui, LlmAgent agent, String rest) {
+        List<String> markers = List.of();
+        String bodyPart = rest;
+        int markerIdx = forbiddenMarkerIndex(rest);
+        if (markerIdx >= 0) {
+            markers = parseForbiddenMarkers(rest.substring(
+                    markerIdx + "запрещено:".length()));
+            bodyPart = rest.substring(0, markerIdx).trim();
+        }
+        String text = bodyPart;
+        String category = "other";
+        String[] words = bodyPart.split("\\s+");
+        String last = words[words.length - 1].toLowerCase(java.util.Locale.ROOT);
+        if (words.length > 1 && List.of("architecture", "stack", "decision",
+                "business", "other").contains(last)) {
+            category = last;
+            text = bodyPart.substring(0, bodyPart.length() - last.length()).trim();
+        }
+        Invariant invariant = agent.taskInvariantAdd(text, category, markers);
+        ui.showSystem("✓ Локальный инвариант задан: «" + invariant.text() + "» ["
+                + invariant.category() + "]"
+                + (invariant.hasForbiddenMarkers()
+                ? "\n  запрещено: "
+                + String.join(", ", invariant.forbiddenMarkers())
+                : "")
+                + ".\n  " + CommandHints.afterTaskInvariantAdd());
+    }
+
+    /** Текст /task invariant: локальные рамки текущей задачи. */
+    static String formatTaskInvariants(LlmAgent agent) {
+        List<Invariant> local = agent.taskInvariantsView();
+        StringBuilder text = new StringBuilder("Локальные инварианты текущей задачи "
+                + "(жёсткие рамки; живут ровно столько, сколько задача — "
+                + "/task clear и /clear их стирают; глобальные не трогаются):");
+        if (local.isEmpty()) {
+            text.append("\n  локальных инвариантов нет. /task invariant add ")
+                    .append("<текст> [категория] — задать.");
+            return text.toString();
+        }
+        for (int i = 0; i < local.size(); i++) {
+            Invariant invariant = local.get(i);
+            text.append("\n  ").append(i + 1).append(". ")
+                    .append(invariant.category() == null
+                            ? "" : "[" + invariant.category() + "] ")
+                    .append(invariant.text())
+                    .append("\n     id: ").append(invariant.id());
+            if (invariant.hasForbiddenMarkers()) {
+                text.append("\n     запрещено: ")
+                        .append(String.join(", ", invariant.forbiddenMarkers()));
+            }
+        }
+        text.append("\n  удалить: /task invariant remove <номер|id> · ")
+                .append("очистить все: /task invariant clear");
+        return text.toString();
     }
 
     /** Текст /task без аргумента: короткое текущее состояние задачи. */

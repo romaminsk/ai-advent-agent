@@ -217,6 +217,8 @@ public final class SelfTest {
             checkInvariantGuardRules();
             checkInvariantGuardNoApiInMessage();
             checkInvariantAddForbiddenMarkers();
+            checkTaskInvariantCommands();
+            checkTaskInvariantBlockAndGuard();
             checkInvariantsNotInWorkingMemoryOrHistory();
             checkInvariantHelpAndIndex();
             checkThreeLayersInRequest();
@@ -7461,6 +7463,204 @@ public final class SelfTest {
             server.stop(0);
             Files.deleteIfExists(keyStore);
         }
+    }
+
+    /**
+     * Локальные инварианты задачи: add без задачи — ошибка; add/list/remove/
+     * clear; живут в TaskState, НЕ в InvariantStore; /task clear и /clear
+     * стирают локальные, глобальные остаются.
+     */
+    private static void checkTaskInvariantCommands() throws Exception {
+        InvariantStore globalStore = tempInvariantStoreForTests();
+        LlmAgent agent = new LlmAgent(new Config("test-key",
+                "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash"),
+                ModelSettings.defaults(),
+                java.net.http.HttpClient.newHttpClient(),
+                new JsonConversationStore(Files.createTempDirectory(baseTempDir, "hist-")
+                        .resolve("conversation.json")),
+                tempMemoryStore(), tempProfileStoreForTests(), globalStore);
+
+        // Без задачи — ошибка, сначала /task start.
+        FakeUi noTaskUi = new FakeUi(
+                TerminalUi.Input.command("/task invariant add рамка задачи stack"),
+                TerminalUi.Input.command("/exit"));
+        Main.runLoop(noTaskUi, agent, "glm-5.3-flash");
+        expect("/task invariant add без задачи — ошибка «сначала /task start»",
+                noTaskUi.errors.stream().anyMatch(t -> t.contains("Задача не начата")
+                        && t.contains("/task start")));
+
+        // Глобальный инвариант для проверки разделения источников.
+        agent.invariantAdd("глобальная рамка проекта", "architecture");
+
+        FakeUi ui = new FakeUi(
+                TerminalUi.Input.command("/task start запустить миграцию вставки"),
+                TerminalUi.Input.command(
+                        "/task invariant add локальная рамка задачи stack "
+                                + "запрещено: fastjson"),
+                TerminalUi.Input.command("/task invariant"),
+                TerminalUi.Input.command("/exit"));
+        Main.runLoop(ui, agent, "glm-5.3-flash");
+        expect("локальный инвариант добавляется к задаче",
+                agent.taskInvariantsView().size() == 1
+                        && agent.taskInvariantsView().get(0).text()
+                        .equals("локальная рамка задачи")
+                        && agent.taskInvariantsView().get(0).category()
+                        .equals("stack")
+                        && agent.taskInvariantsView().get(0).forbiddenMarkers()
+                        .equals(List.of("fastjson")));
+        expect("локальный инвариант НЕ в глобальном хранилище",
+                agent.invariantsView().size() == 1
+                        && agent.invariantsView().get(0).text()
+                        .equals("глобальная рамка проекта"));
+        String globalJson = Files.readString(globalStore.file(),
+                StandardCharsets.UTF_8);
+        expect("файл глобальных инвариантов не знает про локальную рамку",
+                !globalJson.contains("локальная рамка задачи"));
+        expect("список /task invariant показывает локальную рамку",
+                ui.systems.stream().anyMatch(t -> t.contains("Локальные инварианты")
+                        && t.contains("локальная рамка задачи")));
+        expect("подсказка после /task invariant add",
+                ui.systems.stream().anyMatch(t ->
+                        t.contains("Дальше: /task invariant — посмотреть локальные рамки")));
+        expect("локальный инвариант живёт вместе с этапами задачи",
+                agent.taskState().stage() == TaskStage.PLANNING);
+
+        // Этапы/шаги не теряют локальные инварианты.
+        agent.taskStep("проверка контрактов");
+        expect("шаг задачи сохраняет локальные инварианты",
+                agent.taskInvariantsView().size() == 1);
+
+        // Remove по номеру, затем по id.
+        agent.taskInvariantAdd("второй локальный инвариант", "business");
+        String firstId = agent.taskInvariantsView().get(0).id();
+        FakeUi removeNumber = new FakeUi(TerminalUi.Input.command(
+                "/task invariant remove 1"));
+        Main.runLoop(removeNumber, agent, "glm-5.3-flash");
+        expect("remove по номеру удаляет локальную рамку",
+                agent.taskInvariantsView().size() == 1
+                        && agent.taskInvariantsView().get(0).text()
+                        .equals("второй локальный инвариант")
+                        && removeNumber.systems.stream().anyMatch(t ->
+                        t.contains("✓ Локальный инвариант удалён")));
+        // Remove по id: сначала несуществующий id — ошибка, затем по id.
+        FakeUi removeId = new FakeUi(TerminalUi.Input.command(
+                "/task invariant remove " + firstId));
+        // firstId уже удалён по номеру; проверяем remove несуществующего id.
+        Main.runLoop(removeId, agent, "glm-5.3-flash");
+        expect("remove по несуществующему id — ошибка",
+                removeId.errors.stream().anyMatch(t ->
+                        t.contains("Локальный инвариант не найден")));
+        FakeUi removeLast = new FakeUi(TerminalUi.Input.command(
+                "/task invariant remove "
+                        + agent.taskInvariantsView().get(0).id()));
+        Main.runLoop(removeLast, agent, "glm-5.3-flash");
+        expect("remove по id удаляет последнюю локальную рамку",
+                agent.taskInvariantsView().isEmpty());
+        agent.taskInvariantAdd("рамка для clear", "other");
+        FakeUi clearUi = new FakeUi(TerminalUi.Input.command(
+                "/task invariant clear"));
+        clearUi.confirmProfileClearAnswer = true;
+        Main.runLoop(clearUi, agent, "glm-5.3-flash");
+        expect("/task invariant clear очищает локальные, глобальные остаются",
+                agent.taskInvariantsView().isEmpty()
+                        && agent.invariantsView().size() == 1);
+
+        // /task clear стирает локальные вместе с задачей; глобальные остаются.
+        agent.taskStart("новая задача с рамками");
+        agent.taskInvariantAdd("локальная рамка перед clear", "stack");
+        FakeUi clearTaskUi = new FakeUi(TerminalUi.Input.command("/task clear"));
+        Main.runLoop(clearTaskUi, agent, "glm-5.3-flash");
+        expect("/task clear стирает локальные инварианты вместе с задачей",
+                agent.taskState() == null
+                        && agent.taskInvariantsView().isEmpty()
+                        && agent.invariantsView().size() == 1);
+
+        // Локальные рамки НЕ переживают перезапуск (TaskState — сессионное).
+        agent.taskStart("задача для перезапуска");
+        agent.taskInvariantAdd("сессионная рамка", "stack");
+        LlmAgent restarted = new LlmAgent(new Config("test-key",
+                "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash"),
+                ModelSettings.defaults(),
+                java.net.http.HttpClient.newHttpClient(),
+                new JsonConversationStore(Files.createTempDirectory(baseTempDir, "hist-")
+                        .resolve("conversation.json")),
+                tempMemoryStore(), tempProfileStoreForTests(),
+                new InvariantStore(globalStore.file()));
+        expect("перезапуск: локальная рамка исчезла (TaskState сессионный), "
+                        + "глобальная на месте",
+                restarted.taskInvariantsView().isEmpty()
+                        && restarted.invariantsView().size() == 1);
+    }
+
+    /** Блок «ИНВАРИАНТЫ» из двух источников + guard по локальным. */
+    private static void checkTaskInvariantBlockAndGuard() throws Exception {
+        ModelSettings settings = ModelSettings.defaults();
+        Map<String, MemoryEntry> emptyMemory = new LinkedHashMap<>();
+        Invariant global = Invariant.create("глобальная рамка архитектуры",
+                "architecture", Instant.parse("2026-01-01T00:00:00Z"));
+        Invariant local = Invariant.create("локальная рамка задачи", "business",
+                Instant.parse("2026-01-01T00:00:00Z"));
+        Instant now = Instant.parse("2026-01-02T00:00:00Z");
+        TaskState withLocal = TaskState.start("задача", now)
+                .withLocalInvariant(local, now);
+
+        // Только глобальные — как раньше, без подзаголовка локальных.
+        ChatMessage globalOnly = ContextBuilder.systemContextMessage(settings,
+                UserProfile.empty(), emptyMemory, null, Map.of(), null, null,
+                List.of(global), List.of());
+        expect("только глобальные: блок без строки локальных",
+                globalOnly.content().contains("[architecture] глобальная рамка")
+                        && !globalOnly.content().contains("Локальные"));
+
+        // Только локальные — блок с пометкой «Локальные».
+        ChatMessage localOnly = ContextBuilder.systemContextMessage(settings,
+                UserProfile.empty(), emptyMemory, withLocal, Map.of(), null, null,
+                List.of(), List.of(local));
+        expect("только локальные: пометка «Локальные (только для текущей задачи)»",
+                localOnly.content().contains("Локальные (только для текущей задачи)")
+                        && localOnly.content().contains("[business] локальная рамка")
+                        && !localOnly.content().contains("Глобальные"));
+
+        // Оба источника — два подзаголовка в одном блоке.
+        ChatMessage both = ContextBuilder.systemContextMessage(settings,
+                UserProfile.empty(), emptyMemory, withLocal, Map.of(), null, null,
+                List.of(global), List.of(local));
+        String bothText = both.content();
+        expect("оба источника в одном блоке с пометками источников",
+                bothText.contains("Глобальные (действуют всегда)")
+                        && bothText.contains("Локальные (только для текущей задачи)")
+                        && bothText.indexOf("Глобальные")
+                        < bothText.indexOf("Локальные"));
+
+        // Пустые оба — блок опускается.
+        ChatMessage none = ContextBuilder.systemContextMessage(settings,
+                UserProfile.empty(), emptyMemory, withLocal, Map.of(), null, null,
+                List.of(), List.of());
+        expect("без глобальных и локальных блок «ИНВАРИАНТЫ» опускается",
+                !none.content().contains("ИНВАРИАНТЫ"));
+
+        // Приоритет: инструкция блока предупреждает, локальные не отменяют
+        // глобальные.
+        expect("инструкция блока: «локальные рамки уточняют, но не отменяют "
+                        + "глобальные»",
+                bothText.contains("локальные рамки уточняют, но не отменяют глобальные"));
+
+        // Guard учитывает оба набора: конфликт ловится по локальной рамке.
+        Invariant localStack = Invariant.create("запрет fastjson в этой задаче",
+                "stack", List.of("fastjson"), now);
+        TaskState guardedState = TaskState.start("задача", now)
+                .withLocalInvariant(localStack, now);
+        List<InvariantGuard.Conflict> conflicts = InvariantGuard.check(
+                "добавь fastjson к парсеру",
+                List.of(global), guardedState.localInvariantsView());
+        expect("guard ловит конфликт по локальному инварианту",
+                conflicts.size() == 1
+                        && conflicts.get(0).invariant().equals(localStack)
+                        && conflicts.get(0).matchedMarkers().contains("fastjson"));
+        // Глобальный не нарушен, только локальный.
+        expect("локальный конфликт не помечает глобальный инвариант",
+                conflicts.stream()
+                        .noneMatch(c -> c.invariant().equals(global)));
     }
 
     /** Инварианты НЕ попадают в рабочую память и НЕ в историю диалога. */

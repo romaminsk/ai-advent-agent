@@ -189,7 +189,7 @@ public interface TerminalUi extends AutoCloseable {
                         "что агент помнит: надолго, в рамках задачи и диалога"),
                 new Row("Профиль", "/profile /skill /pipeline",
                         "как к вам обращаться и как отвечать"),
-                new Row("Рамки", "/invariant",
+                new Row("Рамки", "/invariant /task invariant",
                         "жёсткие ограничения, которые агент не нарушает"),
                 new Row("Контекст", "/context /summary /strategy /facts /branch",
                         "что уходит в запрос к модели"),
@@ -380,6 +380,10 @@ public interface TerminalUi extends AutoCloseable {
                       /task expect <текст>             — ожидаемое действие
                       /task pause · /task resume       — пауза и продолжение
                       /task block · /task unblock      — ожидание внешних данных
+                      /task invariant                  — локальные рамки задачи (жизненный
+                                                          цикл — с задачей; /task clear их стирает)
+                      /task invariant add <текст> [категория] [запрещено: …]
+                      /task invariant remove <номер|id> · /task invariant clear
                       /task · /task status             — состояние
                       /task clear                      — очистить
 
@@ -389,15 +393,18 @@ public interface TerminalUi extends AutoCloseable {
                       /task stage execution не сошлись итоговые цифры
 
                     Эффекты
-                      этапы — только вперёд planning → execution → validation → done;
+                     этапы — только вперёд planning → execution → validation → done;
                       возврат validation → execution — с причиной; DONE → planning
                       нельзя (это новая задача). Пауза замораживает этап, шаг и
                       выполненные шаги; возобновление — только /task resume.
                       Состояние подставляется в каждый запрос блоком
                       «СОСТОЯНИЕ ЗАДАЧИ» и живёт до /task clear или /clear
-                      (текущий запуск). Не вызывает API.
+                      (текущий запуск). Локальные инварианты (/task invariant)
+                      — часть состояния задачи: существуют только у активной
+                      задачи, уточняют глобальные, не отменяя их.
+                      Не вызывает API.
 
-                    Связано: /facts, /memory.""";
+                    Связано: /facts, /memory, /invariant.""";
             case "/profile" -> """
                     /profile — профиль пользователя (обращение, стиль, формат, ограничения)
 

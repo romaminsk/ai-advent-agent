@@ -68,6 +68,23 @@ final class InvariantGuard {
             "заюзай", "заюзать");
 
     /**
+     * Вариант с двумя источниками: глобальные + локальные инварианты активной
+     * задачи; проверяется объединённый список.
+     */
+    static List<InvariantGuard.Conflict> check(String userMessage,
+                                               List<Invariant> global,
+                                               List<Invariant> local) {
+        List<Invariant> combined = new ArrayList<>();
+        if (global != null) {
+            combined.addAll(global);
+        }
+        if (local != null) {
+            combined.addAll(local);
+        }
+        return check(userMessage, combined);
+    }
+
+    /**
      * Единственный вход: запрос + инварианты → конфликты (пусто — пропускаем
      * к модели). Императив обязателен; маркеры совпадают по границам слов.
      */

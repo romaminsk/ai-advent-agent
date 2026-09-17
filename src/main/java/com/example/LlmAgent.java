@@ -1498,6 +1498,133 @@ public final class LlmAgent {
         loadInvariants();
     }
 
+    // ================= Локальные инварианты задачи (/task invariant) =================
+
+    /**
+     * Локальные инварианты текущей задачи — жёсткие рамки, привязанные к
+     * задаче: живут ровно столько, сколько задача (часть TaskState,
+     * сессионное), исчезают вместе с ней (/task clear, /clear). Глобальные
+     * ({@link InvariantStore} и invariantsView()) при этом не трогаются.
+     */
+    public List<Invariant> taskInvariantsView() {
+        TaskState state = workingMemory.taskState();
+        return state == null ? List.of() : state.localInvariantsView();
+    }
+
+    /** Максимальная длина текста локального инварианта — как у глобального. */
+    private static final int MAX_TASK_INVARIANT_TEXT_LENGTH = 300;
+
+    /**
+     * Добавляет локальный инвариант к текущей задаче
+     * (/task invariant add …): создаёт Invariant с сгенерированным id
+     * (уникальность — в списке задачи), состояние задачи заменяется копией.
+     * Если задачи нет — ошибка: сначала /task start.
+     */
+    public Invariant taskInvariantAdd(String text, String category) {
+        return taskInvariantAdd(text, category, List.of());
+    }
+
+    /** Вариант с явными запрещёнными маркерами. */
+    public Invariant taskInvariantAdd(String text, String category,
+                                      List<String> forbiddenMarkers) {
+        TaskState state = requireTaskState();
+        if (text == null || text.isBlank()) {
+            throw new AgentException("Пустой локальный инвариант: укажите текст "
+                    + "(/task invariant add <текст> [категория]).");
+        }
+        String trimmed = text.trim();
+        if (trimmed.length() > MAX_TASK_INVARIANT_TEXT_LENGTH) {
+            throw new AgentException("Текст локального инварианта не длиннее "
+                    + MAX_TASK_INVARIANT_TEXT_LENGTH + " символов, получено: "
+                    + trimmed.length() + ".");
+        }
+        // Идентификатор уникален в списке локальных инвариантов задачи.
+        java.util.Set<String> existingIds = new java.util.HashSet<>();
+        for (Invariant invariant : state.localInvariantsView()) {
+            existingIds.add(invariant.id());
+        }
+        String normalizedCategory = category == null || category.isBlank()
+                ? "other" : category.trim().toLowerCase(java.util.Locale.ROOT);
+        Invariant created = Invariant.create(trimmed, normalizedCategory,
+                forbiddenMarkers, java.time.Instant.now());
+        while (existingIds.contains(created.id())) {
+            created = Invariant.create(trimmed, normalizedCategory, forbiddenMarkers,
+                    created.createdAt());
+        }
+        workingMemory.setTaskState(state.withLocalInvariant(created,
+                java.time.Instant.now()));
+        return created;
+    }
+
+    /**
+     * Результат /task invariant remove: что сделано и какой локальный
+     * инвариант удалён.
+     */
+    public record TaskInvariantRemoveResult(boolean removed, Invariant invariant) {
+    }
+
+    /**
+     * Удаляет локальный инвариант по номеру (1-базовый, порядок списка)
+     * или id; глобальные инварианты не трогаются.
+     */
+    public TaskInvariantRemoveResult taskInvariantRemove(String idOrNumber) {
+        String token = idOrNumber == null ? "" : idOrNumber.trim();
+        TaskState state = requireTaskState();
+        TaskState.TaskInvariantRemove result =
+                taskStateWithoutByToken(state, token);
+        if (result.removed() == null) {
+            return new TaskInvariantRemoveResult(false, null);
+        }
+        workingMemory.setTaskState(result.state());
+        return new TaskInvariantRemoveResult(true, result.removed());
+    }
+
+    /** Универсальное разрешение «номер|id» для локальных инвариантов состояния. */
+    private static TaskState.TaskInvariantRemove taskStateWithoutByToken(
+            TaskState state, String token) {
+        Invariant target = null;
+        Integer number = null;
+        try {
+            number = Integer.parseInt(token);
+        } catch (NumberFormatException ignored) {
+        }
+        if (number != null && number >= 1
+                && number <= state.localInvariantsView().size()) {
+            target = state.localInvariantsView().get(number - 1);
+        } else {
+            String normalized = token.toLowerCase(java.util.Locale.ROOT);
+            for (Invariant invariant : state.localInvariantsView()) {
+                if (invariant.id().toLowerCase(java.util.Locale.ROOT)
+                        .equals(normalized)) {
+                    target = invariant;
+                    break;
+                }
+            }
+            if (target == null && !normalized.isEmpty()) {
+                for (Invariant invariant : state.localInvariantsView()) {
+                    if (invariant.id().toLowerCase(java.util.Locale.ROOT)
+                            .startsWith(normalized)) {
+                        target = invariant;
+                        break;
+                    }
+                }
+            }
+        }
+        return target == null
+                ? new TaskState.TaskInvariantRemove(state, null)
+                : state.withoutLocalInvariant(target.id(), java.time.Instant.now());
+    }
+
+    /**
+     * Очищает локальные инварианты текущей задачи (/task invariant clear);
+     * остальное состояние задачи и глобальные инварианты не трогаются.
+     */
+    public void taskInvariantsClear() {
+        TaskState state = requireTaskState();
+        workingMemory.setTaskState(state.withoutLocalInvariants(
+                java.time.Instant.now()));
+    }
+
     // ================= Профиль пользователя: команды =================
 
     /** Текущий профиль пользователя (данные для /profile без вызова API). */
@@ -2654,7 +2781,8 @@ public final class LlmAgent {
     private List<ChatMessage> buildContextMessages(String userMessage) {
         return ContextBuilder.buildContextMessages(settings, history, userProfile,
                 longTermMemory, workingMemory.taskState(), workingMemory.factsView(),
-                userMessage, effectiveSummary(), List.copyOf(invariants));
+                userMessage, effectiveSummary(), List.copyOf(invariants),
+                taskInvariantsView());
     }
 
     /**

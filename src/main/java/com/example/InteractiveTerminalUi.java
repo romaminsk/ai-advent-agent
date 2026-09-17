@@ -69,6 +69,8 @@ final class InteractiveTerminalUi implements TerminalUi {
                         "/memory", "/remember ", "/forget ", "/task ", "/task clear",
                         "/invariant", "/invariant add ", "/invariant remove ",
                         "/invariant clear",
+                        "/task invariant", "/task invariant add ",
+                        "/task invariant remove ", "/task invariant clear",
                         "/exit", "exit", "quit"))
                 .build();
         // История ввода хранится только в памяти: файл истории не подключается.
