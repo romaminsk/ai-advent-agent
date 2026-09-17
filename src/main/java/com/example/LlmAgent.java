@@ -119,6 +119,16 @@ public final class LlmAgent {
     /** Текущий профиль пользователя (загружается при старте). */
     private UserProfile userProfile;
 
+    /**
+     * Хранилище инвариантов — жёстких ограничений, которые агент не имеет
+     * права нарушать (отдельный файл, переживает /clear, /reset и перезапуск).
+     * Инварианты не в WorkingMemory и не в истории диалога.
+     */
+    private final InvariantStore invariantStore;
+
+    /** Текущий список инвариантов (загружается при старте, порядок сохранения). */
+    private List<Invariant> invariants = new ArrayList<>();
+
     /** Рабочая память: текущая задача и факты (слой 2). */
     private final WorkingMemory workingMemory = new WorkingMemory();
 
@@ -308,6 +318,16 @@ public final class LlmAgent {
         }
     }
 
+    /** Временные инварианты для тестов: никогда не читают и не пишут реальный файл. */
+    private static InvariantStore tempInvariantStore() {
+        try {
+            Path tempDir = Files.createTempDirectory("agent-test-invariant-");
+            return new InvariantStore(tempDir.resolve("invariants.json"));
+        } catch (IOException e) {
+            throw new IllegalStateException("Не удалось создать инварианты для теста", e);
+        }
+    }
+
     /** Пакетно-приватный конструктор для локальных тестов с подставным MemoryStore. */
     LlmAgent(Config config, ModelSettings settings, HttpClient httpClient,
              ConversationStore store, MemoryStore memoryStore) {
@@ -317,32 +337,45 @@ public final class LlmAgent {
     /**
      * Боевой конструктор с явно указанными хранилищами: боевая точка создания
      * агента (Main) подключает MemoryStore.openDefault() (файл
-     * ~/.ai-advent-agent/memory.json или LLM_MEMORY_FILE) и
+     * ~/.ai-advent-agent/memory.json или LLM_MEMORY_FILE),
      * ProfileStore.openDefault() (~/.ai-advent-agent/profile.json или
-     * LLM_PROFILE_FILE) — долговременная память и профиль переживают
-     * перезапуск. Тестовые конструкторы выше остаются изолированными
-     * (временные файлы) и реальные файлы не трогают.
+     * LLM_PROFILE_FILE) и InvariantStore.openDefault()
+     * (~/.ai-advent-agent/invariants.json или LLM_INVARIANT_FILE) —
+     * долговременная память, профиль и инварианты переживают перезапуск.
+     * Тестовые конструкторы выше остаются изолированными (временные файлы)
+     * и реальные файлы не трогают.
      */
     public LlmAgent(Config config, ModelSettings settings, ConversationStore store,
-                    MemoryStore memoryStore, ProfileStore profileStore) {
+                    MemoryStore memoryStore, ProfileStore profileStore,
+                    InvariantStore invariantStore) {
         this(config, settings, HttpClient.newBuilder()
                 .connectTimeout(CONNECT_TIMEOUT)
-                .build(), store, memoryStore, profileStore);
+                .build(), store, memoryStore, profileStore, invariantStore);
     }
 
     /** Вариант с собственным HttpClient (для подстановки тестового клиента). */
     public LlmAgent(Config config, ModelSettings settings, HttpClient httpClient,
                     ConversationStore store, MemoryStore memoryStore,
                     ProfileStore profileStore) {
+        this(config, settings, httpClient, store, memoryStore, profileStore,
+                tempInvariantStore());
+    }
+
+    /** Полный конструктор с подстановным HttpClient и хранилищем инвариантов. */
+    public LlmAgent(Config config, ModelSettings settings, HttpClient httpClient,
+                    ConversationStore store, MemoryStore memoryStore,
+                    ProfileStore profileStore, InvariantStore invariantStore) {
         this.config = config;
         this.settings = Objects.requireNonNull(settings, "settings");
         this.httpClient = httpClient;
         this.store = Objects.requireNonNull(store, "store");
         this.memoryStore = Objects.requireNonNull(memoryStore, "memoryStore");
         this.profileStore = Objects.requireNonNull(profileStore, "profileStore");
+        this.invariantStore = Objects.requireNonNull(invariantStore, "invariantStore");
         this.objectMapper = new ObjectMapper();
         loadLongTermMemory();
         loadUserProfile();
+        loadInvariants();
         restoreFromStore();
     }
 
@@ -354,6 +387,16 @@ public final class LlmAgent {
     private void loadLongTermMemory() {
         longTermMemory.clear();
         longTermMemory.putAll(memoryStore.load());
+    }
+
+    /**
+     * Загружает инварианты из отдельного файла. Отсутствие файла — пустой
+     * список, запуск не ломается; повреждённый файл — ошибка повреждения
+     * (файл не изменяется).
+     */
+    private void loadInvariants() {
+        invariants.clear();
+        invariants.addAll(invariantStore.load());
     }
 
     /**
@@ -1347,6 +1390,239 @@ public final class LlmAgent {
     /** Путь файла профиля (для признака первого запуска и диагностики). */
     public java.nio.file.Path profileFile() {
         return profileStore.file();
+    }
+
+    // ================= Инварианты (жёсткие рамки) =================
+
+    /**
+     * Текущие инварианты — жёсткие ограничения, которые агент не имеет права
+     * нарушать. Неизменяемое представление (порядок сохранения); используется
+     * командой /invariant и подстановкой в контекст без вызова API.
+     */
+    public List<Invariant> invariantsView() {
+        return List.copyOf(invariants);
+    }
+
+    /** Путь файла инвариантов (для диагностики). */
+    public java.nio.file.Path invariantsFile() {
+        return invariantStore.file();
+    }
+
+    /** Максимальная длина текста инварианта (инвариант — формулировка, не эссе). */
+    private static final int MAX_INVARIANT_TEXT_LENGTH = 300;
+
+    /**
+     * Добавляет инвариант (/invariant add <текст> [категория] [запрещено:…]).
+     * Текст — формулировка рамки, обрезается до 300 символов; категория
+     * нормализуется хранилищем. Запись в отдельный файл атомарная; при
+     * ошибке записи инвариант не сохраняется.
+     */
+    public Invariant invariantAdd(String text, String category) {
+        return invariantAdd(text, category, List.of());
+    }
+
+    /** Вариант с явными запрещёнными маркерами (для детерминированной проверки). */
+    public Invariant invariantAdd(String text, String category,
+                                  List<String> forbiddenMarkers) {
+        if (text == null || text.isBlank()) {
+            throw new AgentException("Пустой инвариант: укажите текст "
+                    + "(/invariant add <текст> [категория]).");
+        }
+        String trimmed = text.trim();
+        if (trimmed.length() > MAX_INVARIANT_TEXT_LENGTH) {
+            throw new AgentException("Текст инварианта не длиннее "
+                    + MAX_INVARIANT_TEXT_LENGTH + " символов, получено: "
+                    + trimmed.length() + ".");
+        }
+        Invariant added = invariantStore.add(trimmed, category, forbiddenMarkers);
+        loadInvariants();
+        return added;
+    }
+
+    /** Результат /invariant remove: что сделано и какой инвариант удалён. */
+    public record InvariantRemoveResult(boolean removed, Invariant invariant) {
+    }
+
+    /**
+     * Удаляет инвариант (/invariant remove <id|номер>): сначала точное
+     * совпадение идентификатора; затем номер в порядке списка (1-базовый,
+     * как в /invariant). Номер обрабатывается первым, если корректен.
+     */
+    public InvariantRemoveResult invariantRemove(String idOrNumber) {
+        String token = idOrNumber == null ? "" : idOrNumber.trim();
+        Invariant target = null;
+        Integer number = null;
+        try {
+            number = Integer.parseInt(token);
+        } catch (NumberFormatException ignored) {
+        }
+        if (number != null && number >= 1 && number <= invariants.size()) {
+            target = invariants.get(number - 1);
+        } else {
+            String normalized = token.toLowerCase(java.util.Locale.ROOT);
+            for (Invariant invariant : invariants) {
+                if (invariant.id().toLowerCase(java.util.Locale.ROOT).equals(normalized)) {
+                    target = invariant;
+                    break;
+                }
+            }
+            if (target == null) {
+                // Частичное совпадение идентификатора (префикс) при
+                // единственном кандидате — как /forget по подстроке.
+                List<Invariant> prefixMatches = new ArrayList<>();
+                for (Invariant invariant : invariants) {
+                    if (invariant.id().toLowerCase(java.util.Locale.ROOT)
+                            .startsWith(normalized) && !normalized.isEmpty()) {
+                        prefixMatches.add(invariant);
+                    }
+                }
+                if (prefixMatches.size() == 1) {
+                    target = prefixMatches.get(0);
+                }
+            }
+        }
+        if (target == null) {
+            return new InvariantRemoveResult(false, null);
+        }
+        if (!invariantStore.remove(target.id())) {
+            throw new AgentException("Не удалось удалить инвариант «" + target.text()
+                    + "» (ошибка записи файла).");
+        }
+        loadInvariants();
+        return new InvariantRemoveResult(true, target);
+    }
+
+    /** Очищает все инварианты (/invariant clear); история и память не трогаются. */
+    public void invariantsClear() {
+        invariantStore.save(List.of());
+        loadInvariants();
+    }
+
+    // ================= Локальные инварианты задачи (/task invariant) =================
+
+    /**
+     * Локальные инварианты текущей задачи — жёсткие рамки, привязанные к
+     * задаче: живут ровно столько, сколько задача (часть TaskState,
+     * сессионное), исчезают вместе с ней (/task clear, /clear). Глобальные
+     * ({@link InvariantStore} и invariantsView()) при этом не трогаются.
+     */
+    public List<Invariant> taskInvariantsView() {
+        TaskState state = workingMemory.taskState();
+        return state == null ? List.of() : state.localInvariantsView();
+    }
+
+    /** Максимальная длина текста локального инварианта — как у глобального. */
+    private static final int MAX_TASK_INVARIANT_TEXT_LENGTH = 300;
+
+    /**
+     * Добавляет локальный инвариант к текущей задаче
+     * (/task invariant add …): создаёт Invariant с сгенерированным id
+     * (уникальность — в списке задачи), состояние задачи заменяется копией.
+     * Если задачи нет — ошибка: сначала /task start.
+     */
+    public Invariant taskInvariantAdd(String text, String category) {
+        return taskInvariantAdd(text, category, List.of());
+    }
+
+    /** Вариант с явными запрещёнными маркерами. */
+    public Invariant taskInvariantAdd(String text, String category,
+                                      List<String> forbiddenMarkers) {
+        TaskState state = requireTaskState();
+        if (text == null || text.isBlank()) {
+            throw new AgentException("Пустой локальный инвариант: укажите текст "
+                    + "(/task invariant add <текст> [категория]).");
+        }
+        String trimmed = text.trim();
+        if (trimmed.length() > MAX_TASK_INVARIANT_TEXT_LENGTH) {
+            throw new AgentException("Текст локального инварианта не длиннее "
+                    + MAX_TASK_INVARIANT_TEXT_LENGTH + " символов, получено: "
+                    + trimmed.length() + ".");
+        }
+        // Идентификатор уникален в списке локальных инвариантов задачи.
+        java.util.Set<String> existingIds = new java.util.HashSet<>();
+        for (Invariant invariant : state.localInvariantsView()) {
+            existingIds.add(invariant.id());
+        }
+        String normalizedCategory = category == null || category.isBlank()
+                ? "other" : category.trim().toLowerCase(java.util.Locale.ROOT);
+        Invariant created = Invariant.create(trimmed, normalizedCategory,
+                forbiddenMarkers, java.time.Instant.now());
+        while (existingIds.contains(created.id())) {
+            created = Invariant.create(trimmed, normalizedCategory, forbiddenMarkers,
+                    created.createdAt());
+        }
+        workingMemory.setTaskState(state.withLocalInvariant(created,
+                java.time.Instant.now()));
+        return created;
+    }
+
+    /**
+     * Результат /task invariant remove: что сделано и какой локальный
+     * инвариант удалён.
+     */
+    public record TaskInvariantRemoveResult(boolean removed, Invariant invariant) {
+    }
+
+    /**
+     * Удаляет локальный инвариант по номеру (1-базовый, порядок списка)
+     * или id; глобальные инварианты не трогаются.
+     */
+    public TaskInvariantRemoveResult taskInvariantRemove(String idOrNumber) {
+        String token = idOrNumber == null ? "" : idOrNumber.trim();
+        TaskState state = requireTaskState();
+        TaskState.TaskInvariantRemove result =
+                taskStateWithoutByToken(state, token);
+        if (result.removed() == null) {
+            return new TaskInvariantRemoveResult(false, null);
+        }
+        workingMemory.setTaskState(result.state());
+        return new TaskInvariantRemoveResult(true, result.removed());
+    }
+
+    /** Универсальное разрешение «номер|id» для локальных инвариантов состояния. */
+    private static TaskState.TaskInvariantRemove taskStateWithoutByToken(
+            TaskState state, String token) {
+        Invariant target = null;
+        Integer number = null;
+        try {
+            number = Integer.parseInt(token);
+        } catch (NumberFormatException ignored) {
+        }
+        if (number != null && number >= 1
+                && number <= state.localInvariantsView().size()) {
+            target = state.localInvariantsView().get(number - 1);
+        } else {
+            String normalized = token.toLowerCase(java.util.Locale.ROOT);
+            for (Invariant invariant : state.localInvariantsView()) {
+                if (invariant.id().toLowerCase(java.util.Locale.ROOT)
+                        .equals(normalized)) {
+                    target = invariant;
+                    break;
+                }
+            }
+            if (target == null && !normalized.isEmpty()) {
+                for (Invariant invariant : state.localInvariantsView()) {
+                    if (invariant.id().toLowerCase(java.util.Locale.ROOT)
+                            .startsWith(normalized)) {
+                        target = invariant;
+                        break;
+                    }
+                }
+            }
+        }
+        return target == null
+                ? new TaskState.TaskInvariantRemove(state, null)
+                : state.withoutLocalInvariant(target.id(), java.time.Instant.now());
+    }
+
+    /**
+     * Очищает локальные инварианты текущей задачи (/task invariant clear);
+     * остальное состояние задачи и глобальные инварианты не трогаются.
+     */
+    public void taskInvariantsClear() {
+        TaskState state = requireTaskState();
+        workingMemory.setTaskState(state.withoutLocalInvariants(
+                java.time.Instant.now()));
     }
 
     // ================= Профиль пользователя: команды =================
@@ -2505,7 +2781,8 @@ public final class LlmAgent {
     private List<ChatMessage> buildContextMessages(String userMessage) {
         return ContextBuilder.buildContextMessages(settings, history, userProfile,
                 longTermMemory, workingMemory.taskState(), workingMemory.factsView(),
-                userMessage, effectiveSummary());
+                userMessage, effectiveSummary(), List.copyOf(invariants),
+                taskInvariantsView());
     }
 
     /**

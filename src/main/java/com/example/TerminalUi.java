@@ -189,6 +189,8 @@ public interface TerminalUi extends AutoCloseable {
                         "что агент помнит: надолго, в рамках задачи и диалога"),
                 new Row("Профиль", "/profile /skill /pipeline",
                         "как к вам обращаться и как отвечать"),
+                new Row("Рамки", "/invariant /task invariant",
+                        "жёсткие ограничения, которые агент не нарушает"),
                 new Row("Контекст", "/context /summary /strategy /facts /branch",
                         "что уходит в запрос к модели"),
                 new Row("Диалог", "/clear /reset", "удалить текущую историю"),
@@ -222,7 +224,7 @@ public interface TerminalUi extends AutoCloseable {
     static String[] chatCommandNames() {
         return new String[]{
                 "/help", "/history", "/memory", "/remember", "/forget", "/task",
-                "/profile", "/skill", "/pipeline", "/clear", "/reset",
+                "/profile", "/skill", "/pipeline", "/invariant", "/clear", "/reset",
                 "/mode", "/multiline", "/paste", "/demo",
                 "/context", "/summary", "/strategy", "/facts", "/branch",
                 "/tokens", "/stats", "/limit", "/status", "/exit",
@@ -378,6 +380,10 @@ public interface TerminalUi extends AutoCloseable {
                       /task expect <текст>             — ожидаемое действие
                       /task pause · /task resume       — пауза и продолжение
                       /task block · /task unblock      — ожидание внешних данных
+                      /task invariant                  — локальные рамки задачи (жизненный
+                                                          цикл — с задачей; /task clear их стирает)
+                      /task invariant add <текст> [категория] [запрещено: …]
+                      /task invariant remove <номер|id> · /task invariant clear
                       /task · /task status             — состояние
                       /task clear                      — очистить
 
@@ -387,15 +393,18 @@ public interface TerminalUi extends AutoCloseable {
                       /task stage execution не сошлись итоговые цифры
 
                     Эффекты
-                      этапы — только вперёд planning → execution → validation → done;
+                     этапы — только вперёд planning → execution → validation → done;
                       возврат validation → execution — с причиной; DONE → planning
                       нельзя (это новая задача). Пауза замораживает этап, шаг и
                       выполненные шаги; возобновление — только /task resume.
                       Состояние подставляется в каждый запрос блоком
                       «СОСТОЯНИЕ ЗАДАЧИ» и живёт до /task clear или /clear
-                      (текущий запуск). Не вызывает API.
+                      (текущий запуск). Локальные инварианты (/task invariant)
+                      — часть состояния задачи: существуют только у активной
+                      задачи, уточняют глобальные, не отменяя их.
+                      Не вызывает API.
 
-                    Связано: /facts, /memory.""";
+                    Связано: /facts, /memory, /invariant.""";
             case "/profile" -> """
                     /profile — профиль пользователя (обращение, стиль, формат, ограничения)
 
@@ -458,6 +467,35 @@ public interface TerminalUi extends AutoCloseable {
                       упорядоченных инструкций. Не вызывает API.
 
                     Связано: /skill, /profile.""";
+            case "/invariant" -> """
+                    /invariant — жёсткие ограничения, которые агент не нарушает
+
+                    Использование
+                      /invariant                              — список рамок
+                      /invariant add <текст> [категория] [запрещено: слова]
+                      /invariant remove <id|номер>            — удалить рамку
+                      /invariant clear                        — удалить все
+
+                    Примеры
+                      /invariant add модульный монолит на Java 21, без Spring и БД architecture запрещено: spring, spring boot, hibernate
+                      /invariant add только стандартная библиотека и Jackson stack
+                      /invariant remove 1
+
+                    Эффекты
+                      инвариант — не предпочтение и не факт памяти: рамка обязана
+                      учитываться в каждом ответе. Подставляется в запрос блоком
+                      «ИНВАРИАНТЫ»; при конфликте запроса агент отказывается:
+                      называет нарушенный инвариант, объясняет противоречие
+                      и предлагает альтернативу в рамках рамки. Явный конфликт
+                      ловится до вызова API (проверка слов по границам слов,
+                      отказ без расхода токенов); «почему нельзя …» и отрицания
+                      не блокируются — это обсуждение, а не запрос на нарушение.
+                      Категории: architecture|stack|decision|business|other
+                      (не указана — other). Переживают /clear, /reset
+                      и перезапуск (отдельный файл invariants.json).
+                      Не вызывает API.
+
+                    Связано: /profile constraint, /memory, /task.""";
             case "/clear" -> """
                     /clear — удалить историю текущего диалога
 

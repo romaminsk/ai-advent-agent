@@ -50,6 +50,17 @@ public final class CommandHints {
         return "Дальше: /memory — посмотреть записи";
     }
 
+    /** После /invariant add: посмотреть все рамки; упомянуть явные маркеры. */
+    public static String afterInvariantAdd() {
+        return "Дальше: /invariant — посмотреть все рамки · при add можно задать "
+                + "«запрещено: маркер1, маркер2» — конфликт будет ловиться до API";
+    }
+
+    /** После /task invariant add: посмотреть локальные рамки задачи. */
+    public static String afterTaskInvariantAdd() {
+        return "Дальше: /task invariant — посмотреть локальные рамки";
+    }
+
     /** После /pipeline: как проверить, что связка работает. */
     public static String afterPipeline() {
         return "Дальше: обычным сообщением с триггером — скиллы подставятся в запрос";
