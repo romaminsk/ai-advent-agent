@@ -180,6 +180,18 @@ public final class Main {
                     }
                     case MESSAGE -> {
                         LlmAgent activeAgent = activeAgent(demoRef, agent);
+                        // Детерминированная проверка инвариантов на вводе: яВный
+                        // конфликт ловится ДО вызова API — отказ без расхода
+                        // токенов, в историю диалога не попадает. Неочевидное
+                        // уходит модели как обычно (блок «ИНВАРИАНТЫ» —
+                        // последняя линия защиты).
+                        List<InvariantGuard.Conflict> invariantConflicts =
+                                InvariantGuard.check(input.text(),
+                                        activeAgent.invariantsView());
+                        if (!invariantConflicts.isEmpty()) {
+                            ui.showSystem(formatInvariantsRefusal(invariantConflicts));
+                            break;
+                        }
                         // Предупреждение о прогнозируемом превышении контекстного
                         // бюджета (только политика warn; block блокирует внутри агента).
                         String budgetWarning = activeAgent.predictContextBudgetWarning(input.text());
@@ -559,34 +571,98 @@ public final class Main {
     }
 
     /**
-     * Разбор «/invariant add <текст> [категория]»: если последний токен —
-     * известная категория (architecture|stack|decision|business|other), она
-     * отделяется; иначе категория по умолчанию other.
+     * Разбор «/invariant add <текст> [категория] [запрещено: маркер1, маркер2]»:
+     * 1) хвост «запрещено: …» (найден по последнему вхождению, без учёта
+     * регистра) — явные запрещённые маркеры через запятую;
+     * 2) если последний токен текста — известная категория
+     * (architecture|stack|decision|business|other), она отделяется;
+     * 3) иначе категория по умолчанию other.
      */
     private static void handleInvariantAdd(TerminalUi ui, LlmAgent agent, String rest) {
         if (rest.isEmpty()) {
-            ui.showSystem("Использование: /invariant add <текст> [категория]. "
-                    + "Категории: architecture|stack|decision|business|other "
-                    + "(не указана — other).");
+            ui.showSystem("Использование: /invariant add <текст> [категория] "
+                    + "[запрещено: маркер1, маркер2]. Категории: architecture|stack|"
+                    + "decision|business|other (не указана — other).");
             return;
         }
-        String text = rest;
+        List<String> markers = List.of();
+        String bodyPart = rest;
+        int markerIdx = forbiddenMarkerIndex(rest);
+        if (markerIdx >= 0) {
+            markers = parseForbiddenMarkers(rest.substring(
+                    markerIdx + "запрещено:".length()));
+            bodyPart = rest.substring(0, markerIdx).trim();
+        }
+        String text = bodyPart;
         String category = "other";
-        String[] words = rest.split("\\s+");
+        String[] words = bodyPart.split("\\s+");
         String last = words[words.length - 1].toLowerCase(java.util.Locale.ROOT);
         if (words.length > 1 && List.of("architecture", "stack", "decision",
                 "business", "other").contains(last)) {
             category = last;
-            text = rest.substring(0, rest.length() - last.length()).trim();
+            text = bodyPart.substring(0, bodyPart.length() - last.length()).trim();
         }
-        Invariant invariant = agent.invariantAdd(text, category);
+        Invariant invariant = agent.invariantAdd(text, category, markers);
         ui.showSystem("✓ Инвариант задан: «" + invariant.text() + "» ["
-                + invariant.category() + "].\n  " + CommandHints.afterInvariantAdd());
+                + invariant.category() + "]"
+                + (invariant.hasForbiddenMarkers()
+                ? "\n  запрещено: "
+                + String.join(", ", invariant.forbiddenMarkers())
+                : "")
+                + ".\n  " + CommandHints.afterInvariantAdd());
+    }
+
+    /** Индекс «запрещено:» без учёта регистра; -1 — нет. */
+    private static int forbiddenMarkerIndex(String raw) {
+        String lower = raw.toLowerCase(java.util.Locale.ROOT);
+        return lower.lastIndexOf("запрещено:");
+    }
+
+    /** Разбор списка маркеров «a, b, c» (пустые отбрасываются, регистр — как введено). */
+    private static List<String> parseForbiddenMarkers(String markersRaw) {
+        List<String> markers = new ArrayList<>();
+        for (String part : markersRaw.split(",")) {
+            String marker = part.trim();
+            if (!marker.isEmpty()) {
+                markers.add(marker);
+            }
+        }
+        return markers;
+    }
+
+    /**
+     * Детерминированный отказ при конфликте запроса и инвариантов
+     * (до вызова API). Три части, как у модельного отказа: какой
+     * инвариант нарушается (цитата и сработавшие маркеры) → почему
+     * конфликт → альтернатива в рамках; плюс строка о пересмотре
+     * (/invariant remove, а не обход в диалоге).
+     */
+    static String formatInvariantsRefusal(List<InvariantGuard.Conflict> conflicts) {
+        StringBuilder text = new StringBuilder(
+                "! Запрос отклонён до вызова API: детерминированная проверка "
+                        + " нашла конфликт с инвариантами (модель не вызывалась, "
+                        + "расход токенов нулевой, история не изменена).");
+        for (InvariantGuard.Conflict conflict : conflicts) {
+            Invariant invariant = conflict.invariant();
+            text.append("\n  инвариант: ")
+                    .append(invariant.category() == null
+                            ? "" : "[" + invariant.category() + "] ")
+                    .append(invariant.text());
+            text.append("\n    нарушено словом(ами): ")
+                    .append(String.join(", ", conflict.matchedMarkers()));
+        }
+        text.append("\n  почему: запрос прямо содержит запрещённые слова рамки — ")
+                .append(" предлагать и частично выполнять такое решение нельзя.");
+        text.append("\n  альтернатива: сформулируйте задачу в рамках инварианта ")
+                .append("(например, средствами разрешённого стека).").append(" Обсуждение ")
+                .append(" («почему нельзя …») не блокируется — оно уходит модели.");
+        text.append("\n  пересмотр: /invariant remove <id|номер> — меняет рамку, ")
+                .append("а не обход в диалоге.");
+        return text.toString();
     }
 
     /** Текст /invariant: список рамок с категориями, id и порядковыми номерами. */
-    static String formatInvariants(LlmAgent agent) {
-        List<Invariant> invariants = agent.invariantsView();
+    static String formatInvariants(LlmAgent agent) {        List<Invariant> invariants = agent.invariantsView();
         StringBuilder text = new StringBuilder("Инварианты — жёсткие ограничения, "
                 + "которые агент не нарушает (переживают /clear, /reset и перезапуск; "
                 + "отдельный файл). Задача пользователя, противоречащая рамке, "
@@ -602,6 +678,10 @@ public final class Main {
                     .append(invariant.text())
                     .append("\n     id: ").append(invariant.id())
                     .append(" · задан: ").append(invariant.createdAt());
+            if (invariant.hasForbiddenMarkers()) {
+                text.append("\n     запрещено: ")
+                        .append(String.join(", ", invariant.forbiddenMarkers()));
+            }
         }
         text.append("\n  удалить: /invariant remove <id|номер> · очистить все: /invariant clear");
         return text.toString();

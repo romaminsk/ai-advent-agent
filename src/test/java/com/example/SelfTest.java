@@ -214,6 +214,9 @@ public final class SelfTest {
             checkInvariantCommands();
             checkInvariantBlockInSystemMessage();
             checkInvariantBlockInRealRequest();
+            checkInvariantGuardRules();
+            checkInvariantGuardNoApiInMessage();
+            checkInvariantAddForbiddenMarkers();
             checkInvariantsNotInWorkingMemoryOrHistory();
             checkInvariantHelpAndIndex();
             checkThreeLayersInRequest();
@@ -7045,6 +7048,34 @@ public final class SelfTest {
         } catch (IllegalArgumentException e) {
             expect("пустой текст инварианта отклоняется", true);
         }
+
+        // Обратная совместимость: старый JSON без forbiddenMarkers читается
+        // как пустой список маркеров.
+        Path legacyFile = Files.createTempDirectory(baseTempDir, "inv-legacy-")
+                .resolve("invariants.json");
+        Files.writeString(legacyFile, """
+                {"schemaVersion": 1, "items": [
+                  {"id": "aa11bb22", "text": "старая рамка без маркеров",
+                   "category": "stack", "createdAt": "2026-01-01T00:00:00Z"}
+                ]}
+                """, StandardCharsets.UTF_8);
+        Invariant legacy = new InvariantStore(legacyFile).list().get(0);
+        expect("старые инварианты без маркеров читаются как пустой список",
+                legacy.forbiddenMarkers().isEmpty());
+
+        // Маркеры сериализуются и читаются обратно.
+        InvariantStore roundtrip = new InvariantStore(
+                Files.createTempDirectory(baseTempDir, "inv-roundtrip-")
+                        .resolve("invariants.json"));
+        roundtrip.add("рамка с маркерами", "stack", List.of("fastjson", "log4j"));
+        JsonNode markersJson = MAPPER.readTree(Files.readString(
+                roundtrip.file(), StandardCharsets.UTF_8));
+        expect("маркеры попадают в JSON (forbiddenMarkers)",
+                markersJson.path("items").get(0).path("forbiddenMarkers")
+                        .size() == 2);
+        expect("маркеры переживают переоткрытие хранилища",
+                new InvariantStore(roundtrip.file()).list().get(0)
+                        .forbiddenMarkers().equals(List.of("fastjson", "log4j")));
     }
 
     /** /invariant add → в списке; remove по id и по номеру; clear; подсказка. */
@@ -7222,7 +7253,9 @@ public final class SelfTest {
                             "/invariant add без Spring и БД stack"),
                     TerminalUi.Input.command("/exit"));
             Main.runLoop(ui, agent, "glm-5.3-flash");
-            agent.ask("добавь Spring Boot в проект");
+            // Нейтральный запрос уходит модели как обычно (проверка не мешает):
+            // «добавь spring» теперь ловится до API (см. checkInvariantGuardNoApiInMessage).
+            agent.ask("расскажи про структуру проекта");
             String system = MAPPER.readTree(lastBody.get())
                     .path("messages").get(0).path("content").asText();
             expect("в запросе есть блок «ИНВАРИАНТЫ (жёсткие рамки, нарушать нельзя)»",
@@ -7238,6 +7271,192 @@ public final class SelfTest {
                     .path("messages").get(0).path("content").asText();
             expect("инварианты переживают /clear и остаются в запросе",
                     rebuilt.contains("[stack] без Spring и БД"));
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Правила InvariantGuard: границы слов, регистр, отрицание, вопрос, словарь. */
+    private static void checkInvariantGuardRules() {
+        Invariant springStack = new Invariant("ab12cd34",
+                "без Spring и БД", "stack", List.of("spring", "spring boot"),
+                Instant.parse("2026-01-01T00:00:00Z"));
+        Invariant archBuiltin = new Invariant("ef34cd56",
+                "модульный монолит на Java 21", "architecture",
+                Instant.parse("2026-01-01T00:00:00Z"));
+        Invariant businessNoMarkers = new Invariant("0912abef",
+                "CSV-экспорт — по RFC 4180, с BOM", "business",
+                Instant.parse("2026-01-01T00:00:00Z"));
+
+        // Явный конфликт с многословным маркером.
+        List<InvariantGuard.Conflict> conflicts = InvariantGuard.check(
+                "добавь spring boot в проект", List.of(springStack, businessNoMarkers));
+        expect("явный конфликт ловится: «добавь spring boot» при маркере «spring boot»",
+                conflicts.size() == 1
+                        && conflicts.get(0).invariant().equals(springStack)
+                        && conflicts.get(0).matchedMarkers().contains("spring boot"));
+
+        // Регистронезависимость.
+        expect("матчинг регистронезависим (Locale.ROOT)",
+                !InvariantGuard.check("Добавь SPRING BOOT",
+                        List.of(springStack)).isEmpty());
+
+        // Границы слов: springfield не ловится как spring.
+        expect("границы слов: «springfield-парсер» не ловится как «spring»",
+                InvariantGuard.check("добавь springfield-парсер",
+                        List.of(springStack)).isEmpty());
+
+        // Отрицание и вопрос — не запрос на нарушение.
+        expect("отрицание «не используй spring» не блокируется",
+                InvariantGuard.check("не используй spring",
+                        List.of(springStack)).isEmpty());
+        expect("вопрос «почему нельзя spring?» не блокируется",
+                InvariantGuard.check("почему нельзя spring?",
+                        List.of(springStack)).isEmpty());
+        expect("обсуждение без императива не блокируется",
+                InvariantGuard.check("spring обсуждается в команде",
+                        List.of(springStack)).isEmpty());
+
+        // Встроенный словарь по категории architecture.
+        expect("встроенный словарь: «подключи hibernate» ловится по категории",
+                !InvariantGuard.check("подключи hibernate",
+                        List.of(archBuiltin)).isEmpty());
+        // Встроенный словарь не применяется, если инвариант сам разрешает слово.
+        Invariant gsonAllowed = gsonAllowedInvariant();
+        expect("встроенный маркер не ловится, если инвариант сам разрешает слово",
+                InvariantGuard.check("используй gson для json",
+                        List.of(gsonAllowed)).isEmpty());
+        Invariant stackBuiltin = new Invariant("cc44dd55",
+                "только разрешённые библиотеки", "stack",
+                Instant.parse("2026-01-01T00:00:00Z"));
+        expect("встроенный словарь stack: «используй log4j» ловится по категории",
+                !InvariantGuard.check("используй log4j в модулях",
+                        List.of(stackBuiltin)).isEmpty());
+        // Пустой список маркеров и категория business — конфликта нет.
+        expect("без маркеров и вне словарных категорий конфликта нет",
+                InvariantGuard.check("добавь всё что угодно",
+                        List.of(businessNoMarkers)).isEmpty());
+        // Пустой запрос и пустой список инвариантов.
+        expect("пустой запрос не даёт конфликта",
+                InvariantGuard.check("   ", List.of(springStack)).isEmpty());
+        expect("пустой список инвариантов не даёт конфликта",
+                InvariantGuard.check("добавь spring boot", List.of()).isEmpty());
+    }
+
+    /** Инвариант «gson разрешён» для проверки фильтра встроенного словаря. */
+    private static Invariant gsonAllowedInvariant() {
+        return new Invariant("11aa22bb", "миграция на gson — разрешено",
+                "stack", Instant.parse("2026-01-01T00:00:00Z"));
+    }
+
+    /**
+     * Отказ на вводе (до API): счётчик вызовов не растёт, история пуста,
+     * текст отказа — три части + пересмотр.
+     */
+    private static void checkInvariantGuardNoApiInMessage() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        AtomicInteger hitCounter = new AtomicInteger();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            hitCounter.incrementAndGet();
+            return new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                    + "\"content\":\"Ок\"}}]}").getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            InvariantStore invariantStore = new InvariantStore(
+                    Files.createTempDirectory(baseTempDir, "inv-")
+                            .resolve("invariants.json"));
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort()
+                            + "/v1/chat/completions", "glm-5.3-flash");
+            LlmAgent agent = new LlmAgent(config, ModelSettings.defaults(),
+                    trustedHttpClient(keyStore), tempStore(), tempMemoryStore(),
+                    tempProfileStoreForTests(), invariantStore);
+            FakeUi setupUi = new FakeUi(
+                    TerminalUi.Input.command(
+                            "/invariant add без Spring и БД stack запрещено: spring, spring boot"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(setupUi, agent, "glm-5.3-flash");
+
+            int hitsBefore = hitCounter.get();
+            FakeUi refusedUi = new FakeUi(
+                    TerminalUi.Input.message("добавь spring boot"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(refusedUi, agent, "glm-5.3-flash");
+            expect("детерминированный конфликт ловится до API: счётчик вызовов не растёт",
+                    hitCounter.get() == hitsBefore);
+            expect("отказ не попал в историю как ответ модели",
+                    agent.getHistory().isEmpty());
+            String refusalText = String.join("\n", refusedUi.systems);
+            expect("отказ называет инвариант и сработавшие маркеры",
+                    refusalText.contains("[stack] без Spring и БД")
+                            && refusalText.contains("spring boot"));
+            expect("отказ объясняет противоречие и альтернативу",
+                    refusalText.contains("почему") && refusalText.contains("альтернатива"));
+            expect("отказ указывает на пересмотр (/invariant remove), "
+                            + "а не обход в диалоге",
+                    refusalText.contains("/invariant remove"));
+
+            // Нейтральное сообщение уходит модели как обычно.
+            int afterRefusal = hitCounter.get();
+            FakeUi passUi = new FakeUi(
+                    TerminalUi.Input.message("расскажи про структуру проекта"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(passUi, agent, "glm-5.3-flash");
+            expect("запрос без конфликта уходит модели как обычно",
+                    hitCounter.get() == afterRefusal + 1
+                            && agent.getHistory().size() == 2);
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** «запрещено: …» сохраняется, показывается в списке и переживает перезапуск. */
+    private static void checkInvariantAddForbiddenMarkers() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) ->
+                new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                        + "\"content\":\"Ок\"}}]}").getBytes(StandardCharsets.UTF_8)));
+        try {
+            InvariantStore invariantStore = tempInvariantStoreForTests();
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort()
+                            + "/v1/chat/completions", "glm-5.3-flash");
+            LlmAgent agent = new LlmAgent(config, ModelSettings.defaults(),
+                    trustedHttpClient(keyStore), tempStore(), tempMemoryStore(),
+                    tempProfileStoreForTests(), invariantStore);
+            FakeUi ui = new FakeUi(
+                    TerminalUi.Input.command(
+                            "/invariant add без Spring и БД architecture "
+                                    + "запрещено: spring, spring boot, hibernate"),
+                    TerminalUi.Input.command("/invariant"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(ui, agent, "glm-5.3-flash");
+            Invariant stored = agent.invariantsView().get(0);
+            expect("«запрещено: …» сохраняется в маркерах инварианта",
+                    stored.forbiddenMarkers().equals(List.of(
+                            "spring", "spring boot", "hibernate")));
+            expect("список инвариантов показывает запрещённые слова",
+                    ui.systems.stream().anyMatch(t -> t.contains("запрещено:")
+                            && t.contains("spring boot")));
+            expect("текст рамки чист от служебного хвоста «запрещено:»",
+                    !stored.text().contains("запрещено"));
+            expect("подсказка после add упоминает «запрещено:»",
+                    ui.systems.stream().anyMatch(t -> t.contains("запрещено:")
+                            && t.contains("до API")));
+
+            LlmAgent restarted = new LlmAgent(new Config("test-key",
+                    "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash"),
+                    ModelSettings.defaults(),
+                    java.net.http.HttpClient.newHttpClient(),
+                    new JsonConversationStore(Files.createTempDirectory(baseTempDir, "hist-")
+                            .resolve("conversation.json")),
+                    tempMemoryStore(), tempProfileStoreForTests(),
+                    new InvariantStore(invariantStore.file()));
+            expect("маркеры переживают перезапуск",
+                    restarted.invariantsView().get(0).forbiddenMarkers()
+                            .equals(List.of("spring", "spring boot", "hibernate")));
         } finally {
             server.stop(0);
             Files.deleteIfExists(keyStore);

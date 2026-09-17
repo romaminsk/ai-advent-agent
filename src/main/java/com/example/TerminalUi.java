@@ -465,12 +465,12 @@ public interface TerminalUi extends AutoCloseable {
 
                     Использование
                       /invariant                              — список рамок
-                      /invariant add <текст> [категория]      — задать рамку
+                      /invariant add <текст> [категория] [запрещено: слова]
                       /invariant remove <id|номер>            — удалить рамку
                       /invariant clear                        — удалить все
 
                     Примеры
-                      /invariant add модульный монолит на Java 21, без Spring и БД architecture
+                      /invariant add модульный монолит на Java 21, без Spring и БД architecture запрещено: spring, spring boot, hibernate
                       /invariant add только стандартная библиотека и Jackson stack
                       /invariant remove 1
 
@@ -479,10 +479,14 @@ public interface TerminalUi extends AutoCloseable {
                       учитываться в каждом ответе. Подставляется в запрос блоком
                       «ИНВАРИАНТЫ»; при конфликте запроса агент отказывается:
                       называет нарушенный инвариант, объясняет противоречие
-                      и предлагает альтернативу в рамках рамки. Категории:
-                      architecture|stack|decision|business|other (не указана —
-                      other). Переживают /clear, /reset и перезапуск
-                      (отдельный файл invariants.json). Не вызывает API.
+                      и предлагает альтернативу в рамках рамки. Явный конфликт
+                      ловится до вызова API (проверка слов по границам слов,
+                      отказ без расхода токенов); «почему нельзя …» и отрицания
+                      не блокируются — это обсуждение, а не запрос на нарушение.
+                      Категории: architecture|stack|decision|business|other
+                      (не указана — other). Переживают /clear, /reset
+                      и перезапуск (отдельный файл invariants.json).
+                      Не вызывает API.
 
                     Связано: /profile constraint, /memory, /task.""";
             case "/clear" -> """

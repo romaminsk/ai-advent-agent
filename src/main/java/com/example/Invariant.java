@@ -1,6 +1,8 @@
 package com.example;
 
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
 
@@ -17,11 +19,14 @@ import java.util.UUID;
  *
  * Поля: id — уникальный короткий идентификатор (8 hex-символов, для удаления);
  * text — текст инварианта; category — необязательная категория для группировки
- * в выводе (architecture|stack|decision|business|other); createdAt — момент
- * создания. Категория нормализуется к нижнему регистру (Locale.ROOT),
- * пустая — null.
+ * в выводе (architecture|stack|decision|business|other); forbiddenMarkers —
+ * необязательные запрещённые слова/фразы для детерминированной проверки
+ * на вводе (пустые — только блок «ИНВАРИАНТЫ» и встроенный словарь
+ * {@link InvariantGuard}); createdAt — момент создания. Категория и маркеры
+ * нормализуются к нижнему регистру (Locale.ROOT).
  */
-public record Invariant(String id, String text, String category, Instant createdAt) {
+public record Invariant(String id, String text, String category,
+                        List<String> forbiddenMarkers, Instant createdAt) {
 
     public Invariant {
         if (id == null || id.isBlank()) {
@@ -37,11 +42,40 @@ public record Invariant(String id, String text, String category, Instant created
         text = text.trim();
         category = category == null || category.isBlank()
                 ? null : category.trim().toLowerCase(Locale.ROOT);
+        // Маркеры нормализуются и дедуплицируются; пустой список — как было.
+        List<String> normalizedMarkers = new ArrayList<>();
+        if (forbiddenMarkers != null) {
+            for (String marker : forbiddenMarkers) {
+                String normalized = marker == null
+                        ? "" : marker.trim().toLowerCase(Locale.ROOT);
+                if (!normalized.isEmpty()
+                        && !normalizedMarkers.contains(normalized)) {
+                    normalizedMarkers.add(normalized);
+                }
+            }
+        }
+        forbiddenMarkers = List.copyOf(normalizedMarkers);
+    }
+
+    /** Совместимый конструктор без маркеров (старый формат и простые вызовы). */
+    public Invariant(String id, String text, String category, Instant createdAt) {
+        this(id, text, category, List.of(), createdAt);
     }
 
     /** Новый инвариант с сгенерированным идентификатором и временем создания. */
     public static Invariant create(String text, String category, Instant now) {
-        return new Invariant(newId(), text, category, now);
+        return create(text, category, List.of(), now);
+    }
+
+    /** Новый инвариант с маркерами, идентификатором и временем создания. */
+    public static Invariant create(String text, String category,
+                                   List<String> forbiddenMarkers, Instant now) {
+        return new Invariant(newId(), text, category, forbiddenMarkers, now);
+    }
+
+    /** true, если у инварианта заданы явные запрещённые маркеры. */
+    public boolean hasForbiddenMarkers() {
+        return !forbiddenMarkers.isEmpty();
     }
 
     /** Короткий идентификатор: 8 hex-символов UUID (читабельно в /invariant remove). */

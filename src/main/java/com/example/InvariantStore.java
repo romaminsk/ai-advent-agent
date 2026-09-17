@@ -163,8 +163,24 @@ public final class InvariantStore {
             if (createdAt == null) {
                 throw corrupt("у записи инварианта нет метки времени");
             }
+            // Обратная совместимость: старые записи без forbiddenMarkers
+            // читаются как пустой список маркеров.
+            List<String> markers = new ArrayList<>();
+            if (node.has("forbiddenMarkers")) {
+                JsonNode markersNode = node.get("forbiddenMarkers");
+                if (!markersNode.isArray()) {
+                    throw corrupt("forbiddenMarkers должен быть массивом строк");
+                }
+                for (JsonNode markerNode : markersNode) {
+                    if (!markerNode.isTextual()) {
+                        throw corrupt("запрещённый маркер должен быть строкой");
+                    }
+                    markers.add(markerNode.asText());
+                }
+            }
             try {
-                invariants.add(new Invariant(id, text, category, Instant.parse(createdAt)));
+                invariants.add(new Invariant(id, text, category, markers,
+                        Instant.parse(createdAt)));
             } catch (IllegalArgumentException | java.time.format.DateTimeParseException e) {
                 throw corrupt("запись инварианта повреждена (" + e.getMessage() + ")");
             }
@@ -226,18 +242,24 @@ public final class InvariantStore {
 
     /** Добавляет инвариант и сохраняет файл; возвращает созданную запись. */
     public Invariant add(String text, String category) {
+        return add(text, category, List.of());
+    }
+
+    /** Добавляет инвариант с запрещёнными маркерами; возвращает созданную запись. */
+    public Invariant add(String text, String category, List<String> forbiddenMarkers) {
         // Категория по умолчанию — other (для группировки в выводе).
         String normalized = category == null || category.isBlank()
                 ? "other" : category.trim().toLowerCase(java.util.Locale.ROOT);
+        List<String> markers = forbiddenMarkers == null ? List.of() : forbiddenMarkers;
         List<Invariant> invariants = load();
         // Идентификатор уникален в списке: коллизия короткого id генерируется заново.
         Set<String> existingIds = new java.util.HashSet<>();
         for (Invariant invariant : invariants) {
             existingIds.add(invariant.id());
         }
-        Invariant created = Invariant.create(text, normalized, Instant.now());
+        Invariant created = Invariant.create(text, normalized, markers, Instant.now());
         while (existingIds.contains(created.id())) {
-            created = Invariant.create(text, normalized, created.createdAt());
+            created = Invariant.create(text, normalized, markers, created.createdAt());
         }
         invariants.add(created);
         save(invariants);
@@ -269,6 +291,12 @@ public final class InvariantStore {
             node.put("text", invariant.text());
             if (invariant.category() != null) {
                 node.put("category", invariant.category());
+            }
+            if (!invariant.forbiddenMarkers().isEmpty()) {
+                var markersNode = node.putArray("forbiddenMarkers");
+                for (String marker : invariant.forbiddenMarkers()) {
+                    markersNode.add(marker);
+                }
             }
             node.put("createdAt", invariant.createdAt().toString());
         }

@@ -1412,12 +1412,18 @@ public final class LlmAgent {
     private static final int MAX_INVARIANT_TEXT_LENGTH = 300;
 
     /**
-     * Добавляет инвариант (/invariant add <текст> [категория]). Текст —
-     * формулировка рамки, обрезается до 300 символов; категория
+     * Добавляет инвариант (/invariant add <текст> [категория] [запрещено:…]).
+     * Текст — формулировка рамки, обрезается до 300 символов; категория
      * нормализуется хранилищем. Запись в отдельный файл атомарная; при
      * ошибке записи инвариант не сохраняется.
      */
     public Invariant invariantAdd(String text, String category) {
+        return invariantAdd(text, category, List.of());
+    }
+
+    /** Вариант с явными запрещёнными маркерами (для детерминированной проверки). */
+    public Invariant invariantAdd(String text, String category,
+                                  List<String> forbiddenMarkers) {
         if (text == null || text.isBlank()) {
             throw new AgentException("Пустой инвариант: укажите текст "
                     + "(/invariant add <текст> [категория]).");
@@ -1428,7 +1434,7 @@ public final class LlmAgent {
                     + MAX_INVARIANT_TEXT_LENGTH + " символов, получено: "
                     + trimmed.length() + ".");
         }
-        Invariant added = invariantStore.add(trimmed, category);
+        Invariant added = invariantStore.add(trimmed, category, forbiddenMarkers);
         loadInvariants();
         return added;
     }
