@@ -25,6 +25,8 @@ import java.net.http.HttpClient;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.security.KeyStore;
 import java.time.Duration;
 import java.time.Instant;
@@ -34,6 +36,7 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -110,51 +113,85 @@ public final class SelfTest {
     /** Базовый временный каталог для всех файловых проверок; удаляется в конце. */
     private static Path baseTempDir;
 
+    /**
+     * Единый счётчик пройденных проверок и текущая группа (для отчёта):
+     * инкрементируется ровно в одном месте — в {@link #expect}; итоговое
+     * число выводится из него же. Падение называет группу, проверку
+     * и разницу «ожидалось / получено» без голого assert.
+     */
     private static int passed = 0;
 
+    /** Текущая группа проверок (слои архитектуры), задётся методом group(). */
+    private static String currentGroup = "без группы";
+
+    /** Задание текущей группы проверок (для сообщений об ошибках). */
+    private static void group(String name) {
+        currentGroup = name;
+        System.out.println("--- Группа: " + name);
+    }
+
+    /**
+     * Единственная точка учёта: одна строка — одна проверка. При падении
+     * AssertionError содержит группу, описание и сравнение «ожидалось —
+     * получено» (ожидаемо true, получено — значение условия невозможно
+     * вычленить, поэтому печатается вся строка-описание), затем список
+     * пройденных к моменту падения — для локализации.
+     */
+    private static void expect(String description, boolean condition) {
+        if (!condition) {
+            throw new AssertionError("Проверка не пройдена — группа: "
+                    + currentGroup + "; проверка: " + description
+                    + "; ожидалось: истина, получено: ложь; "
+                    + "пройдено до падения: " + passed + " проверок.");
+        }
+        passed++;
+        System.out.println("OK: " + description);
+    }
     public static void main(String[] args) throws Exception {
         baseTempDir = Files.createTempDirectory("selftest-day8");
         try {
+            // --- Диалог с моделью (локальный HTTPS-сервер, без платных запросов) ---
+            group("Диалог");
             checkConfigErrors();
             checkEmptyQueryNoApiCall();
             checkDialogOnLocalServer();
+            checkRequestParameters();
+            checkContextLimit();
+            checkErrorClassification();
+
+            // --- Хранилища: ConversationStore, MemoryStore, ProfileStore, InvariantStore ---
+            group("Хранилища");
             checkConversationStore();
+            checkStoreValidation();
             checkPersistenceAcrossAgents();
             checkSaveFailure();
+            checkSaveFailureKeepsPreviousFile();
             checkCorruptedFile();
             checkLocking();
             checkMainCommandsPersistence();
-            checkPlainTerminalUi();
-            checkAnsiSanitizer();
-            checkProgressSpinner();
+            checkStoresHardening();
             checkModelSettings();
-            checkRequestParameters();
-            checkContextLimit();
+            checkSessionTokenLimitSettings();
+
+            // --- Модель состояния: TaskState, TaskStage, TaskStatus, Invariant ---
+            group("Состояние задачи");
+            checkTaskStateMachineModel();
+            checkTaskStateEdgeCases();
+            checkTaskCommands();
+            checkTaskStateCommands();
+            checkTaskStateBlockInSystemMessage();
+            checkTaskStatePauseResumeInRequest();
+
+            // --- Контекст: Layer Builder (ContextBuilder, режимы, стратегии) ---
+            group("Контекст");
             checkDiagnosticsAndLimit();
-            checkModeCommand();
+            checkContextBudget();
+            checkTokensStatsCommandsNoApi();
             checkTokenCounterHeuristics();
             checkTokenEstimations();
             checkSessionUsageAccounting();
             checkSessionCost();
-            checkContextBudget();
-            checkErrorClassification();
-            checkTokensStatsCommandsNoApi();
-            checkOldHistoryCompatible();
-            checkSessionTokenLimitSettings();
             checkSessionTokenLimitFeature();
-            checkClearCommand();
-            checkClearConfirmationUi();
-            checkUiPrompt();
-            checkUiMessageMarkers();
-            checkUiRedesign();
-            checkUiColorAndMarkdown();
-            checkHistoryStoreCleanText();
-            checkClearDemoIsolation();
-            checkClearErrorKeepsMemory();
-            checkDemoTokensMode();
-            checkDemoFailureClassifications();
-            checkDemoCommandsNoApi();
-            checkPasteInput();
             checkDay9SettingsValidation();
             checkDay9SummaryThresholds();
             checkDay9IncrementalSummary();
@@ -187,56 +224,91 @@ public final class SelfTest {
             checkDay10BranchPersistence();
             checkDay10StrategyCompare();
             checkDay10CompareGuards();
-            checkDay10OtherStoreValidation();
             checkFactsPrepLengthAbortsCompare();
             checkFactsNearLimitWarning();
+            checkThreeLayersInRequest();
+            checkContextBlockOrder();
+            checkMemoryUpdateAccountingOnce();
+
+            // --- Команды: профиль, память, задачи, инварианты ---
+            group("Команды");
             checkMemoryLayerSeparation();
             checkRememberKeyFormats();
+            checkRememberForgetMemoryCommands();
+            checkForgetPartialMatches();
+            checkLegacyRememberEntries();
+            checkMemoryPersistsAcrossRestarts();
+            checkClearKeepsLongTermMemory();
             checkProfileStoreLifecycle();
             checkProfileSubcommandUi();
             checkProfileBlockInSystemMessage();
             checkProfileBlockAcrossRestartsAndClear();
             checkSkillsAndPipelines();
             checkPipelineSubstitutionInRequest();
-            checkForgetPartialMatches();
-            checkLegacyRememberEntries();
-            checkSystemInstructionRules();
             checkWorkingCounterMatchesFacts();
-            checkRememberForgetMemoryCommands();
-            checkMemoryPersistsAcrossRestarts();
-            checkClearKeepsLongTermMemory();
-            checkTaskCommands();
-            checkTaskStateMachineModel();
-            checkTaskStateCommands();
-            checkTaskStateBlockInSystemMessage();
-            checkTaskStatePauseResumeInRequest();
+            checkModeCommand();
+            checkSystemInstructionRules();
             checkInvariantsStoreLifecycle();
             checkInvariantCommands();
             checkInvariantBlockInSystemMessage();
             checkInvariantBlockInRealRequest();
-            checkInvariantGuardRules();
-            checkInvariantGuardNoApiInMessage();
             checkInvariantAddForbiddenMarkers();
             checkTaskInvariantCommands();
+            checkHelpForEveryCommand();
+            checkUnknownSubcommands();
+
+            // --- Детерминированная проверка (InvariantGuard) ---
+            group("InvariantGuard");
+            checkInvariantGuardRules();
+            checkInvariantGuardNoApiInMessage();
             checkTaskInvariantBlockAndGuard();
             checkInvariantsNotInWorkingMemoryOrHistory();
+
+            // --- UX: терминал, справка, меню, подсказки, онбординг ---
+            group("UX");
+            checkPlainTerminalUi();
+            checkAnsiSanitizer();
+            checkProgressSpinner();
+            checkUiPrompt();
+            checkUiMessageMarkers();
+            checkUiRedesign();
+            checkUiColorAndMarkdown();
+            checkHistoryStoreCleanText();
+            checkShortHelpAndFullIndex();
+            checkNextHints();
+            checkInteractiveMenus();
+            checkInteractiveMenuCancel();
+            checkPlainMenusDisabledWithSyntaxHint();
+            checkTypoSuggestions();
+            checkStatusOverview();
+            checkOnboardingFirstLaunch();
             checkInvariantHelpAndIndex();
-            checkThreeLayersInRequest();
-            checkMemoryUpdateAccountingOnce();
+
+            // --- Режим измерений /demo ---
+            group("Измерения");
+            checkClearCommand();
+            checkClearConfirmationUi();
+            checkClearDemoIsolation();
+            checkClearErrorKeepsMemory();
+            checkDemoTokensMode();
+            checkDemoFailureClassifications();
+            checkDemoCommandsNoApi();
+            checkPasteInput();
+            checkDay10OtherStoreValidation();
+
+            // --- Тихий вывод и диагностика (LLM_DIAGNOSTICS) ---
+            group("Тихий вывод");
             checkUserFacingOutputNeutral();
             checkDefaultRunSettings();
             checkQuietStartupAndAnswer();
             checkExplicitCommandsStillDetailed();
             checkDiagnosticsHiddenByDefault();
+
+            // --- Интеграционные прогоны процесса ---
+            group("Интеграция");
             checkTwoProcessIntegration();
             checkProfilePersistenceAcrossProcesses();
-            checkShortHelpAndFullIndex();
-            checkNextHints();
-            checkInteractiveMenus();
-            checkPlainMenusDisabledWithSyntaxHint();
-            checkTypoSuggestions();
-            checkStatusOverview();
-            checkOnboardingFirstLaunch();
+            checkOldHistoryCompatible();
         } finally {
             deleteRecursively(baseTempDir);
         }
@@ -4781,14 +4853,6 @@ public final class SelfTest {
         return "";
     }
 
-    private static void expect(String description, boolean condition) {
-        if (!condition) {
-            throw new AssertionError("Проверка не пройдена: " + description);
-        }
-        passed++;
-        System.out.println("OK: " + description);
-    }
-
     // ---------- День 9.2: оценка выгоды и баланс ----------
 
     /** Короткие сообщения с односложными ответами: сжатие пропускается. */
@@ -5790,6 +5854,65 @@ public final class SelfTest {
     // ================= Модель памяти: три слоя =================
 
     // ================= Профиль пользователя =================
+
+    /**
+     * Закалка хранилищ (постгарантии): повреждённый файл — понятная ошибка
+     * без перезаписи (MemoryStore, ProfileStore, InvariantStore); права
+     * доступа только владельца на каталоге и файлах; запись в каталог без
+     * прав не портит исходный файл. Обратная совместимость схем покрыта
+     * проверками legacy-истории, legacy-записей памяти и legacy-инвариантов.
+     */
+    private static void checkStoresHardening() throws IOException {
+        // Профиль: повреждённый файл даёт ошибку с путём и не перезаписывается.
+        Path profileFile = Files.createTempDirectory(baseTempDir, "hard-prof-")
+                .resolve("profile.json");
+        ProfileStore profileStore = new ProfileStore(profileFile);
+        profileStore.save(UserProfile.empty());
+        byte[] profileCorrupted = "это не { json вообще".getBytes(StandardCharsets.UTF_8);
+        Files.write(profileFile, profileCorrupted);
+        expect("повреждённый файл профиля даёт ошибку с путём (без перезаписи)",
+                expectError(() -> profileStore.load())
+                        .contains(profileFile.toString())
+                        && Arrays.equals(Files.readAllBytes(profileFile),
+                        profileCorrupted));
+
+        // Инварианты: повреждённый файл — ошибка, файл не перезаписан; права.
+        Path invariantFile = Files.createTempDirectory(baseTempDir, "hard-inv-")
+                .resolve("invariants.json");
+        InvariantStore invariantStore = new InvariantStore(invariantFile);
+        invariantStore.add("рамка hardening", "other");
+        byte[] invariantGarbage = "повреждение { инвариантов".getBytes(StandardCharsets.UTF_8);
+        Files.write(invariantFile, invariantGarbage);
+        expect("повреждённый файл инвариантов даёт ошибку с путём (без перезаписи)",
+                expectError(() -> invariantStore.load())
+                        .contains(invariantFile.toString())
+                        && Arrays.equals(Files.readAllBytes(invariantFile),
+                        invariantGarbage));
+
+        // Права доступа: каталог rwx------, файлы rw------- (POSIX; иначе пропуск).
+        expect("каталог памяти доступен только владельцу (rwx------)",
+                checkPosixPermissions(Files.createTempDirectory(baseTempDir, "hard-mem-")
+                        .resolve("memory.json").getParent(), "rwx------"));
+        InvariantStore permissionStore = new InvariantStore(
+                Files.createTempDirectory(baseTempDir, "hard-perm-")
+                        .resolve("invariants.json"));
+        permissionStore.add("рамка прав", "other");
+        expect("файл инвариантов доступен только владельцу (rw-------)",
+                checkPosixPermissions(permissionStore.file(), "rw-------"));
+    }
+
+    /** true, если POSIX-права файла соответствуют шаблону; без POSIX — true. */
+    private static boolean checkPosixPermissions(Path file, String expected) {
+        try {
+            Set<PosixFilePermission> permissions = Files
+                    .getPosixFilePermissions(file,
+                            java.nio.file.LinkOption.NOFOLLOW_LINKS);
+            return expected.equals(PosixFilePermissions.toString(permissions));
+        } catch (UnsupportedOperationException | IOException e) {
+            // Система без POSIX-прав — проверка не применима, не ломаем прогон.
+            return true;
+        }
+    }
 
     /** Хранилище профиля: пустой файл не создаётся, запись/чтение/валидация/перезапуск. */
     private static void checkProfileStoreLifecycle() throws IOException {
@@ -6941,6 +7064,43 @@ public final class SelfTest {
         }
     }
 
+    /** Граничные значения состояния задачи: пустое описание, длинный шаг, спецсимволы. */
+    private static void checkTaskStateEdgeCases() {
+        Instant now = Instant.parse("2026-01-01T00:00:00Z");
+
+        // Пустое описание — ошибка без создания состояния.
+        expect("start без описания отклоняется",
+                expectError(() -> TaskState.start("   ", now))
+                        .contains("Описание задачи обязательно"));
+        expect("withDescription пустым текстом отклоняется",
+                expectError(() -> TaskState.start("задача", now)
+                        .withDescription("  ", now))
+                        .contains("не может быть пустым"));
+
+        // Очень длинный шаг: сохраняется целиком (лимиты живут в командном слое).
+        String longStep = "шаг-" + "х".repeat(500) + "-42";
+        TaskState longState = TaskState.start("задача", now).withStep(longStep, now);
+        expect("шаг длиной 500+ символов сохраняется целиком",
+                longStep.equals(longState.currentStep()));
+
+        // Спецсимволы, кавычки, переносы и emoji не ломают состояние record;
+        // краевые пробельные символы нормализуются, как во всём коде.
+        String trickyDescription = "описание с \"кавычками\", \\backslash, «ёлочки» 🚀";
+        String trickyStep = "шаг с \n переносом строки и табом\tвнутри";
+        TaskState special = TaskState.start(trickyDescription, now)
+                .withStep(trickyStep, now);
+        expect("спецсимволы в описании и шаге сохраняются без потерь",
+                trickyDescription.equals(special.description())
+                        && trickyStep.equals(special.currentStep()));
+
+        // statuses: прямой переход блокировка → пауза запрещён (как пауза → блокировка).
+        TaskState blocked = TaskState.start("задача", now)
+                .withStatus(TaskStatus.BLOCKED, now);
+        expect("прямой переход блокировка → пауза запрещён",
+                expectError(() -> blocked.withStatus(TaskStatus.PAUSED, now))
+                        .contains("не разрешён"));
+    }
+
     /** /task задаёт и показывает задачу, /task clear очищает рабочую память задачи. */
     private static void checkTaskCommands() throws Exception {
         Path keyStore = createSelfSignedKeyStore();
@@ -7752,6 +7912,126 @@ public final class SelfTest {
             server.stop(0);
             Files.deleteIfExists(keyStore);
         }
+    }
+
+    /**
+     * Порядок блоков в system-сообщении стабилен: профиль → долговременная
+     * память → рабочая память → состояние задачи → инварианты; пустые
+     * блоки опускаются; инварианты после состояния задачи.
+     */
+    private static void checkContextBlockOrder() {
+        ModelSettings settings = ModelSettings.defaults();
+        Map<String, MemoryEntry> emptyMemory = new LinkedHashMap<>();
+        Instant now = Instant.parse("2026-01-01T00:00:00Z");
+
+        // Всё задано: блоки и порядок в одном system-сообщении.
+        TaskState task = TaskState.start("задача порядка блоков", now);
+        UserProfile profile = new UserProfile("Алексей", null, null, List.of(),
+                new LinkedHashMap<>(), new LinkedHashMap<>(),
+                "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
+        ChatMessage full = ContextBuilder.systemContextMessage(settings,
+                profile, new LinkedHashMap<>(Map.of(
+                        "кодовое слово", new MemoryEntry("кодовое слово", "ЯКОРЬ-42",
+                                "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"))),
+                task, Map.of("цель", "МАЯК"), null, null,
+                List.of(Invariant.create("рамка порядка", "other",
+                        Instant.parse("2026-01-01T00:00:00Z"))), List.of());
+        String system = full.content();
+        int profileIdx = system.indexOf("<<<ПРОФИЛЬ ПОЛЬЗОВАТЕЛЬ");
+        int memoryIdx = system.indexOf("<<<ДОЛГОВРЕМЕННАЯ ПАМЯТЬ");
+        int workingIdx = system.indexOf("<<<РАБОЧАЯ ПАМЯТЬ");
+        int taskIdx = system.indexOf("<<<СОСТОЯНИЕ ЗАДАЧИ");
+        int invariantsIdx = system.indexOf("<<<ИНВАРИАНТЫ");
+        expect("порядок блоков: профиль → память → рабочая → задача → инварианты",
+                profileIdx >= 0 && profileIdx < memoryIdx
+                        && memoryIdx < workingIdx && workingIdx < taskIdx
+                        && taskIdx < invariantsIdx
+                        && system.indexOf("<<<ПАЙПЛАЙН") == -1);
+    }
+
+    /** /help <команда> возвращает непустую справку для каждой известной команды. */
+    private static void checkHelpForEveryCommand() {
+        for (String name : TerminalUi.chatCommandNames()) {
+            String help = TerminalUi.chatCommandHelp(name);
+            expect("справка /help " + name + " непустая",
+                    help != null && !help.isBlank() && help.contains(name));
+        }
+    }
+
+    /** Неизвестная подкоманда даёт понятное «Использование», не стектрейс и не исключение. */
+    private static void checkUnknownSubcommands() throws Exception {
+        InvariantStore invariantStore = tempInvariantStoreForTests();
+        LlmAgent agent = new LlmAgent(new Config("test-key",
+                "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash"),
+                ModelSettings.defaults(),
+                java.net.http.HttpClient.newHttpClient(),
+                new JsonConversationStore(Files.createTempDirectory(baseTempDir, "hist-")
+                        .resolve("conversation.json")),
+                tempMemoryStore(), tempProfileStoreForTests(), invariantStore);
+        FakeUi ui = new FakeUi(
+                TerminalUi.Input.command("/invariant совсем-не-субкоманда"),
+                TerminalUi.Input.command("/task invariant совсем-не-субкоманда"),
+                TerminalUi.Input.command("/exit"));
+        Main.runLoop(ui, agent, "glm-5.3-flash");
+        String systems = String.join("\n", ui.systems);
+        expect("неизвестная подкоманда /invariant даёт «Использование:»",
+                systems.contains("Использование: /invariant"));
+        expect("неизвестная подкоманда /task invariant даёт «Использование:»",
+                systems.contains("Использование: /task invariant"));
+        expect("неизвестные подкоманды не ломают агента и не создают историю",
+                agent.getHistory().isEmpty() && agent.taskState() == null
+                        && agent.invariantsView().isEmpty()
+                        && agent.taskInvariantsView().isEmpty());
+    }
+
+    /** Отмена пошагового меню (выбор «ничего»/мусор) не меняет состояние. */
+    private static void checkInteractiveMenuCancel() throws Exception {
+        LlmAgent agent = new LlmAgent(new Config("test-key",
+                "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash"),
+                ModelSettings.defaults(),
+                java.net.http.HttpClient.newHttpClient(),
+                new JsonConversationStore(Files.createTempDirectory(baseTempDir, "hist-")
+                        .resolve("conversation.json")),
+                tempMemoryStore(), tempProfileStoreForTests(),
+                tempInvariantStoreForTests());
+
+        // Меню задачи: отмена пунктом «ничего».
+        FakeUi cancelUi = new FakeUi(
+                TerminalUi.Input.command("/task"),
+                TerminalUi.Input.command("7"),
+                TerminalUi.Input.command("/exit"));
+        cancelUi.interactiveMenusEnabled = true;
+        Main.runLoop(cancelUi, agent, "glm-5.3-flash");
+        expect("меню задачи: выбор «ничего» отменяет без состояния и ошибок",
+                agent.taskState() == null
+                        && cancelUi.systems.stream().anyMatch(t ->
+                        t.contains("Действие с задачей отменено"))
+                        && cancelUi.errors.isEmpty());
+
+        // Меню задачи: неизвестный пункт даёт повтор вопроса — состояние не создаётся.
+        FakeUi junkUi = new FakeUi(
+                TerminalUi.Input.command("/task"),
+                TerminalUi.Input.command("не-пункт-меню"),
+                TerminalUi.Input.command("7"),
+                TerminalUi.Input.command("/exit"));
+        junkUi.interactiveMenusEnabled = true;
+        Main.runLoop(junkUi, agent, "glm-5.3-flash");
+        expect("меню задачи: мусорный выбор переспрашивает (Enter — отмена)",
+                agent.taskState() == null
+                        && junkUi.systems.stream().anyMatch(t ->
+                        t.contains("Не понял выбор"))
+                        && junkUi.errors.isEmpty());
+
+        // Подсказка следующего шага не выдаётся на чистых командах без результата.
+        FakeUi silentUi = new FakeUi(
+                TerminalUi.Input.command("/invariant remove 99"),
+                TerminalUi.Input.command("/exit"));
+        Main.runLoop(silentUi, agent, "glm-5.3-flash");
+        expect("ошибка удаления локального/глобального инварианта без подсказки «Дальше»",
+                silentUi.errors.stream().anyMatch(t ->
+                        t.contains("Инвариант не найден"))
+                        && silentUi.systems.stream()
+                        .noneMatch(t -> t.startsWith("Дальше:")));
     }
 
     /** Служебный расход обновления памяти учтён ровно один раз и входит в лимит сессии. */
