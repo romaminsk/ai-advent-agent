@@ -189,6 +189,8 @@ public interface TerminalUi extends AutoCloseable {
                         "что агент помнит: надолго, в рамках задачи и диалога"),
                 new Row("Профиль", "/profile /skill /pipeline",
                         "как к вам обращаться и как отвечать"),
+                new Row("Рамки", "/invariant",
+                        "жёсткие ограничения, которые агент не нарушает"),
                 new Row("Контекст", "/context /summary /strategy /facts /branch",
                         "что уходит в запрос к модели"),
                 new Row("Диалог", "/clear /reset", "удалить текущую историю"),
@@ -222,7 +224,7 @@ public interface TerminalUi extends AutoCloseable {
     static String[] chatCommandNames() {
         return new String[]{
                 "/help", "/history", "/memory", "/remember", "/forget", "/task",
-                "/profile", "/skill", "/pipeline", "/clear", "/reset",
+                "/profile", "/skill", "/pipeline", "/invariant", "/clear", "/reset",
                 "/mode", "/multiline", "/paste", "/demo",
                 "/context", "/summary", "/strategy", "/facts", "/branch",
                 "/tokens", "/stats", "/limit", "/status", "/exit",
@@ -458,6 +460,31 @@ public interface TerminalUi extends AutoCloseable {
                       упорядоченных инструкций. Не вызывает API.
 
                     Связано: /skill, /profile.""";
+            case "/invariant" -> """
+                    /invariant — жёсткие ограничения, которые агент не нарушает
+
+                    Использование
+                      /invariant                              — список рамок
+                      /invariant add <текст> [категория]      — задать рамку
+                      /invariant remove <id|номер>            — удалить рамку
+                      /invariant clear                        — удалить все
+
+                    Примеры
+                      /invariant add модульный монолит на Java 21, без Spring и БД architecture
+                      /invariant add только стандартная библиотека и Jackson stack
+                      /invariant remove 1
+
+                    Эффекты
+                      инвариант — не предпочтение и не факт памяти: рамка обязана
+                      учитываться в каждом ответе. Подставляется в запрос блоком
+                      «ИНВАРИАНТЫ»; при конфликте запроса агент отказывается:
+                      называет нарушенный инвариант, объясняет противоречие
+                      и предлагает альтернативу в рамках рамки. Категории:
+                      architecture|stack|decision|business|other (не указана —
+                      other). Переживают /clear, /reset и перезапуск
+                      (отдельный файл invariants.json). Не вызывает API.
+
+                    Связано: /profile constraint, /memory, /task.""";
             case "/clear" -> """
                     /clear — удалить историю текущего диалога
 

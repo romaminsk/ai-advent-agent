@@ -210,6 +210,12 @@ public final class SelfTest {
             checkTaskStateCommands();
             checkTaskStateBlockInSystemMessage();
             checkTaskStatePauseResumeInRequest();
+            checkInvariantsStoreLifecycle();
+            checkInvariantCommands();
+            checkInvariantBlockInSystemMessage();
+            checkInvariantBlockInRealRequest();
+            checkInvariantsNotInWorkingMemoryOrHistory();
+            checkInvariantHelpAndIndex();
             checkThreeLayersInRequest();
             checkMemoryUpdateAccountingOnce();
             checkUserFacingOutputNeutral();
@@ -6381,6 +6387,12 @@ public final class SelfTest {
                 .resolve("profile.json"));
     }
 
+    /** Инварианты для тестов: временный файл, реальный invariants.json не трогается. */
+    private static InvariantStore tempInvariantStoreForTests() throws IOException {
+        return new InvariantStore(Files.createTempDirectory(baseTempDir, "inv-")
+                .resolve("invariants.json"));
+    }
+
     /** Три слоя хранятся отдельно: отдельный файл, формат, валидация при чтении. */
     private static void checkMemoryLayerSeparation() throws IOException {        Path memoryFile = Files.createTempDirectory(baseTempDir, "mem-")
                 .resolve("memory.json");
@@ -6967,6 +6979,318 @@ public final class SelfTest {
             server.stop(0);
             Files.deleteIfExists(keyStore);
         }
+    }
+
+    /** Хранилище инвариантов: add/list/remove/clear, персистентность, отдельный файл. */
+    private static void checkInvariantsStoreLifecycle() throws IOException {
+        Path file = Files.createTempDirectory(baseTempDir, "inv-")
+                .resolve("invariants.json");
+        InvariantStore store = new InvariantStore(file);
+
+        expect("отсутствующий файл инвариантов даёт пустой список", store.list().isEmpty());
+        expect("при отсутствии файла инвариантов JSON не создаётся заранее",
+                !Files.exists(file));
+
+        Invariant first = store.add("проект «Север-17» — модульный монолит на Java 21, "
+                + "без Spring и БД", "architecture");
+        Invariant second = store.add("только стандартная библиотека и Jackson", null);
+        expect("инвариант хранит текст, категорию и метку времени",
+                first.text().startsWith("проект «Север-17»") && first.category() != null
+                        && first.createdAt() != null);
+        expect("категория по умолчанию — other",
+                "other".equals(second.category()));
+        expect("идентификаторы инвариантов уникальны и не пусты",
+                !first.id().isBlank() && !second.id().isBlank()
+                        && !first.id().equals(second.id()));
+        expect("файл инвариантов отдельный от истории и памяти (invariants.json)",
+                file.getFileName().toString().equals("invariants.json") && Files.exists(file));
+        expect("категория сохраняется как задана (нижний регистр)",
+                "architecture".equals(first.category()));
+
+        // Персистентность: запись → новый экземпляр стора → чтение.
+        InvariantStore reopened = new InvariantStore(file);
+        List<Invariant> loaded = reopened.list();
+        expect("инварианты переживают переоткрытие хранилища",
+                loaded.size() == 2
+                        && loaded.get(0).text().equals(first.text())
+                        && loaded.get(0).createdAt().equals(first.createdAt())
+                        && loaded.get(1).text().equals(second.text()));
+
+        // Удаление и очистка.
+        expect("remove по id удаляет запись", reopened.remove(first.id()));
+        expect("повторный remove по тому же id — false", !reopened.remove(first.id()));
+        expect("после remove остаётся одна запись", reopened.list().size() == 1);
+        reopened.clear();
+        expect("clear опустошает список инвариантов", reopened.list().isEmpty());
+        expect("пустой список переживает переоткрытие",
+                new InvariantStore(file).list().isEmpty());
+
+        // Формат файла: собственная сущность, а не поле истории или памяти.
+        InvariantStore formatted = new InvariantStore(
+                Files.createTempDirectory(baseTempDir, "inv-").resolve("invariants.json"));
+        formatted.add("рамка", "stack");
+        JsonNode saved = MAPPER.readTree(
+                Files.readString(formatted.file(), StandardCharsets.UTF_8));
+        expect("файл инвариантов имеет собственный формат (schemaVersion 1 и items)",
+                saved.path("schemaVersion").asInt(-1)
+                        == InvariantStore.SUPPORTED_SCHEMA_VERSION
+                        && saved.path("items").size() == 1
+                        && saved.path("items").get(0).path("category").asText()
+                        .equals("stack"));
+
+        // Пустой текст — ошибка, файл не трогается.
+        try {
+            store.add("   ", null);
+            expect("пустой текст инварианта отклоняется", false);
+        } catch (IllegalArgumentException e) {
+            expect("пустой текст инварианта отклоняется", true);
+        }
+    }
+
+    /** /invariant add → в списке; remove по id и по номеру; clear; подсказка. */
+    private static void checkInvariantCommands() throws Exception {
+        InvariantStore invariants = tempInvariantStoreForTests();
+        LlmAgent agent = new LlmAgent(new Config("test-key",
+                "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash"),
+                ModelSettings.defaults(),
+                java.net.http.HttpClient.newHttpClient(),
+                new JsonConversationStore(Files.createTempDirectory(baseTempDir, "hist-")
+                        .resolve("conversation.json")),
+                tempMemoryStore(), tempProfileStoreForTests(), invariants);
+
+        FakeUi ui = new FakeUi(
+                TerminalUi.Input.command("/invariant"),
+                TerminalUi.Input.command(
+                        "/invariant add проект «Север-17» — модульный монолит на Java 21, "
+                                + "без Spring и БД architecture"),
+                TerminalUi.Input.command(
+                        "/invariant add только стандартная библиотека и Jackson"),
+                TerminalUi.Input.command("/invariant"),
+                TerminalUi.Input.command("/exit"));
+        Main.runLoop(ui, agent, "glm-5.3-flash");
+        expect("пустой список инвариантов сообщает, как задать рамку",
+                ui.systems.stream().anyMatch(t ->
+                        t.contains("инвариантов нет")
+                                && t.contains("/invariant add <текст> — задать")));
+        expect("подтверждение добавления инварианта с категорией",
+                ui.systems.stream().anyMatch(t -> t.contains("✓ Инвариант задан")
+                        && t.contains("без Spring и БД") && t.contains("[architecture]")));
+        expect("категория без явного указания — other",
+                ui.systems.stream().anyMatch(t ->
+                        t.contains("✓ Инвариант задан") && t.contains("[other]")));
+        expect("после /invariant add подсказка следующего шага",
+                ui.systems.stream().anyMatch(t -> t.contains(
+                        "Дальше: /invariant — посмотреть все рамки")));
+        expect("список показывает обе рамки с категориями",
+                ui.systems.stream().anyMatch(t -> t.contains("[architecture]")
+                        && t.contains("[other]"))
+                        && !ui.systems.stream().anyMatch(t ->
+                        t.contains("[stack]") && t.contains("Инварианты — жёсткие")));
+        expect("инварианты добавлены в агент и хранилище",
+                agent.invariantsView().size() == 2
+                        && agent.invariantsView().get(0).category().equals("architecture")
+                        && agent.invariantsFile().getFileName().toString()
+                        .equals("invariants.json"));
+
+        // Remove по номеру, затем по id (отдельные прогоны: состояние
+        // проверяется между ними).
+        String secondId = agent.invariantsView().get(1).id();
+        FakeUi removeNumberUi = new FakeUi(
+                TerminalUi.Input.command("/invariant remove 1"),
+                TerminalUi.Input.command("/exit"));
+        Main.runLoop(removeNumberUi, agent, "glm-5.3-flash");
+        expect("remove по номеру удаляет рамку с подтверждением текста",
+                removeNumberUi.systems.stream().anyMatch(t -> t.contains("✓ Инвариант удалён")
+                        && t.contains("без Spring и БД"))
+                        && agent.invariantsView().size() == 1);
+        FakeUi removeIdUi = new FakeUi(
+                TerminalUi.Input.command("/invariant remove " + secondId),
+                TerminalUi.Input.command("/exit"));
+        Main.runLoop(removeIdUi, agent, "glm-5.3-flash");
+        expect("remove по id удаляет рамку с подтверждением текста",
+                removeIdUi.systems.stream().anyMatch(t -> t.contains("✓ Инвариант удалён")
+                        && t.contains("стандартная библиотека"))
+                        && agent.invariantsView().isEmpty());
+
+        // Неизвестный id/номер — ошибка, ничего не удалено.
+        agent.invariantAdd("рамка для удаления", "stack");
+        FakeUi notFoundUi = new FakeUi(TerminalUi.Input.command("/invariant remove 99"));
+        Main.runLoop(notFoundUi, agent, "glm-5.3-flash");
+        expect("несуществующий номер — ошибка, рамка сохранена",
+                notFoundUi.errors.stream().anyMatch(t -> t.contains("Инвариант не найден"))
+                        && agent.invariantsView().size() == 1);
+
+        // Clear с подтверждением и отказом от подтверждения.
+        FakeUi clearNoUi = new FakeUi(TerminalUi.Input.command("/invariant clear"));
+        clearNoUi.confirmProfileClearAnswer = false;
+        Main.runLoop(clearNoUi, agent, "glm-5.3-flash");
+        expect("отказ подтверждения сохраняет инварианты",
+                clearNoUi.confirmProfileClearCount == 1 && clearNoUi.confirmProfileClearSubject
+                        .contains("инварианты")
+                        && agent.invariantsView().size() == 1
+                        && clearNoUi.systems.stream().anyMatch(t ->
+                        t.contains("Удаление отменено")));
+        FakeUi clearYesUi = new FakeUi(
+                TerminalUi.Input.command("/invariant clear"),
+                TerminalUi.Input.command("/invariant"),
+                TerminalUi.Input.command("/exit"));
+        clearYesUi.confirmProfileClearAnswer = true;
+        Main.runLoop(clearYesUi, agent, "glm-5.3-flash");
+        expect("/invariant clear очищает все рамки и сообщает об этом",
+                clearYesUi.confirmProfileClearCount == 1
+                        && agent.invariantsView().isEmpty()
+                        && clearYesUi.systems.stream().anyMatch(t ->
+                        t.contains("✓ Инварианты очищены")));
+
+        // Персистентность команд: запись → новый экземпляр агента со тем же файлом.
+        FakeUi addUi = new FakeUi(TerminalUi.Input.command(
+                "/invariant add персистентная рамка stack"));
+        Main.runLoop(addUi, agent, "glm-5.3-flash");
+        LlmAgent restarted = new LlmAgent(new Config("test-key",
+                "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash"),
+                ModelSettings.defaults(),
+                java.net.http.HttpClient.newHttpClient(),
+                new JsonConversationStore(Files.createTempDirectory(baseTempDir, "hist-")
+                        .resolve("conversation.json")),
+                tempMemoryStore(), tempProfileStoreForTests(),
+                new InvariantStore(invariants.file()));
+        expect("инварианты переживают перезапуск (новый агент с тем же файлом)",
+                restarted.invariantsView().size() == 1
+                        && restarted.invariantsView().get(0).text()
+                        .contains("персистентная рамка"));
+    }
+
+    /** Блок «ИНВАРИАНТЫ» подставляется в system-сообщение, когда рамки есть. */
+    private static void checkInvariantBlockInSystemMessage() {
+        ModelSettings settings = ModelSettings.defaults();
+        Map<String, MemoryEntry> emptyMemory = new LinkedHashMap<>();
+
+        Invariant architecture = Invariant.create(
+                "проект «Север-17» — модульный монолит на Java 21, без Spring и БД",
+                "architecture", Instant.parse("2026-01-01T00:00:00Z"));
+        Invariant business = Invariant.create("CSV-экспорт — по RFC 4180, с BOM", "business",
+                Instant.parse("2026-01-01T00:00:00Z"));
+
+        ChatMessage emptySystem = ContextBuilder.systemContextMessage(settings,
+                UserProfile.empty(), emptyMemory, null, Map.of(), null, null, List.of());
+        expect("без инвариантов блок «ИНВАРИАНТЫ» опускается",
+                !emptySystem.content().contains("ИНВАРИАНТЫ"));
+
+        ChatMessage fullSystem = ContextBuilder.systemContextMessage(settings,
+                UserProfile.empty(), emptyMemory, null, Map.of(), null, null,
+                List.of(architecture, business));
+        String system = fullSystem.content();
+        expect("заданные инварианты подставлены: заголовок блока",
+                system.contains("<<<ИНВАРИАНТЫ (жёсткие рамки, нарушать нельзя)"));
+        expect("блок содержит инвариант с категорией architecture",
+                system.contains("[architecture] проект «Север-17»"));
+        expect("блок содержит инвариант с категорией business",
+                system.contains("[business] CSV-экспорт — по RFC 4180"));
+        expect("инструкция блока объявляет жёсткие ограничения",
+                system.contains("Это жёсткие ограничения"));
+        expect("инструкция запрещает решения, нарушающие инвариант",
+                system.contains("НЕ предлагай решение, которое нарушает"));
+        expect("инструкция требует назвать инвариант и предложить альтернативу",
+                system.contains("назови инвариант")
+                        && system.contains("альтернативу в рамках инварианта"));
+        expect("инвариант не трактуется как исторические сведения",
+                !system.contains("исторические сведения"));
+    }
+
+    /** Полный прогон: инвариант добавлен командой, блок «ИНВАРИАНТЫ» в запросе. */
+    private static void checkInvariantBlockInRealRequest() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        AtomicReference<String> lastBody = new AtomicReference<>();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            lastBody.set(requestBody);
+            return new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                    + "\"content\":\"Ок\"}}]}").getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            InvariantStore invariantStore = new InvariantStore(
+                    Files.createTempDirectory(baseTempDir, "inv-")
+                            .resolve("invariants.json"));
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort()
+                            + "/v1/chat/completions", "glm-5.3-flash");
+            LlmAgent agent = new LlmAgent(config, ModelSettings.defaults(),
+                    trustedHttpClient(keyStore), tempStore(), tempMemoryStore(),
+                    tempProfileStoreForTests(), invariantStore);
+
+            FakeUi ui = new FakeUi(
+                    TerminalUi.Input.command(
+                            "/invariant add без Spring и БД stack"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(ui, agent, "glm-5.3-flash");
+            agent.ask("добавь Spring Boot в проект");
+            String system = MAPPER.readTree(lastBody.get())
+                    .path("messages").get(0).path("content").asText();
+            expect("в запросе есть блок «ИНВАРИАНТЫ (жёсткие рамки, нарушать нельзя)»",
+                    system.contains("ИНВАРИАНТЫ (жёсткие рамки, нарушать нельзя)"));
+            expect("блок содержит заданный инвариант",
+                    system.contains("[stack] без Spring и БД")
+                            && system.contains("НЕ предлагай решение, которое нарушает"));
+
+            // /clear не стирает инварианты: они снова в запросе после очистки.
+            agent.resetConversation();
+            agent.ask("вопрос после /clear");
+            String rebuilt = MAPPER.readTree(lastBody.get())
+                    .path("messages").get(0).path("content").asText();
+            expect("инварианты переживают /clear и остаются в запросе",
+                    rebuilt.contains("[stack] без Spring и БД"));
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    /** Инварианты НЕ попадают в рабочую память и НЕ в историю диалога. */
+    private static void checkInvariantsNotInWorkingMemoryOrHistory() throws Exception {
+        InvariantStore invariantStore = tempInvariantStoreForTests();
+        LlmAgent agent = new LlmAgent(new Config("test-key",
+                "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash"),
+                ModelSettings.defaults(),
+                java.net.http.HttpClient.newHttpClient(),
+                new JsonConversationStore(Files.createTempDirectory(baseTempDir, "hist-")
+                        .resolve("conversation.json")),
+                tempMemoryStore(), tempProfileStoreForTests(), invariantStore);
+        FakeUi ui = new FakeUi(
+                TerminalUi.Input.command("/invariant add жёсткая рамка стек stack"),
+                TerminalUi.Input.command("/invariant clear"),
+                TerminalUi.Input.command("/exit"));
+        ui.confirmProfileClearAnswer = true;
+        Main.runLoop(ui, agent, "glm-5.3-flash");
+        expect("инварианты не превратились в факты рабочей памяти",
+                agent.factsView().isEmpty());
+        expect("инварианты не превратились в задачу рабочей памяти",
+                agent.taskState() == null);
+        expect("инварианты не попали в историю диалога",
+                agent.getHistory().isEmpty());
+        expect("инварианты не попали в долговременную память",
+                agent.memoryView().isEmpty());
+    }
+
+    /** /invariant в полном индексе (группа «Рамки» с назначением) и в справке. */
+    private static void checkInvariantHelpAndIndex() {
+        String full = TerminalUi.chatIndex(80);
+        expect("полный индекс содержит группу «Рамки»", full.contains("Рамки"));
+        expect("полный индекс содержит /invariant", full.contains("/invariant"));
+        expect("группа «Рамки» объяснена одной строкой назначения",
+                full.contains("жёсткие ограничения, которые агент не нарушает"));
+        String commandHelp = TerminalUi.chatCommandHelp("/invariant");
+        expect("у /invariant есть подробная справка (жёсткие рамки)",
+                commandHelp != null && commandHelp.contains("/invariant add")
+                        && commandHelp.contains("не нарушает"));
+        boolean listed = false;
+        for (String name : TerminalUi.chatCommandNames()) {
+            if (name.equals("/invariant")) {
+                listed = true;
+            }
+        }
+        expect("/invariant входит в список известных команд (подсказки опечаток)",
+                listed);
+        expect("опечатка в имени команды даёт подсказку /invariant",
+                Main.closestCommand("/indvarian").equals("/invariant"));
     }
 
     /** В запрос подставляются все три слоя с корректными заголовками. */

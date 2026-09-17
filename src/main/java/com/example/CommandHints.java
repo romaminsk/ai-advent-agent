@@ -50,6 +50,11 @@ public final class CommandHints {
         return "Дальше: /memory — посмотреть записи";
     }
 
+    /** После /invariant add: посмотреть все рамки. */
+    public static String afterInvariantAdd() {
+        return "Дальше: /invariant — посмотреть все рамки";
+    }
+
     /** После /pipeline: как проверить, что связка работает. */
     public static String afterPipeline() {
         return "Дальше: обычным сообщением с триггером — скиллы подставятся в запрос";

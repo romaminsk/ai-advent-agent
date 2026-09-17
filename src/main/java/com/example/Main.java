@@ -44,14 +44,15 @@ public final class Main {
         // --help обработан выше: он не создаёт и не блокирует историю
         // и не требует API-ключа.
         try (JsonConversationStore store = JsonConversationStore.openDefault()) {
-            // Боевая точка создания агента: долговременная память и профиль
-            // подключаются к реальным файлам (~/.ai-advent-agent/memory.json
-            // и ~/.ai-advent-agent/profile.json, переменные LLM_MEMORY_FILE и
-            // LLM_PROFILE_FILE) и переживают /clear, /reset и перезапуск.
-            // Тестовые конструкторы LlmAgent (временные файлы) боевым
-            // кодом не используются.
+            // Боевая точка создания агента: долговременная память, профиль и
+            // инварианты подключаются к реальным файлам (~/.ai-advent-agent/
+            // memory.json, profile.json и invariants.json, переменные
+            // LLM_MEMORY_FILE, LLM_PROFILE_FILE и LLM_INVARIANT_FILE) и
+            // переживают /clear, /reset и перезапуск. Тестовые конструкторы
+            // LlmAgent (временные файлы) боевым кодом не используются.
             LlmAgent agent = new LlmAgent(config, ModelSettings.fromEnv(), store,
-                    MemoryStore.openDefault(), ProfileStore.openDefault());
+                    MemoryStore.openDefault(), ProfileStore.openDefault(),
+                    InvariantStore.openDefault());
             TerminalUi ui = TerminalUi.create(plainRequested);
             try {
                 exitCode = runLoop(ui, agent, config.model());
@@ -153,6 +154,10 @@ public final class Main {
                                 || normalized.startsWith("/forget ")) {
                             LlmAgent activeAgent = activeAgent(demoRef, agent);
                             handleMemoryCommand(ui, activeAgent, input.text(), demoRef);
+                        } else if (normalized.equals("/invariant")
+                                || normalized.startsWith("/invariant ")) {
+                            LlmAgent activeAgent = activeAgent(demoRef, agent);
+                            handleInvariantCommand(ui, activeAgent, input.text(), demoRef);
                         } else if (normalized.equals("/profile")
                                 || normalized.startsWith("/profile ")
                                 || normalized.equals("/skill")
@@ -478,6 +483,128 @@ public final class Main {
         } catch (AgentException e) {
             ui.showError(e.getMessage());
         }
+    }
+
+    // ================= Инварианты (жёсткие рамки) =================
+
+    /**
+     * Инварианты — жёсткие ограничения, которые агент не имеет права нарушать
+     * (выбранная архитектура, принятые технические решения, ограничения по
+     * стеку, бизнес-правила). Инвариант — не предпочтение и не факт памяти:
+     * агент обязан учитывать его в рассуждениях и отказываться от решений,
+     * которые его нарушают, объясняя отказ.
+     *
+     * Диспетчер /invariant (без вызова API): список, add <текст> [категория],
+     * remove <id|номер>, clear (с подтверждением). Инварианты не хранятся
+     * в рабочей памяти и не в истории диалога — только в InvariantStore.
+     */
+    private static void handleInvariantCommand(TerminalUi ui, LlmAgent agent, String raw,
+                                               DemoRef demoRef) {
+        if (demoRef.demo != null) {
+            ui.showSystem("В режиме измерения токенов команды инвариантов работают "
+                    + "с основной беседой. Завершите режим (/demo stop) и повторите.");
+            return;
+        }
+        String argument = raw.length() > "/invariant".length()
+                ? raw.substring("/invariant".length()).trim() : "";
+        try {
+            if (argument.isEmpty() || argument.toLowerCase(java.util.Locale.ROOT)
+                    .equals("list")) {
+                ui.showSystem(formatInvariants(agent));
+                return;
+            }
+            if (argument.startsWith("add ")) {
+                handleInvariantAdd(ui, agent, argument.substring("add ".length()).trim());
+                return;
+            }
+            if (argument.startsWith("remove ")) {
+                String token = argument.substring("remove ".length()).trim();
+                if (token.isEmpty()) {
+                    ui.showSystem("Использование: /invariant remove <id|номер>. "
+                            + "Список: /invariant.");
+                    return;
+                }
+                LlmAgent.InvariantRemoveResult result = agent.invariantRemove(token);
+                if (result.removed()) {
+                    ui.showSystem("✓ Инвариант удалён: «" + result.invariant().text()
+                            + "»."
+                            + (result.invariant().category() == null ? ""
+                            : " [" + result.invariant().category() + "]"));
+                } else {
+                    ui.showError("Инвариант не найден: «" + token + "». "
+                            + "Список: /invariant.");
+                }
+                return;
+            }
+            if (argument.toLowerCase(java.util.Locale.ROOT).equals("clear")) {
+                if (agent.invariantsView().isEmpty()) {
+                    ui.showSystem("Инвариантов нет. /invariant add <текст> — задать.");
+                    return;
+                }
+                if (!ui.confirmProfileClear("все инварианты")) {
+                    ui.showSystem("Удаление отменено.");
+                    return;
+                }
+                agent.invariantsClear();
+                ui.showSystem("✓ Инварианты очищены. История и долговременная память "
+                        + "не изменены.");
+                return;
+            }
+            ui.showSystem("Использование: /invariant — список, "
+                    + "/invariant add <текст> [архитектура|стек|решение|правило], "
+                    + "/invariant remove <id|номер>, /invariant clear (с подтверждением).");
+        } catch (AgentException e) {
+            ui.showError(e.getMessage());
+        }
+    }
+
+    /**
+     * Разбор «/invariant add <текст> [категория]»: если последний токен —
+     * известная категория (architecture|stack|decision|business|other), она
+     * отделяется; иначе категория по умолчанию other.
+     */
+    private static void handleInvariantAdd(TerminalUi ui, LlmAgent agent, String rest) {
+        if (rest.isEmpty()) {
+            ui.showSystem("Использование: /invariant add <текст> [категория]. "
+                    + "Категории: architecture|stack|decision|business|other "
+                    + "(не указана — other).");
+            return;
+        }
+        String text = rest;
+        String category = "other";
+        String[] words = rest.split("\\s+");
+        String last = words[words.length - 1].toLowerCase(java.util.Locale.ROOT);
+        if (words.length > 1 && List.of("architecture", "stack", "decision",
+                "business", "other").contains(last)) {
+            category = last;
+            text = rest.substring(0, rest.length() - last.length()).trim();
+        }
+        Invariant invariant = agent.invariantAdd(text, category);
+        ui.showSystem("✓ Инвариант задан: «" + invariant.text() + "» ["
+                + invariant.category() + "].\n  " + CommandHints.afterInvariantAdd());
+    }
+
+    /** Текст /invariant: список рамок с категориями, id и порядковыми номерами. */
+    static String formatInvariants(LlmAgent agent) {
+        List<Invariant> invariants = agent.invariantsView();
+        StringBuilder text = new StringBuilder("Инварианты — жёсткие ограничения, "
+                + "которые агент не нарушает (переживают /clear, /reset и перезапуск; "
+                + "отдельный файл). Задача пользователя, противоречащая рамке, "
+                + "получит отказ с объяснением:");
+        if (invariants.isEmpty()) {
+            text.append("\n  инвариантов нет. /invariant add <текст> — задать.");
+            return text.toString();
+        }
+        for (int i = 0; i < invariants.size(); i++) {
+            Invariant invariant = invariants.get(i);
+            text.append("\n  ").append(i + 1).append(". ")
+                    .append(invariant.category() == null ? "" : "[" + invariant.category() + "] ")
+                    .append(invariant.text())
+                    .append("\n     id: ").append(invariant.id())
+                    .append(" · задан: ").append(invariant.createdAt());
+        }
+        text.append("\n  удалить: /invariant remove <id|номер> · очистить все: /invariant clear");
+        return text.toString();
     }
 
     // ================= Состояние задачи (Task State Machine) =================
@@ -2803,7 +2930,8 @@ public final class Main {
         out.println("LLM_SESSION_TOKEN_LIMIT (информационный лимит сессии),");
         out.println("LLM_CONTEXT_MODE (full/summary), LLM_CONTEXT_KEEP_LAST_MESSAGES,");
         out.println("LLM_SUMMARY_BATCH_MESSAGES, LLM_SUMMARY_MAX_OUTPUT_TOKENS,");
-        out.println("LLM_DIAGNOSTICS, LLM_HISTORY_FILE, LLM_MEMORY_FILE, LLM_PROFILE_FILE");
+        out.println("LLM_DIAGNOSTICS, LLM_HISTORY_FILE, LLM_MEMORY_FILE, LLM_PROFILE_FILE,");
+        out.println("LLM_INVARIANT_FILE");
         out.println("(при запуске через launcher загружаются из локального .env проекта).");
         out.println();
         out.println("История беседы хранится в JSON в ~/.ai-advent-agent/");
@@ -2813,7 +2941,8 @@ public final class Main {
         out.println();
         out.println("Команды чата: /help (коротко; /help all — полный список),");
         out.println("/history, /status, /tokens, /stats, /limit, /reset, /clear,");
-        out.println("/profile, /skill, /pipeline, /memory, /remember, /forget, /task,");
+        out.println("/profile, /skill, /pipeline, /invariant, /memory, /remember,");
+        out.println("/forget, /task,");
         out.println("/context [full|summary], /context compare <вопрос>, /summary [refresh],");
         out.println("/multiline, /exit (также exit, quit).");
     }
