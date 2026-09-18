@@ -173,6 +173,16 @@ final class ContextBuilder {
         }
         text.append("Сейчас этап ").append(state.stage()).append(", статус ")
                 .append(state.status()).append(".\n");
+        if (state.plan() != null) {
+            text.append("План (").append(state.planApproved()
+                    ? "утверждён" : "не утверждён").append("): ")
+                    .append(state.plan()).append('\n');
+        }
+        if (state.validationResult() != null) {
+            text.append("Результат проверки (").append(state.validationPassed()
+                    ? "успешная" : "неуспешная").append("): ")
+                    .append(state.validationResult()).append('\n');
+        }
         if (state.currentStep() != null) {
             text.append("Текущий шаг: ").append(state.currentStep()).append('\n');
         }
@@ -183,12 +193,38 @@ final class ContextBuilder {
             text.append("Выполнено ранее: ")
                     .append(String.join("; ", state.completedSteps())).append('\n');
         }
+        switch (state.stage()) {
+            case PLANNING -> text.append("""
+                    Этап planning: уточняй задачу, обсуждай и готовь план. Реализацию задачи \
+                    не начинай; даже если пользователь просит пропустить план и сразу писать \
+                    реализацию — коротко объясни, что сначала план утверждается, и предложи \
+                    допустимое действие: /task plan <текст> и /task approve. Реализация \
+                    начинается только после перехода на этап EXECUTION (команда /task stage \
+                    execution — лишь после утверждения плана).""");
+            case EXECUTION -> text.append("""
+                    Этап execution: выполняй текущий шаг в рамках утверждённого плана. \
+                    Задачу завершённой не объявляй: завершение возможно только после проверки \
+                    на этапе validation. Когда готов к проверке, сообщи об этом и подскажи \
+                    команду /task stage validation.""");
+            case VALIDATION -> text.append("""
+                    Этап validation: проверяй результат, анализируй ошибки и обсуждай \
+                    необходимые проверки. Исправление реализации не выполняй до возврата \
+                    на этап EXECUTION (/task stage execution <причина>). Задачу завершённой \
+                    не объявляй: успешный результат проверки подтверждает пользователь \
+                    командой /task validate pass <результат>, завершение — /task stage done.""");
+            case DONE -> text.append("""
+                    Задача завершена. Прежнюю задачу не возобновляй и не продолжай; \
+                    для новой работы предложи команду /task start <описание>.""");
+        }
         switch (state.status()) {
             case ACTIVE -> text.append("""
+
                     Работай над текущим шагом задачи и учитывай ожидаемое действие. После \
                     возобновления задачи (команда /task resume) продолжай ровно с текущего \
                     шага: задачу заново не пересказывай и уже выполненные шаги не повторяй.""");
             case PAUSED -> text.append("""
+
+
                     Задача на паузе. НЕ продолжай выполнение задачи и не решай сам, что \
                     «пора продолжить»: возобновление — только по команде пользователя \
                     /task resume. Если сообщение пользователя не о возобновлении, ответь \
@@ -196,6 +232,8 @@ final class ContextBuilder {
                     /task resume — продолжить». Даже если пользователь пишет «давай \
                     дальше», продолжать не нужно — мягко подскажи команду /task resume.""");
             case BLOCKED -> text.append("""
+
+
                     Задача ждёт внешних данных. В ответе — ТОЛЬКО запрос недостающих \
                     сведений, конкретно перечисляя, чего не хватает для продолжения. \
                     НЕ выполняй другие шаги задачи, НЕ пиши код, НЕ помечай шаги \

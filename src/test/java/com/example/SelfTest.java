@@ -177,6 +177,8 @@ public final class SelfTest {
             group("Состояние задачи");
             checkTaskStateMachineModel();
             checkTaskStateEdgeCases();
+            checkTaskControlledTransitions();
+            checkTaskTransitionsNoApiOnRefusal();
             checkTaskCommands();
             checkTaskStateCommands();
             checkTaskStateBlockInSystemMessage();
@@ -6738,11 +6740,42 @@ public final class SelfTest {
                         && TaskStage.VALIDATION.isBackwardTransitionTo(TaskStage.EXECUTION)
                         && !TaskStage.EXECUTION.isBackwardTransitionTo(TaskStage.VALIDATION));
 
-        TaskState execution = started.withStage(TaskStage.EXECUTION, null, now);
-        expect("переход на execution переносит плановый шаг в выполненные",
+        expect("planning → execution без утверждённого плана отклоняется",
+                expectError(() -> started.withStage(TaskStage.EXECUTION, null, now))
+                        .contains("утверждённого плана"));
+        TaskState planned = started.withPlan("сверить цифры по двум источникам", now);
+        expect("план зафиксирован: не утверждён, отметки валидации пусты",
+                "сверить цифры по двум источникам".equals(planned.plan())
+                        && !planned.planApproved()
+                        && planned.validationResult() == null && !planned.validationPassed());
+        expect("утверждение без плана отклоняется",
+                expectError(() -> started.approvePlan(now)).contains("План не зафиксирован"));
+        expect("утверждение на этапе planning остаётся на этапе planning",
+                planned.approvePlan(now).stage() == TaskStage.PLANNING
+                        && planned.approvePlan(now).planApproved());
+        expect("повторное утверждение отклоняется без изменения состояния",
+                expectError(() -> planned.approvePlan(now).approvePlan(now))
+                        .contains("План уже утверждён"));
+        expect("пустой или пробельный план отклоняется",
+                expectError(() -> started.withPlan("   ", now)).contains("Текст плана обязателен"));
+        expect("замена плана сбрасывает утверждение",
+                planned.approvePlan(now).withPlan("другой план", now)
+                        instanceof TaskState replaced
+                        && !replaced.planApproved()
+                        && "другой план".equals(replaced.plan()));
+        expect("повторная установка того же текста плана сохраняет утверждение",
+                expectError(() -> planned.approvePlan(now)
+                        .withPlan("сверить цифры по двум источникам", now))
+                        .contains("План уже зафиксирован"));
+
+        TaskState execution = planned.approvePlan(now)
+                .withStage(TaskStage.EXECUTION, null, now);
+        expect("переход на execution после утверждения плана переносит плановый шаг в выполненные",
                 execution.stage() == TaskStage.EXECUTION
                         && execution.currentStep() == null
-                        && execution.completedSteps().contains("сформулировать план"));
+                        && execution.completedSteps().contains("сформулировать план")
+                        && "сверить цифры по двум источникам".equals(execution.plan())
+                        && execution.planApproved());
         expect("исходное состояние не изменяется (record)", started.stage() == TaskStage.PLANNING
                 && started.currentStep() != null);
 
@@ -6754,10 +6787,64 @@ public final class SelfTest {
                 "итоговые цифры не сошлись", now);
         expect("возврат validation → execution с причиной разрешён",
                 back.stage() == TaskStage.EXECUTION);
-        TaskState done = validation.withStage(TaskStage.DONE, null, now);
-        expect("DONE → planning даёт понятную ошибку с подсказкой /task start",
+        expect("возврат validation → execution сбрасывает результат проверки",
+                back.validationResult() == null && !back.validationPassed());
+        TaskState redone = back.withStage(TaskStage.VALIDATION, null, now);
+        expect("повторный вход в validation требует нового результата",
+                expectError(() -> redone.withStage(TaskStage.DONE, null, now))
+                        .contains("/task validate pass"));
+        TaskState validated = redone.withValidationResult(true,
+                "расхождений нет", now);
+        expect("результат проверки зафиксирован как успешный",
+                "расхождений нет".equals(validated.validationResult())
+                        && validated.validationPassed());
+        expect("pass, затем fail: снова запрещает done",
+                expectError(() -> validated.withValidationResult(false, "нашли ошибку", now)
+                        .withStage(TaskStage.DONE, null, now))
+                        .contains("/task validate pass"));
+        expect("неуспешная проверка сама по себе запрещает done",
+                expectError(() -> redone.withValidationResult(false, "нашли ошибку", now)
+                        .withStage(TaskStage.DONE, null, now))
+                        .contains("/task validate pass"));
+        expect("пустой результат проверки не принимается",
+                expectError(() -> redone.withValidationResult(true, "  ", now))
+                        .contains("Текст результата проверки обязателен"));
+        expect("фиксация результата вне validation отклоняется",
+                expectError(() -> execution.withValidationResult(true, "успех", now))
+                        .contains("validation"));
+        TaskState done = validation.withValidationResult(true, "расхождений нет", now)
+                .withStage(TaskStage.DONE, null, now);
+        expect("done после зафиксированного успешного результата разрешён",
+                done.stage() == TaskStage.DONE);
+        expect("из DONE нет никаких переходов этапов",
                 expectError(() -> done.withStage(TaskStage.PLANNING, null, now))
+                        .contains("/task start")
+                        && expectError(() -> done.withStage(TaskStage.EXECUTION, null, now))
+                        .contains("/task start")
+                        && expectError(() -> done.withStage(TaskStage.VALIDATION, null, now))
                         .contains("/task start"));
+
+        // Смена этапа и подтверждения только в ACTIVE.
+        TaskState steppedBeforePause = validation.withValidationResult(true, "ок", now);
+        TaskState pausedStage = steppedBeforePause.withStatus(TaskStatus.PAUSED, now);
+        expect("смена этапа на паузе отклоняется (PAUSED нельзя обойти сменой этапа)",
+                expectError(() -> pausedStage.withStage(TaskStage.EXECUTION, "доработка", now))
+                        .contains("только для активной задачи")
+                        && expectError(() -> pausedStage.withStage(TaskStage.DONE, null, now))
+                        .contains("только для активной задачи"));
+        expect("утверждение плана на паузе отклоняется",
+                expectError(() -> pausedStage.approvePlan(now))
+                        .contains("только для активной задачи"));
+        expect("фиксация результата проверки на паузе отклоняется",
+                expectError(() -> pausedStage.withValidationResult(true, "ок", now))
+                        .contains("только для активной задачи"));
+        expect("замена плана на паузе отклоняется",
+                expectError(() -> pausedStage.withPlan("новый план", now))
+                        .contains("только для активной задачи"));
+        TaskState blockedStage = steppedBeforePause.withStatus(TaskStatus.BLOCKED, now);
+        expect("завершение задачи при блокировке отклоняется",
+                expectError(() -> blockedStage.withStage(TaskStage.DONE, null, now))
+                        .contains("только для активной задачи"));
 
         TaskState stepped = execution.withStep("собрать цифры", now);
         TaskState paused = stepped.withStatus(TaskStatus.PAUSED, now);
@@ -6846,16 +6933,33 @@ public final class SelfTest {
             FakeUi stageUi = new FakeUi(
                     TerminalUi.Input.command("/task stage validation"),
                     TerminalUi.Input.command("/task stage execution"),
+                    TerminalUi.Input.command("/task approve"),
+                    TerminalUi.Input.command("/task plan сверить цифры бюджетов"),
+                    TerminalUi.Input.command("/task approve"),
+                    TerminalUi.Input.command("/task stage execution"),
+                    TerminalUi.Input.command("/task approve"),
                     TerminalUi.Input.command("/exit"));
             Main.runLoop(stageUi, agent, "glm-5.3-flash");
             expect("пропуск этапа planning → validation отклоняется",
                     stageUi.errors.stream().anyMatch(t -> t.contains("planning → validation")
                             && t.contains("не разрешён")));
-            expect("ошибочный переход не меняет состояние, допустимый проходит",
+            expect("переход execution без утверждённого плана отклоняется с подсказкой",
+                    stageUi.errors.stream().anyMatch(t -> t.contains("утверждённого плана")
+                            && t.contains("/task approve")));
+            expect("утверждение без плана отклоняется, план без утверждения тоже не пускает",
+                    stageUi.errors.stream().anyMatch(t -> t.contains("План не зафиксирован")));
+            expect("план зафиксирован и утверждён командами (без объединения с переходом)",
+                    stageUi.systems.stream().anyMatch(t -> t.contains("✓ План зафиксирован")
+                            && t.contains("/task approve"))
+                            && stageUi.systems.stream().anyMatch(t -> t.contains("✓ План утверждён")
+                            && t.contains("по-прежнему planning")));
+            expect("ошибочный переход не меняет состояние, допустимый после утверждения проходит",
                     agent.taskState().stage() == TaskStage.EXECUTION
                             && agent.taskState().completedSteps().contains("сформулировать план")
                             && stageUi.systems.stream().anyMatch(t ->
                             t.contains("✓ Задача переведена на этап execution")));
+            expect("повторное утверждение на этапе execution отклоняется",
+                    stageUi.errors.stream().anyMatch(t -> t.contains("Утверждение плана — на этапе planning")));
 
             FakeUi stepsUi = new FakeUi(
                     TerminalUi.Input.command("/task step собрать цифры"),
@@ -6917,9 +7021,18 @@ public final class SelfTest {
             FakeUi doneUi = new FakeUi(
                     TerminalUi.Input.command("/task stage validation"),
                     TerminalUi.Input.command("/task stage done"),
+                    TerminalUi.Input.command("/task validate pass расхождений нет"),
+                    TerminalUi.Input.command("/task stage done"),
                     TerminalUi.Input.command("/task stage planning"),
                     TerminalUi.Input.command("/exit"));
             Main.runLoop(doneUi, agent, "glm-5.3-flash");
+            expect("done без результата проверки отклоняется с подсказкой /task validate pass",
+                    doneUi.errors.stream().anyMatch(t -> t.contains("/task validate pass")
+                            && t.contains("Сообщение модели «всё проверено»")));
+            expect("результат проверки зафиксирован командой (оставаясь на validation)",
+                    doneUi.systems.stream().anyMatch(t ->
+                            t.contains("✓ Результат проверки зафиксирован (успешная)")
+                                    && t.contains("Завершение отдельной командой: /task stage done.")));
             expect("этап done подтверждается",
                     agent.taskState().stage() == TaskStage.DONE
                             && doneUi.systems.stream().anyMatch(t ->
@@ -6966,6 +7079,8 @@ public final class SelfTest {
 
         TaskState active = TaskState
                 .start("подготовить отчёт к среде", now)
+                .withPlan("сверить цифры бюджетов", now)
+                .approvePlan(now)
                 .withStage(TaskStage.EXECUTION, null, now)
                 .withStep("собрать цифры", now)
                 .withExpectedAction("агент готовит таблицу", now);
@@ -6982,6 +7097,49 @@ public final class SelfTest {
         expect("в блоке выполненные шаги", block.contains("сформулировать план"));
         expect("правило неповторения выполненных шагов после resume в блоке",
                 block.contains("выполненные шаги не повторяй"));
+        expect("правило этапа execution: завершённость запрещена до проверки",
+                block.contains("Этап execution")
+                        && block.contains("Задачу завершённой не объявляй")
+                        && block.contains("/task stage validation"));
+        expect("в блоке план с пометкой утверждения",
+                block.contains("План (утверждён): сверить цифры бюджетов"));
+
+        // Правило этапа planning: реализация запрещена до EXECUTION; план/утверждение.
+        TaskState planning = TaskState.start("подготовить отчёт к среде", now);
+        ChatMessage planningSystem = ContextBuilder.systemContextMessage(settings,
+                emptyProfile, emptyMemory, planning, Map.of(), null, null);
+        String planningBlock = planningSystem.content();
+        expect("правило этапа planning: реализацию не начинать, пропуск плана отсеивается",
+                planningBlock.contains("Этап planning")
+                        && planningBlock.contains("Реализацию задачи")
+                        && planningBlock.contains("пропустить план")
+                        && planningBlock.contains("/task plan")
+                        && planningBlock.contains("/task approve"));
+
+        // Правило этапа validation: доработка и завершение — только через команды.
+        TaskState inValidation = active.withStage(TaskStage.VALIDATION, null, now);
+        ChatMessage validationSystem = ContextBuilder.systemContextMessage(settings,
+                emptyProfile, emptyMemory, inValidation, Map.of(), null, null);
+        String validationBlock = validationSystem.content();
+        expect("правило этапа validation: необъявление done и правила возврата",
+                validationBlock.contains("Этап validation")
+                        && validationBlock.contains("Исправление реализации не выполняй")
+                        && validationBlock.contains("/task validate pass")
+                        && validationBlock.contains("/task stage execution <причина>"));
+        TaskState withResult = inValidation.withValidationResult(true, "расхождений нет", now);
+        ChatMessage resultSystem = ContextBuilder.systemContextMessage(settings,
+                emptyProfile, emptyMemory, withResult, Map.of(), null, null);
+        expect("в блоке зафиксированный результат проверки с пометкой",
+                resultSystem.content().contains("Результат проверки (успешная): расхождений нет"));
+
+        // DONE: прежняя задача не возобновляется.
+        TaskState doneTask = withResult.withStage(TaskStage.DONE, null, now);
+        ChatMessage doneSystem = ContextBuilder.systemContextMessage(settings,
+                emptyProfile, emptyMemory, doneTask, Map.of(), null, null);
+        expect("правило этапа done: задачу не возобновлять, новая — через /task start",
+                doneSystem.content().contains("Задача завершена")
+                        && doneSystem.content().contains("не возобновляй")
+                        && doneSystem.content().contains("/task start <описание>"));
 
         ChatMessage pausedSystem = ContextBuilder.systemContextMessage(settings,
                 emptyProfile, emptyMemory,
@@ -7033,6 +7191,8 @@ public final class SelfTest {
                     new java.util.HashMap<>());
 
             agent.taskStart("подготовить отчёт к среде");
+            agent.taskPlan("сверить цифры бюджетов");
+            agent.taskApprove();
             agent.taskStage("execution", null);
             agent.taskStep("собрать цифры продаж");
             agent.taskPause();
@@ -7099,6 +7259,196 @@ public final class SelfTest {
         expect("прямой переход блокировка → пауза запрещён",
                 expectError(() -> blocked.withStatus(TaskStatus.PAUSED, now))
                         .contains("не разрешён"));
+    }
+
+    /**
+     * Контролируемые переходы: замена плана вне planning, пробельная причина
+     * возврата, неизменность TaskState после отказа, изоляция жизненного
+     * цикла (новая задача не наследует подтверждения; локальные инварианты
+     * переживают переходы и паузу, исчезают с задачей), команды без задачи,
+     * ошибочный синтаксис — всё без вызова API.
+     */
+    private static void checkTaskControlledTransitions() throws IOException {
+        LlmAgent agent = new LlmAgent(new Config("test-key",
+                "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash"),
+                ModelSettings.defaults(),
+                java.net.http.HttpClient.newHttpClient(),
+                new JsonConversationStore(Files.createTempDirectory(baseTempDir, "hist-")
+                        .resolve("conversation.json")),
+                tempMemoryStore(), tempProfileStoreForTests());
+        Instant now = Instant.parse("2026-01-01T00:00:00Z");
+
+        TaskState base = TaskState.start("задача", now)
+                .withPlan("план", now).approvePlan(now)
+                .withStage(TaskStage.EXECUTION, null, now);
+        TaskState snapshot = base;
+        expect("замена плана вне planning отклоняется и не меняет состояние",
+                expectError(() -> base.withPlan("другой", now))
+                        .contains("План фиксируется на этапе planning")
+                        && base.equals(snapshot));
+        snapshot = base;
+        expect("утверждение вне planning отклоняется без изменения состояния",
+                expectError(() -> base.approvePlan(now)).contains("Утверждение плана — на этапе planning")
+                        && base.equals(snapshot));
+        snapshot = base;
+        expect("фиксация результата вне validation отклоняется без изменения состояния",
+                expectError(() -> base.withValidationResult(true, "ок", now))
+                        .contains("validation") && base.equals(snapshot));
+        TaskState inValidation = base.withStage(TaskStage.VALIDATION, null, now);
+        snapshot = inValidation;
+        expect("возврат с пробельной причиной отклоняется без изменения состояния",
+                expectError(() -> inValidation.withStage(TaskStage.EXECUTION, "   ", now))
+                        .contains("причины") && inValidation.equals(snapshot));
+        snapshot = inValidation;
+        expect("повторная установка текущего этапа отклоняется без изменения состояния",
+                expectError(() -> inValidation.withStage(TaskStage.VALIDATION, null, now))
+                        .contains("Задача уже на этапе") && inValidation.equals(snapshot));
+
+        // Локальные инварианты переживают переходы, подтверждения и паузу.
+        Invariant local = new Invariant("id-local-1", "только Java 21", "stack",
+                List.of(), java.time.Instant.now());
+        TaskState withLocal = base.withLocalInvariant(local, now);
+        TaskState survived = withLocal.withStage(TaskStage.VALIDATION, null, now)
+                .withValidationResult(true, "проверено", now)
+                .withStatus(TaskStatus.PAUSED, now)
+                .withStatus(TaskStatus.ACTIVE, now);
+        expect("локальные инварианты сохраняются при переходах, валидации, паузе и resume",
+                survived.localInvariantsView().size() == 1
+                        && survived.localInvariantsView().get(0).text().equals("только Java 21")
+                        && survived.planApproved()
+                        && "проверено".equals(survived.validationResult()));
+
+        // Команды плана/утверждения/валидации без начатой задачи — понятные ошибки.
+        expect("план без начатой задачи отклоняется",
+                expectError(() -> agent.taskPlan("план")).contains("Задача не начата"));
+        expect("утверждение без начатой задачи отклоняется",
+                expectError(agent::taskApprove).contains("Задача не начата"));
+        expect("валидация без начатой задачи отклоняется",
+                expectError(() -> agent.taskValidate(true, "результат"))
+                        .contains("Задача не начата"));
+
+        FakeUi syntaxUi = new FakeUi(
+                TerminalUi.Input.command("/task validate ok что-то там"),
+                TerminalUi.Input.command("/task validate pass"),
+                TerminalUi.Input.command("/task план текст"),
+                TerminalUi.Input.command("/exit"));
+        Main.runLoop(syntaxUi, agent, "glm-5.3-flash");
+        String syntaxSystems = String.join("\n", syntaxUi.systems);
+        String syntaxErrors = String.join("\n", syntaxUi.errors);
+        expect("неизвестный результат проверки даст «Использование»",
+                syntaxErrors.contains("Использование: /task validate pass <результат>"));
+        expect("pass без текста результата — подсказка синтаксиса, состояния нет",
+                syntaxSystems.contains("Текст результата обязателен: /task validate pass <результат проверки>."));
+        expect("короткая форма /task <текст> задаёт описание, план не фиксирует",
+                agent.taskState() != null
+                        && "план текст".equals(agent.taskState().description())
+                        && agent.taskState().plan() == null
+                        && !agent.taskState().planApproved());
+    }
+
+    /**
+     * Интеграция контура: HTTP-stub со счётчиком подтверждает отсутствие
+     * запросов модели при недопустимых управляющих командах; ответ модели
+     * «задача завершена» не меняет TaskState; новая задача не наследует
+     * план/подтверждения прежней; /task clear стирает их с локальными
+     * инвариантами; после сброса валидации в контексте нет устаревшего
+     * результата проверки.
+     */
+    private static void checkTaskTransitionsNoApiOnRefusal() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        AtomicInteger hitCounter = new AtomicInteger();
+        AtomicReference<String> lastBody = new AtomicReference<>();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            hitCounter.incrementAndGet();
+            lastBody.set(requestBody);
+            return new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                    + "\"content\":\"Хорошо, задача завершена!\"}}]}")
+                    .getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort()
+                            + "/v1/chat/completions", "glm-5.3-flash");
+            LlmAgent agent = newMemoryAgent(config, trustedHttpClient(keyStore),
+                    new java.util.HashMap<>());
+
+            agent.taskStart("подготовить отчёт к среде");
+            agent.taskPlan("сверить цифры бюджетов");
+            agent.taskApprove();
+
+            FakeUi refusalUi = new FakeUi(
+                    TerminalUi.Input.command("/task stage validation"),
+                    TerminalUi.Input.command("/task stage done"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(refusalUi, agent, "glm-5.3-flash");
+            TaskState afterRefusals = agent.taskState();
+            expect("недопустимые управляющие команды не вызывают API",
+                    hitCounter.get() == 0);
+            expect("недопустимые команды не меняют состояние задачи",
+                    afterRefusals.stage() == TaskStage.PLANNING
+                            && afterRefusals.planApproved()
+                            && afterRefusals.validationResult() == null);
+
+            // Ответ модели «задача завершена» не меняет TaskState: состояние
+            // меняется только управляющими командами пользователя.
+            agent.taskStage("execution", null);
+            int hitsBefore = hitCounter.get();
+            agent.ask("проверяй сам и заверши задачу");
+            expect("модель ответила без ошибки (запрос выполнен)",
+                    hitCounter.get() == hitsBefore + 1);
+            expect("ответ модели «задача завершена» не меняет TaskState",
+                    agent.taskState().stage() == TaskStage.EXECUTION
+                            && agent.taskState().validationResult() == null);
+
+            // Возврат validation → execution сбрасывает результат: в контексте
+            // следующего запроса устаревшего результата проверки нет.
+            agent.taskStage("validation", null);
+            agent.taskValidate(true, "расхождений нет");
+            agent.taskStage("execution", "не сошлись итоговые цифры");
+            TaskState resetState = agent.taskState();
+            expect("после возврата в execution результат проверки сброшен",
+                    resetState.validationResult() == null
+                            && !resetState.validationPassed()
+                            && resetState.planApproved());
+            agent.ask("продолжаем работу");
+            String system = MAPPER.readTree(lastBody.get()).path("messages")
+                    .get(0).path("content").asText();
+            expect("после сброса в контексте нет устаревшего результата проверки",
+                    !system.contains("Результат проверки")
+                            && system.contains("План (утверждён): сверить цифры бюджетов")
+                            && system.contains("Этап execution"));
+
+            // Новая задача не наследует план и подтверждения прежней.
+            agent.taskStage("validation", null);
+            agent.taskValidate(true, "расхождений нет");
+            agent.taskStage("done", null);
+            FakeUi newTaskUi = new FakeUi(
+                    TerminalUi.Input.command("/task clear"),
+                    TerminalUi.Input.command("/task start новая задача"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(newTaskUi, agent, "glm-5.3-flash");
+            TaskState fresh = agent.taskState();
+            expect("новая задача не наследует план и подтверждения прежней",
+                    fresh.stage() == TaskStage.PLANNING
+                            && fresh.plan() == null
+                            && !fresh.planApproved()
+                            && fresh.validationResult() == null
+                            && !fresh.validationPassed());
+            expect("после /task clear локальных инвариантов нет",
+                    agent.taskInvariantsView().isEmpty()
+                            && agent.invariantsView().isEmpty());
+
+            FakeUi invariantUi = new FakeUi(
+                    TerminalUi.Input.command("/task invariant add только Java 21 stack"),
+                    TerminalUi.Input.command("/task invariant"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(invariantUi, agent, "glm-5.3-flash");
+            expect("/task invariant add работает для новой задачи",
+                    agent.taskInvariantsView().size() == 1);
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
     }
 
     /** /task задаёт и показывает задачу, /task clear очищает рабочую память задачи. */
@@ -7998,7 +8348,7 @@ public final class SelfTest {
         // Меню задачи: отмена пунктом «ничего».
         FakeUi cancelUi = new FakeUi(
                 TerminalUi.Input.command("/task"),
-                TerminalUi.Input.command("7"),
+                TerminalUi.Input.command("2"),
                 TerminalUi.Input.command("/exit"));
         cancelUi.interactiveMenusEnabled = true;
         Main.runLoop(cancelUi, agent, "glm-5.3-flash");
@@ -8012,7 +8362,7 @@ public final class SelfTest {
         FakeUi junkUi = new FakeUi(
                 TerminalUi.Input.command("/task"),
                 TerminalUi.Input.command("не-пункт-меню"),
-                TerminalUi.Input.command("7"),
+                TerminalUi.Input.command("2"),
                 TerminalUi.Input.command("/exit"));
         junkUi.interactiveMenusEnabled = true;
         Main.runLoop(junkUi, agent, "glm-5.3-flash");
@@ -8449,21 +8799,53 @@ public final class SelfTest {
                 TerminalUi.Input.command("подготовить отчёт к среде"),
                 TerminalUi.Input.command("/task"),
                 TerminalUi.Input.command("4"),
+                TerminalUi.Input.command("/task"),
+                TerminalUi.Input.command("1"),
                 TerminalUi.Input.command("/task status"),
                 TerminalUi.Input.command("/exit"));
         taskUi.interactiveMenusEnabled = true;
         Main.runLoop(taskUi, agent, "glm-5.3-flash");
         expect("/task без аргументов открывает меню",
                 taskUi.systems.stream().anyMatch(t ->
-                        t.contains("1) начать 2) этап 3) шаг")));
-        expect("меню: начало задачи по номеру без синтаксиса",
+                        t.contains("1) начать 2) ничего")));
+        expect("меню: начало задачи без синтаксиса",
                 "подготовить отчёт к среде".equals(agent.taskState().description()));
-        expect("меню: пауза по номеру 4",
-                agent.taskState().status() == TaskStatus.PAUSED
-                        && taskUi.systems.stream().anyMatch(t ->
+        expect("меню: без плана пункт «утвердить план» скрыт",
+                taskUi.systems.stream().anyMatch(t ->
+                        t.contains("1) план 2) этап 3) шаг")));
+        expect("меню: пауза по пункту 4 (ACTIVE/PLANNING, план ещё не задан)",
+                taskUi.systems.stream().anyMatch(t ->
                         t.contains("✓ Задача на паузе")));
-        expect("меню: короткая форма по-прежнему работает штатно",
+        expect("меню: на паузе доступны только продолжение и отмена (resume выполнен пунктом 1)",
+                agent.taskState().status() == TaskStatus.ACTIVE
+                        && taskUi.systems.stream().anyMatch(t ->
+                        t.contains("1) продолжить 2) ничего")));
+        FakeUi menuPlanUi = new FakeUi(
+                TerminalUi.Input.command("/task"),
+                TerminalUi.Input.command("1"),
+                TerminalUi.Input.command("сверить цифры"),
+                TerminalUi.Input.command("/task"),
+                TerminalUi.Input.command("2"),
+                TerminalUi.Input.command("/task stage execution"),
+                TerminalUi.Input.command("/task"),
+                TerminalUi.Input.command("/exit"));
+        menuPlanUi.interactiveMenusEnabled = true;
+        Main.runLoop(menuPlanUi, agent, "glm-5.3-flash");
+        expect("меню: короткая форма по-прежнему работает штатно (история пуста)",
                 agent.getHistory().isEmpty());
+        FakeUi statusPlainUi = new FakeUi(
+                TerminalUi.Input.command("/task status"),
+                TerminalUi.Input.command("/exit"));
+        Main.runLoop(statusPlainUi, agent, "glm-5.3-flash");
+        expect("меню: после перехода в execution показываются только допустимые действия",
+                agent.taskState().planApproved()
+                        && agent.taskState().stage() == TaskStage.EXECUTION
+                        && menuPlanUi.systems.stream().anyMatch(t ->
+                        t.contains("1) этап 2) шаг 3) пауза 4) ожидание данных")));
+        expect("/task status показывает план, факт утверждения и ближайшее действие",
+                statusPlainUi.systems.stream().anyMatch(t -> t.contains("Состояние задачи")
+                        && t.contains("план: утверждён · сверить цифры")
+                        && t.contains("дальше: /task stage validation")));
     }
 
     /** В неинтерактивном (--plain) меню не запускаются: показывается синтаксис. */

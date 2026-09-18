@@ -375,7 +375,11 @@ public interface TerminalUi extends AutoCloseable {
                       /task                            — состояние; в интерактивном терминале — меню
                       /task start <описание>          — начать (этап planning)
                       /task <текст>                    — короткая форма задания описания
+                      /task plan <текст>               — зафиксировать/заменить план (planning)
+                      /task approve                    — утвердить зафиксированный план
                       /task stage <этап> [причина]     — planning|execution|validation|done
+                      /task validate pass <результат>  — зафиксировать успешную проверку
+                      /task validate fail <результат>  — зафиксировать неуспешную проверку
                       /task step <текст>               — текущий шаг (прежний — в выполненные)
                       /task expect <текст>             — ожидаемое действие
                       /task pause · /task resume       — пауза и продолжение
@@ -389,14 +393,26 @@ public interface TerminalUi extends AutoCloseable {
 
                     Примеры
                       /task start подготовить отчёт к среде
+                      /task plan сверить цифры по двух источникам
+                      /task approve
                       /task stage execution
+                      /task stage validation
+                      /task validate pass расхождения не найдены
                       /task stage execution не сошлись итоговые цифры
 
                     Эффекты
                      этапы — только вперёд planning → execution → validation → done;
-                      возврат validation → execution — с причиной; DONE → planning
-                      нельзя (это новая задача). Пауза замораживает этап, шаг и
-                      выполненные шаги; возобновление — только /task resume.
+                      вход в execution — только после утверждения плана (/task approve,
+                      простая смена этапа план не утверждает); вход в done — только
+                      после успешного результата проверки (/task validate pass;
+                      реплика «всё проверено» результат не фиксирует); возврат
+                      validation → execution — с причиной и сбросом результата.
+                      DONE → planning нельзя (это новая задача). Подтверждения,
+                      валидация и смены этапов — только для активной задачи
+                      (/task plan/approve/validate/stage при паузе или блокировке
+                      отклоняются). Замена плана сбрасывает его утверждение.
+                      Пауза замораживает этап, шаг и выполненные шаги;
+                      возобновление — только /task resume.
                       Состояние подставляется в каждый запрос блоком
                       «СОСТОЯНИЕ ЗАДАЧИ» и живёт до /task clear или /clear
                       (текущий запуск). Локальные инварианты (/task invariant)

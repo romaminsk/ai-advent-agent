@@ -21,6 +21,14 @@ import java.util.List;
  * задачи — это текущая задача, живёт в рамках сессии, очищается /clear
  * и /task clear, но переживает пауза и продолжение внутри сессии.
  *
+ * Контролируемые переходы: вход в EXECUTION требует явно утверждённого
+ * плана (plan + planApproved), вход в DONE — явно зафиксированного
+ * успешного результата проверки (validationResult + validationPassed).
+ * Утверждение и результат фиксируются отдельными командами пользователя;
+ * смена этапа и подтверждения возможны только в статусе ACTIVE. Замена
+ * плана сбрасывает его утверждение; возврат VALIDATION → EXECUTION
+ * сбрасывает результат проверки.
+ *
  * Локальные инварианты (localInvariants) — жёсткие рамки, привязанные к
  * этой задаче: тот же тип {@link Invariant}, что и глобальные, но живут
  * ровно столько, сколько задача — они часть сессионного состояния
@@ -34,14 +42,27 @@ public record TaskState(TaskStage stage,
                         List<String> completedSteps,
                         List<Invariant> localInvariants,
                         String description,
-                        String updatedAt) {
+                        String updatedAt,
+                        String plan,
+                        boolean planApproved,
+                        String validationResult,
+                        boolean validationPassed) {
 
-    /** Совместимый конструктор без локальных инвариантов. */
+    /** Совместимый конструктор без плана, подтверждений и результата проверки. */
     public TaskState(TaskStage stage, TaskStatus status, String currentStep,
                      String expectedAction, List<String> completedSteps,
                      String description, String updatedAt) {
         this(stage, status, currentStep, expectedAction, completedSteps,
-                List.of(), description, updatedAt);
+                List.of(), description, updatedAt, null, false, null, false);
+    }
+
+    /** Совместимый конструктор без плана, подтверждений и результата проверки. */
+    public TaskState(TaskStage stage, TaskStatus status, String currentStep,
+                     String expectedAction, List<String> completedSteps,
+                     List<Invariant> localInvariants, String description,
+                     String updatedAt) {
+        this(stage, status, currentStep, expectedAction, completedSteps,
+                localInvariants, description, updatedAt, null, false, null, false);
     }
 
     public TaskState {
@@ -81,10 +102,23 @@ public record TaskState(TaskStage stage,
      * по цепочке и возврат VALIDATION → EXECUTION — но обратный переход
      * требует явной причины (ошибка проверки), иначе он теряет смысл.
      * Сделанный шаг считается выполненным и переносится в completedSteps.
+     *
+     * Дополнительные правила контролируемых переходов:
+     * - смена этапа возможна только в статусе ACTIVE (PAUSED/BLOCKED
+     *   нельзя обойти сменой этапа, в том числе завершением задачи);
+     * - вход в EXECUTION из PLANNING требует утверждённого плана
+     *   (утверждение — отдельная команда пользователя);
+     * - вход в DONE требует зафиксированного успешного результата
+     *   проверки; возврат VALIDATION → EXECUTION сбрасывает результат.
      */
     public TaskState withStage(TaskStage target, String reason, Instant now) {
         if (target == null) {
             throw new AgentException("Не указан этап задачи: /task stage <planning|execution|validation|done>.");
+        }
+        if (status != TaskStatus.ACTIVE) {
+            throw new AgentException("Смена этапа возможна только для активной задачи (сейчас "
+                    + status.lowerName() + "). Верните задаче статус active: "
+                    + (status == TaskStatus.PAUSED ? "/task resume." : "/task unblock."));
         }
         if (target == stage) {
             throw new AgentException("Задача уже на этапе " + stage.lowerName() + ".");
@@ -100,6 +134,17 @@ public record TaskState(TaskStage stage,
                     + "planning → execution → validation → done (допустим возврат "
                     + "validation → execution с причиной).");
         }
+        if (stage == TaskStage.PLANNING && target == TaskStage.EXECUTION
+                && !(plan != null && planApproved)) {
+            throw new AgentException("Переход на этап execution требует утверждённого плана. "
+                    + "Зафиксируйте и утвердите его: /task plan <текст>, затем /task approve. "
+                    + "Простая смена этапа план не утверждает.");
+        }
+        if (stage == TaskStage.VALIDATION && target == TaskStage.DONE && !validationPassed) {
+            throw new AgentException("Переход на этап done требует зафиксированного успешного "
+                    + "результата проверки: /task validate pass <результат проверки>. "
+                    + "Сообщение модели «всё проверено» результат не фиксирует.");
+        }
         if (stage.isBackwardTransitionTo(target)) {
             if (reason == null || reason.isBlank()) {
                 throw new AgentException("Возврат на этап execution требует причины: "
@@ -110,8 +155,14 @@ public record TaskState(TaskStage stage,
         if (currentStep != null) {
             completed.add(currentStep);
         }
+        // Возврат в execution сбрасывает прежнее подтверждение валидации:
+        // повторный вход в validation потребует нового результата.
+        boolean keepValidation = !(stage == TaskStage.VALIDATION && target == TaskStage.EXECUTION);
         return new TaskState(target, status, null, expectedAction, completed,
-                localInvariants, description, now.toString());
+                localInvariants, description, now.toString(),
+                plan, planApproved,
+                keepValidation ? validationResult : null,
+                keepValidation && validationPassed);
     }
 
     /** Смена статуса (ACTIVE ↔ PAUSED, ACTIVE ↔ BLOCKED; произвольные — ошибка). */
@@ -125,7 +176,8 @@ public record TaskState(TaskStage stage,
                     + "в активное состояние (/task resume, /task unblock).");
         }
         return new TaskState(stage, target, currentStep, expectedAction,
-                completedSteps, localInvariants, description, now.toString());
+                completedSteps, localInvariants, description, now.toString(),
+                plan, planApproved, validationResult, validationPassed);
     }
 
     private static String sameStatusMessage(TaskStatus target) {
@@ -152,7 +204,8 @@ public record TaskState(TaskStage stage,
             completed.add(currentStep);
         }
         return new TaskState(stage, status, newStep, expectedAction, completed,
-                localInvariants, description, now.toString());
+                localInvariants, description, now.toString(),
+                plan, planApproved, validationResult, validationPassed);
     }
 
     /** Задание ожидаемого действия (что должен сделать агент или пользователь дальше). */
@@ -161,16 +214,18 @@ public record TaskState(TaskStage stage,
             throw new AgentException("Текст ожидаемого действия обязателен: /task expect <текст>.");
         }
         return new TaskState(stage, status, currentStep, action, completedSteps,
-                localInvariants, description, now.toString());
+                localInvariants, description, now.toString(),
+                plan, planApproved, validationResult, validationPassed);
     }
 
-    /** Обновление описания задачи (этап, шаги и статус не трогаются). */
+    /** Обновление описания задачи (этап, шаги, план и статус не трогаются). */
     public TaskState withDescription(String newDescription, Instant now) {
         if (newDescription == null || newDescription.isBlank()) {
             throw new AgentException("Описание задачи не может быть пустым.");
         }
         return new TaskState(stage, status, currentStep, expectedAction,
-                completedSteps, localInvariants, newDescription, now.toString());
+                completedSteps, localInvariants, newDescription, now.toString(),
+                plan, planApproved, validationResult, validationPassed);
     }
 
     // ================= Локальные инварианты задачи =================
@@ -188,7 +243,8 @@ public record TaskState(TaskStage stage,
         List<Invariant> copy = new ArrayList<>(localInvariants);
         copy.add(invariant);
         return new TaskState(stage, status, currentStep, expectedAction,
-                completedSteps, copy, description, now.toString());
+                completedSteps, copy, description, now.toString(),
+                plan, planApproved, validationResult, validationPassed);
     }
 
     /** Результат /task invariant remove: новое состояние и удалённая запись. */
@@ -213,13 +269,108 @@ public record TaskState(TaskStage stage,
             return new TaskInvariantRemove(this, null);
         }
         TaskState updated = new TaskState(stage, status, currentStep, expectedAction,
-                completedSteps, remaining, description, now.toString());
+                completedSteps, remaining, description, now.toString(),
+                plan, planApproved, validationResult, validationPassed);
         return new TaskInvariantRemove(updated, removedInvariant);
     }
 
     /** Очистка всех локальных инвариантов (остальное состояние задачи не трогается). */
     public TaskState withoutLocalInvariants(Instant now) {
         return new TaskState(stage, status, currentStep, expectedAction,
-                completedSteps, List.of(), description, now.toString());
+                completedSteps, List.of(), description, now.toString(),
+                plan, planApproved, validationResult, validationPassed);
+    }
+
+    // ================= План и его утверждение =================
+
+    /**
+     * Фиксирует или заменяет план (/task plan <текст>) — только в статусе
+     * ACTIVE и только на этапе PLANNING: после выхода из planning план
+     * не меняется, чтобы утверждённый план нельзя было незаметно подменить,
+     * сохранив старое подтверждение. Замена текста сбрасывает утверждение;
+     * повторная установка того же текста ничего не меняет (утверждение
+     * сохраняется).
+     */
+    public TaskState withPlan(String newPlan, Instant now) {
+        if (status != TaskStatus.ACTIVE) {
+            throw new AgentException("Фиксация плана возможна только для активной задачи "
+                    + "(сейчас " + status.lowerName() + "). Верните задаче статус active: "
+                    + (status == TaskStatus.PAUSED ? "/task resume." : "/task unblock."));
+        }
+        if (stage != TaskStage.PLANNING) {
+            throw new AgentException("План фиксируется на этапе planning (сейчас "
+                    + stage.lowerName() + "). После выхода из planning план не меняется — "
+                    + "иначе утверждённый план можно было бы подменить, сохранив утверждение.");
+        }
+        if (newPlan == null || newPlan.isBlank()) {
+            throw new AgentException("Текст плана обязателен: /task plan <текст>.");
+        }
+        String trimmed = newPlan.trim();
+        if (trimmed.equals(plan)) {
+            throw new AgentException("План уже зафиксирован с этим текстом"
+                    + (planApproved ? " и утверждён." : " (утверждение: /task approve)."));
+        }
+        return new TaskState(stage, status, currentStep, expectedAction,
+                completedSteps, localInvariants, description, now.toString(),
+                trimmed, false, validationResult, validationPassed);
+    }
+
+    /**
+     * Явное утверждение зафиксированного плана (/task approve) — только
+     * в статусе ACTIVE и только на этапе PLANNING. Утверждение относится
+     * к конкретному зафиксированному плану: без плана отклоняется;
+     * смена этапа план не утверждает.
+     */
+    public TaskState approvePlan(Instant now) {
+        if (status != TaskStatus.ACTIVE) {
+            throw new AgentException("Утверждение плана возможно только для активной задачи "
+                    + "(сейчас " + status.lowerName() + "). Верните задаче статус active: "
+                    + (status == TaskStatus.PAUSED ? "/task resume." : "/task unblock."));
+        }
+        if (stage != TaskStage.PLANNING) {
+            throw new AgentException("Утверждение плана — на этапе planning (сейчас "
+                    + stage.lowerName() + ").");
+        }
+        if (plan == null) {
+            throw new AgentException("План не зафиксирован: /task plan <текст>. "
+                    + "Утверждать можно только конкретный план.");
+        }
+        if (planApproved) {
+            throw new AgentException("План уже утверждён. Переход к выполнению: "
+                    + "/task stage execution.");
+        }
+        return new TaskState(stage, status, currentStep, expectedAction,
+                completedSteps, localInvariants, description, now.toString(),
+                plan, true, validationResult, validationPassed);
+    }
+
+    // ================= Результат проверки (валидация) =================
+
+    /**
+     * Фиксация результата проверки (/task validate pass|fail <результат>) —
+     * только в статусе ACTIVE и только на этапе VALIDATION. Вход на этап
+     * validation сам по себе ничего не фиксирует. Пустой результат не
+     * принимается; новый результат заменяет прежний (pass → fail снова
+     * запрещает DONE).
+     */
+    public TaskState withValidationResult(boolean passed, String result, Instant now) {
+        if (status != TaskStatus.ACTIVE) {
+            throw new AgentException("Фиксация результата проверки возможна только для "
+                    + "активной задачи (сейчас " + status.lowerName() + "). Верните задаче "
+                    + "статус active: "
+                    + (status == TaskStatus.PAUSED ? "/task resume." : "/task unblock."));
+        }
+        if (stage != TaskStage.VALIDATION) {
+            throw new AgentException("Результат проверки фиксируется на этапе validation "
+                    + "(сейчас " + stage.lowerName() + "): сначала /task stage validation, "
+                    + "после проверки — /task validate pass|fail <результат>.");
+        }
+        if (result == null || result.isBlank()) {
+            throw new AgentException("Текст результата проверки обязателен: "
+                    + "/task validate " + (passed ? "pass" : "fail") + " <результат проверки>.");
+        }
+        return new TaskState(stage, status, currentStep, expectedAction,
+                completedSteps, localInvariants, description, now.toString(),
+                plan, planApproved, result.trim(), passed);
     }
 }

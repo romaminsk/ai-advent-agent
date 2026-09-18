@@ -719,8 +719,9 @@ public final class Main {
                     if (ui.interactiveMenus()) {
                         interactiveTaskMenu(ui, agent, demoRef);
                     } else if (agent.taskState() != null) {
-                        ui.showSystem("Действия: /task stage|step|expect|pause|resume|"
-                                + "block|unblock|clear · меню доступно в интерактивном терминале.");
+                        ui.showSystem("Действия: /task plan|approve|stage|step|expect|"
+                                + "validate|pause|resume|block|unblock|clear · "
+                                + "меню доступно в интерактивном терминале.");
                     }
                 }
                 case "status" -> ui.showSystem(formatTaskStatus(agent));
@@ -740,7 +741,10 @@ public final class Main {
                     if (rest.isEmpty()) {
                         ui.showSystem("Использование: /task stage <planning|execution|"
                                 + "validation|done> [причина]. Переходы — только вперёд; "
-                                + "возврат validation → execution с причиной.");
+                                + "возврат validation → execution с причиной; вход "
+                                + "в execution требует утверждённого плана (/task approve), "
+                                + "вход в done — успешного результата проверки "
+                                + "(/task validate pass).");
                         return;
                     }
                     String[] parts = rest.split("\\s+", 2);
@@ -751,6 +755,59 @@ public final class Main {
                     ui.showSystem("✓ Задача переведена на этап "
                             + state.stage().lowerName() + "."
                             + (doneNote.isEmpty() ? "\n  " + CommandHints.afterTaskStage(state.stage()) : doneNote));
+                }
+                case "plan" -> {
+                    if (rest.isEmpty()) {
+                        ui.showSystem("Использование: /task plan <текст> — зафиксировать "
+                                + "или заменить план (этап planning). Замена плана "
+                                + "сбрасывает его утверждение.");
+                        return;
+                    }
+                    agent.taskPlan(rest);
+                    ui.showSystem("✓ План зафиксирован: «" + rest + "».\n  "
+                            + "Утверждение отдельной командой: /task approve "
+                            + "(этап остаётся planning).");
+                }
+                case "approve" -> {
+                    if (!rest.isEmpty()) {
+                        ui.showSystem("Использование: /task approve — без аргументов. "
+                                + "План задаётся командой /task plan <текст>.");
+                        return;
+                    }
+                    TaskState state = agent.taskApprove();
+                    ui.showSystem("✓ План утверждён: «" + state.plan() + "». Этап "
+                            + "по-прежнему planning; переход к выполнению: "
+                            + "/task stage execution.");
+                }
+                case "validate" -> {
+                    if (rest.isEmpty()) {
+                        ui.showSystem("Использование: /task validate pass <результат>"
+                                + " — успех · /task validate fail <результат>"
+                                + " — неуспех. Фиксирует результат вашей проверки "
+                                + "(этап validation); сам он ничего не запускает.");
+                        return;
+                    }
+                    String[] parts = rest.split("\\s+", 2);
+                    boolean passed = switch (parts[0].toLowerCase(java.util.Locale.ROOT)) {
+                        case "pass", "успех", "успешно" -> true;
+                        case "fail", "неуспех", "неуспешно" -> false;
+                        default -> throw new AgentException(
+                                "Неизвестный результат проверки: «" + parts[0] + "». "
+                                        + "Использование: /task validate pass <результат> "
+                                        + "или /task validate fail <результат>.");
+                    };
+                    if (parts.length < 2 || parts[1].isBlank()) {
+                        ui.showSystem("Текст результата обязателен: /task validate "
+                                + (passed ? "pass" : "fail") + " <результат проверки>.");
+                        return;
+                    }
+                    TaskState state = agent.taskValidate(passed, parts[1]);
+                    ui.showSystem("✓ Результат проверки зафиксирован ("
+                            + (passed ? "успешная" : "неуспешная") + "): «"
+                            + state.validationResult() + "».\n  "
+                            + (passed
+                            ? "Завершение отдельной командой: /task stage done."
+                            : "Доработка: /task stage execution <причина>."));
                 }
                 case "step" -> {
                     if (rest.isEmpty()) {
@@ -963,93 +1020,188 @@ public final class Main {
     }
 
     /**
-     * Пошаговое меню задачи (/task без аргументов, интерактивный терминал):
-     * начать, этап, шаг, пауза, продолжить, блокировка. Короткая форма
-     * (/task stage execution) — как раньше; меню открывается только
-     * без аргументов.
+     * Пошаговое меню задачи (/task без аргументов, интерактивный терминал).
+     * Пункты собраны по текущему состоянию задачи: недопустимые действия
+     * не показываются (смена этапа и подтверждения видны только в ACTIVE,
+     * утверждение плана — только без утверждённого плана и т.п.). Короткая
+     * форма (/task stage execution) — как раньше; меню открывается только
+     * без аргументов. Доменная проверка обязательна независимо от меню.
      */
     private static void interactiveTaskMenu(TerminalUi ui, LlmAgent agent, DemoRef demoRef) {
+        record MenuItem(String label, Runnable action) {}
+        List<MenuItem> items = new ArrayList<>();
+        TaskState state = agent.taskState();
+        if (state == null) {
+            items.add(new MenuItem("начать", () -> {
+                String description = promptStep(ui, "Опишите задачу:");
+                if (description == null) {
+                    ui.showSystem("Действие отменено.");
+                    return;
+                }
+                TaskState started = agent.taskStart(description);
+                updatePromptLabels(ui, agent, demoRef);
+                ui.showSystem("✓ Задача задана: «" + started.description()
+                        + "». Этап planning, статус active.\n  "
+                        + CommandHints.afterTaskStart());
+            }));
+        } else if (state.status() == TaskStatus.PAUSED) {
+            items.add(new MenuItem("продолжить", () -> {
+                TaskState resumed = agent.taskResume();
+                ui.showSystem("✓ Задача возобновлена: этап " + resumed.stage().lowerName()
+                        + (resumed.currentStep() != null
+                        ? ", текущий шаг «" + resumed.currentStep() + "»."
+                        : ", текущий шаг не задан.")
+                        + "\n  Подробнее: /task status");
+            }));
+        } else if (state.status() == TaskStatus.BLOCKED) {
+            items.add(new MenuItem("снять блокировку", () -> {
+                TaskState unblocked = agent.taskUnblock();
+                ui.showSystem("✓ Блокировка снята: задача снова активна (этап "
+                        + unblocked.stage().lowerName() + ").\n  "
+                        + CommandHints.afterTaskStage(unblocked.stage()));
+            }));
+        } else { // ACTIVE
+            if (state.stage() == TaskStage.PLANNING) {
+                items.add(new MenuItem("план", () -> {
+                    String plan = promptStep(ui, "Введите текст плана:");
+                    if (plan == null) {
+                        ui.showSystem("Действие отменено.");
+                        return;
+                    }
+                    agent.taskPlan(plan);
+                    ui.showSystem("✓ План зафиксирован: «" + plan + "».\n  "
+                            + "Утверждение отдельной командой: /task approve "
+                            + "(этап остаётся planning).");
+                }));
+                if (state.plan() != null && !state.planApproved()) {
+                    items.add(new MenuItem("утвердить план", () -> {
+                        TaskState approved = agent.taskApprove();
+                        ui.showSystem("✓ План утверждён: «" + approved.plan() + "». "
+                                + "Переход к выполнению: /task stage execution.");
+                    }));
+                }
+            }
+            items.add(new MenuItem("этап", () -> {
+                String value = promptStep(ui, "Этап (planning|execution|validation|done)"
+                        + ", для возврата — через пробел причина:");
+                if (value == null) {
+                    ui.showSystem("Действие отменено.");
+                    return;
+                }
+                String[] parts = value.split("\\s+", 2);
+                TaskState staged = agent.taskStage(parts[0],
+                        parts.length > 1 ? parts[1] : null);
+                String stageNote = staged.stage() == TaskStage.DONE
+                        ? "Начать новую: /task start <описание>."
+                        : CommandHints.afterTaskStage(staged.stage());
+                ui.showSystem("✓ Задача переведена на этап "
+                        + staged.stage().lowerName() + ".\n  " + stageNote);
+            }));
+            items.add(new MenuItem("шаг", () -> {
+                String step = promptStep(ui, "Введите текст текущего шага:");
+                if (step == null) {
+                    ui.showSystem("Действие отменено.");
+                    return;
+                }
+                agent.taskStep(step);
+                ui.showSystem("✓ Текущий шаг: «" + step + "».\n  "
+                        + CommandHints.afterTaskStep());
+            }));
+            if (state.stage() == TaskStage.VALIDATION) {
+                items.add(new MenuItem("результат проверки", () -> {
+                    String value = promptStep(ui, "Результат (pass|fail) и через пробел "
+                            + "текст результата:");
+                    if (value == null) {
+                        ui.showSystem("Действие отменено.");
+                        return;
+                    }
+                    String[] parts = value.split("\\s+", 2);
+                    boolean passed;
+                    if ("pass".equalsIgnoreCase(parts[0].trim())) {
+                        passed = true;
+                    } else if ("fail".equalsIgnoreCase(parts[0].trim())) {
+                        passed = false;
+                    } else {
+                        ui.showError("Неизвестный результат проверки: «" + parts[0]
+                                + "». Использование: /task validate pass <результат> "
+                                + "или /task validate fail <результат>.");
+                        return;
+                    }
+                    if (parts.length < 2 || parts[1].isBlank()) {
+                        ui.showSystem("Текст результата обязателен: "
+                                + (passed ? "/task validate pass <результат проверки>."
+                                : "/task validate fail <результат проверки>."));
+                        return;
+                    }
+                    TaskState validated = agent.taskValidate(passed, parts[1]);
+                    ui.showSystem("✓ Результат проверки зафиксирован ("
+                            + (passed ? "успешная" : "неуспешная") + "): «"
+                            + validated.validationResult() + "».\n  "
+                            + (passed
+                            ? "Завершение отдельной командой: /task stage done."
+                            : "Доработка: /task stage execution <причина>."));
+                }));
+            }
+            items.add(new MenuItem("пауза", () -> {
+                agent.taskPause();
+                ui.showSystem("✓ Задача на паузе: этап, шаг и выполненные шаги "
+                        + "сохранены. Продолжение: /task resume.");
+            }));
+            items.add(new MenuItem("ожидание данных", () -> {
+                agent.taskBlock();
+                ui.showSystem("✓ Задача помечена как blocked: модель будет "
+                        + "запрашивать недостающее. Снять: /task unblock.");
+            }));
+            if (state.stage() == TaskStage.DONE) {
+                items.add(new MenuItem("начать новую задачу", () -> {
+                    String description = promptStep(ui, "Опишите новую задачу:");
+                    if (description == null) {
+                        ui.showSystem("Действие отменено.");
+                        return;
+                    }
+                    TaskState started = agent.taskStart(description);
+                    updatePromptLabels(ui, agent, demoRef);
+                    ui.showSystem("✓ Задача задана: «" + started.description()
+                            + "». Этап planning, статус active.\n  "
+                            + CommandHints.afterTaskStart());
+                }));
+            }
+        }
+        items.add(new MenuItem("ничего", () -> ui.showSystem("Действие с задачей отменено.")));
+
         String choice;
         try {
             while (true) {
-                choice = promptStep(ui, "Задача: 1) начать 2) этап 3) шаг 4) пауза "
-                        + "5) продолжить 6) ожидание данных 7) ничего (Enter — отмена)");
+                StringBuilder prompt = new StringBuilder("Задача: ");
+                for (int i = 0; i < items.size(); i++) {
+                    prompt.append(i + 1).append(") ").append(items.get(i).label());
+                    if (i < items.size() - 1) {
+                        prompt.append(' ');
+                    }
+                }
+                prompt.append(" (Enter — отмена)");
+                choice = promptStep(ui, prompt.toString());
                 if (choice == null) {
                     ui.showSystem("Действие с задачей отменено.");
                     return;
                 }
-                switch (choice.toLowerCase(java.util.Locale.ROOT)) {
-                    case "1", "1) начать", "начать", "start" -> {
-                        String description = promptStep(ui, "Опишите задачу:");
-                        if (description == null) {
-                            ui.showSystem("Действие отменено.");
-                            return;
-                        }
-                        TaskState state = agent.taskStart(description);
-                        updatePromptLabels(ui, agent, demoRef);
-                        ui.showSystem("✓ Задача задана: «" + state.description()
-                                + "». Этап planning, статус active.\n  "
-                                + CommandHints.afterTaskStart());
-                        return;
+                String normalized = choice.toLowerCase(java.util.Locale.ROOT).trim();
+                MenuItem matched = null;
+                for (int i = 0; i < items.size(); i++) {
+                    MenuItem item = items.get(i);
+                    if (String.valueOf(i + 1).equals(normalized)
+                            || item.label().equals(normalized)) {
+                        matched = item;
+                        break;
                     }
-                    case "2", "2) этап", "этап", "stage" -> {
-                        String value = promptStep(ui, "Этап (planning|execution|validation|done)"
-                                + ", для возврата — через пробел причина:");
-                        if (value == null) {
-                            ui.showSystem("Действие отменено.");
-                            return;
-                        }
-                        String[] parts = value.split("\\s+", 2);
-                        TaskState state = agent.taskStage(parts[0],
-                                parts.length > 1 ? parts[1] : null);
-                        String stageNote = state.stage() == TaskStage.DONE
-                                ? "Начать новую: /task start <описание>."
-                                : CommandHints.afterTaskStage(state.stage());
-                        ui.showSystem("✓ Задача переведена на этап "
-                                + state.stage().lowerName() + ".\n  " + stageNote);
-                        return;
-                    }
-                    case "3", "3) шаг", "шаг", "step" -> {
-                        String step = promptStep(ui, "Введите текст текущего шага:");
-                        if (step == null) {
-                            ui.showSystem("Действие отменено.");
-                            return;
-                        }
-                        agent.taskStep(step);
-                        ui.showSystem("✓ Текущий шаг: «" + step + "».\n  "
-                                + CommandHints.afterTaskStep());
-                        return;
-                    }
-                    case "4", "4) пауза", "пауза", "pause" -> {
-                        agent.taskPause();
-                        ui.showSystem("✓ Задача на паузе: этап, шаг и выполненные шаги "
-                                + "сохранены. Продолжение: /task resume.");
-                        return;
-                    }
-                    case "5", "5) продолжить", "продолжить", "resume" -> {
-                        TaskState state = agent.taskResume();
-                        ui.showSystem("✓ Задача возобновлена: этап "
-                                + state.stage().lowerName()
-                                + (state.currentStep() != null
-                                ? ", текущий шаг «" + state.currentStep() + "»."
-                                : ", текущий шаг не задан.")
-                                + "\n  Подробнее: /task status");
-                        return;
-                    }
-                    case "6", "6) ожидание данных", "ожидание данных", "блокировка", "block" -> {
-                        agent.taskBlock();
-                        ui.showSystem("✓ Задача помечена как blocked: модель будет "
-                                + "запрашивать недостающее. Снять: /task unblock.");
-                        return;
-                    }
-                    case "7", "7) ничего", "ничего", "нет" -> {
-                        ui.showSystem("Действие с задачей отменено.");
-                        return;
-                    }
-                    default ->
-                            ui.showSystem("Не понял выбор: «" + choice
-                                    + "». Выберите 1–7 (Enter — отмена).");
                 }
+                if (matched == null) {
+                    ui.showSystem("Не понял выбор: «" + choice + "». Выберите 1–"
+                            + items.size() + " (Enter — отмена).");
+                    continue;
+                }
+                matched.action().run();
+                return;
             }
         } catch (AgentException e) {
             ui.showError(e.getMessage());
@@ -1067,10 +1219,18 @@ public final class Main {
                 ? "не задано" : state.description());
         text.append("\n  этап: ").append(state.stage().lowerName())
                 .append(" · статус: ").append(state.status().lowerName());
+        text.append("\n  план: ").append(state.plan() == null
+                ? "не зафиксирован (/task plan <текст>)"
+                : (state.planApproved() ? "утверждён · " : "не утверждён · ") + state.plan());
+        text.append("\n  результат валидации: ").append(state.validationResult() == null
+                ? "нет (/task validate pass|fail <результат>)"
+                : (state.validationPassed() ? "успешная · " : "неуспешная · ")
+                + state.validationResult());
         text.append("\n  текущий шаг: ").append(state.currentStep() == null
                 ? "не задан" : state.currentStep());
         text.append("\n  ожидаемое действие: ").append(state.expectedAction() == null
                 ? "не задано" : state.expectedAction());
+        text.append("\n  дальше: ").append(CommandHints.nextTaskAction(state));
         if (state.completedSteps().isEmpty()) {
             text.append("\n  выполненные шаги: нет");
         } else {

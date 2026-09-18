@@ -1313,6 +1313,9 @@ public final class LlmAgent {
      * Переводит задачу на этап (/task stage <этап> [причина]). Переходы —
      * только вперёд; возврат validation → execution разрешён только явно
      * и с причиной (ожидаемое действие получает «устранить: <причина>»).
+     * Вход в execution требует утверждённого плана, вход в done —
+     * зафиксированного успешного результата проверки; смена этапа —
+     * только для активной задачи (все правила — в {@link TaskState}).
      */
     public TaskState taskStage(String stageName, String reason) {
         TaskState current = requireTaskState();
@@ -1336,6 +1339,31 @@ public final class LlmAgent {
     /** Задаёт ожидаемое действие (/task expect <текст>). */
     public TaskState taskExpect(String action) {
         TaskState updated = requireTaskState().withExpectedAction(action, java.time.Instant.now());
+        workingMemory.setTaskState(updated);
+        return updated;
+    }
+
+    /** Фиксирует или заменяет план (/task plan <текст>); замена сбрасывает утверждение. */
+    public TaskState taskPlan(String plan) {
+        TaskState updated = requireTaskState().withPlan(plan, java.time.Instant.now());
+        workingMemory.setTaskState(updated);
+        return updated;
+    }
+
+    /** Явно утверждает зафиксированный план (/task approve); этап не меняет. */
+    public TaskState taskApprove() {
+        TaskState updated = requireTaskState().approvePlan(java.time.Instant.now());
+        workingMemory.setTaskState(updated);
+        return updated;
+    }
+
+    /**
+     * Фиксирует результат проверки (/task validate pass|fail <результат>);
+     * этап не меняет: завершение — отдельная команда /task stage done.
+     */
+    public TaskState taskValidate(boolean passed, String result) {
+        TaskState updated = requireTaskState()
+                .withValidationResult(passed, result, java.time.Instant.now());
         workingMemory.setTaskState(updated);
         return updated;
     }
