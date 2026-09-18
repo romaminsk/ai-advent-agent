@@ -796,9 +796,10 @@ public final class Main {
                                         + "Использование: /task validate pass <результат> "
                                         + "или /task validate fail <результат>.");
                     };
-                    if (parts.length < 2 || parts[1].isBlank()) {
-                        ui.showSystem("Текст результата обязателен: /task validate "
-                                + (passed ? "pass" : "fail") + " <результат проверки>.");
+                    if (parts.length < 2) {
+                        // Без текста результата домен сам даёт подсказку по состоянию:
+                        // в VALIDATION — ошибка ввода, вне его — отказ со сменой этапа.
+                        agent.taskValidate(passed, null);
                         return;
                     }
                     TaskState state = agent.taskValidate(passed, parts[1]);
@@ -1127,10 +1128,10 @@ public final class Main {
                                 + "или /task validate fail <результат>.");
                         return;
                     }
-                    if (parts.length < 2 || parts[1].isBlank()) {
-                        ui.showSystem("Текст результата обязателен: "
-                                + (passed ? "/task validate pass <результат проверки>."
-                                : "/task validate fail <результат проверки>."));
+                    if (parts.length < 2) {
+                        // Без текста результата домен даёт подсказку по состоянию:
+                        // в VALIDATION — ошибка ввода, вне его — отказ с ближайшим шагом.
+                        agent.taskValidate(passed, null);
                         return;
                     }
                     TaskState validated = agent.taskValidate(passed, parts[1]);

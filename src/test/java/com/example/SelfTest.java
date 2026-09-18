@@ -6829,6 +6829,14 @@ public final class SelfTest {
         expect("фиксация результата вне validation отклоняется",
                 expectError(() -> execution.withValidationResult(true, "успех", now))
                         .contains("validation"));
+        String executionValidationRefusal = expectError(() ->
+                execution.withValidationResult(true, "успех", now));
+        expect("validate в EXECUTION: подсказка /task stage validation, без утверждения «работа готова»",
+                executionValidationRefusal.contains("/task stage validation")
+                        && !executionValidationRefusal.contains("работа выполнена"));
+        expect("resume повторной активации незавершённой ACTIVE задачи — «уже активна»",
+                expectError(() -> execution.withStatus(TaskStatus.ACTIVE, now))
+                        .contains("Задача уже активна"));
         TaskState done = validation.withValidationResult(true, "расхождений нет", now)
                 .withStage(TaskStage.DONE, null, now);
         expect("done после зафиксированного успешного результата разрешён",
@@ -7371,13 +7379,78 @@ public final class SelfTest {
         String syntaxErrors = String.join("\n", syntaxUi.errors);
         expect("неизвестный результат проверки даст «Использование»",
                 syntaxErrors.contains("Использование: /task validate pass <результат>"));
-        expect("pass без текста результата — подсказка синтаксиса, состояния нет",
-                syntaxSystems.contains("Текст результата обязателен: /task validate pass <результат проверки>."));
+        expect("validate pass без задачи даёт существующее сообщение об отсутствии задачи",
+                syntaxErrors.contains("Задача не начата"));
         expect("короткая форма /task <текст> задаёт описание, план не фиксирует",
                 agent.taskState() != null
                         && "план текст".equals(agent.taskState().description())
                         && agent.taskState().plan() == null
                         && !agent.taskState().planApproved());
+
+        // Подсказки при отказе validate зависят от фактического состояния
+        // (обработчик-команда, полная цепочка, FakeUi). Без прямого перехода
+        // в VALIDATION из PLANNING.
+        FakeUi hintsUi = new FakeUi(
+                TerminalUi.Input.command("/task validate pass р1"),
+                TerminalUi.Input.command("/task plan список из плана"),
+                TerminalUi.Input.command("/task validate fail р2"),
+                TerminalUi.Input.command("/task approve"),
+                TerminalUi.Input.command("/task validate pass р3"),
+                TerminalUi.Input.command("/task stage execution"),
+                TerminalUi.Input.command("/task validate fail р4"),
+                TerminalUi.Input.command("/task pause"),
+                TerminalUi.Input.command("/task validate pass р5"),
+                TerminalUi.Input.command("/task resume"),
+                TerminalUi.Input.command("/task block"),
+                TerminalUi.Input.command("/task validate pass р6"),
+                TerminalUi.Input.command("/task unblock"),
+                TerminalUi.Input.command("/task stage validation"),
+                TerminalUi.Input.command("/task validate pass"),
+                TerminalUi.Input.command("/task validate pass проверка выполнена"),
+                TerminalUi.Input.command("/task stage done"),
+                TerminalUi.Input.command("/task validate pass р8"),
+                TerminalUi.Input.command("/task resume"),
+                TerminalUi.Input.command("/task status"),
+                TerminalUi.Input.command("/exit"));
+        Main.runLoop(hintsUi, agent, "glm-5.3-flash");
+        List<String> hintErrors = hintsUi.errors;
+        expect("validate в PLANNING без плана: подсказка /task plan, без прямого входа в validation",
+                expectError(() -> TaskState.start("з", now)
+                        .withValidationResult(true, "р", now))
+                        .contains("/task plan <текст>")
+                        && !expectError(() -> TaskState.start("з", now)
+                        .withValidationResult(true, "р", now))
+                        .contains("/task stage validation"));
+        expect("validate в PLANNING с неутверждённым планом: подсказка /task approve",
+                hintErrorsContain(hintErrors, "утвердите план: /task approve"));
+        expect("validate в PLANNING с утверждённым планом: подсказка /task stage execution",
+                hintErrorsContain(hintErrors, "/task stage execution"));
+        expect("validate в EXECUTION: подсказка /task stage validation после работы",
+                hintErrorsContain(hintErrors, "/task stage validation")
+                        && hintErrorsContain(hintErrors, "сейчас execution"));
+        expect("validate на паузе: сначала /task resume",
+                hintErrorsContain(hintErrors, "/task resume"));
+        expect("validate при блокировке: /task unblock",
+                hintErrorsContain(hintErrors, "/task unblock"));
+        expect("validate при DONE: подсказка новой задачи, без возврата в прежнюю",
+                hintErrorsContain(hintErrors, "Задача завершена")
+                        && hintErrorsContain(hintErrors, "/task start <описание>"));
+        expect("пустой результат в ACTIVE/VALIDATION — отдельная ошибка ввода, не смена этапа",
+                hintErrorsContain(hintErrors, "Текст результата проверки обязателен"));
+        expect("resume для DONE: отказ связан с завершением, не «уже активна», состояние неизменно",
+                hintErrorsContain(hintErrors, "Задача завершена: возобновить её нельзя")
+                        && hintErrorsContain(hintErrors, "/task start <описание>")
+                        && !hintErrorsContain(hintErrors, "уже активна")
+                        && agent.taskState().stage() == TaskStage.DONE
+                        && agent.taskState().validationPassed());
+        expect("/task status показывает DONE после отказов",
+                hintsUi.systems.stream().anyMatch(t -> t.contains("Состояние задачи")
+                        && t.contains("этап: done")));
+    }
+
+    /** true, если список отказов содержит подстроку (для читаемости сценариев). */
+    private static boolean hintErrorsContain(List<String> errors, String needle) {
+        return errors.stream().anyMatch(t -> t.contains(needle));
     }
 
     /**
@@ -7413,11 +7486,16 @@ public final class SelfTest {
             FakeUi refusalUi = new FakeUi(
                     TerminalUi.Input.command("/task stage validation"),
                     TerminalUi.Input.command("/task stage done"),
+                    TerminalUi.Input.command("/task validate pass пробный результат"),
                     TerminalUi.Input.command("/exit"));
             Main.runLoop(refusalUi, agent, "glm-5.3-flash");
             TaskState afterRefusals = agent.taskState();
             expect("недопустимые управляющие команды не вызывают API",
                     hitCounter.get() == 0);
+            expect("validate вне VALIDATION ограничен подсказкой допустимого шага текущего состояния",
+                    refusalUi.errors.stream().anyMatch(t -> t.contains(
+                            "Результат проверки фиксируется только на этапе validation")
+                            && t.contains("/task stage execution")));
             expect("недопустимые команды не меняют состояние задачи",
                     afterRefusals.stage() == TaskStage.PLANNING
                             && afterRefusals.planApproved()
@@ -7462,9 +7540,10 @@ public final class SelfTest {
                     TerminalUi.Input.command("/task resume"),
                     TerminalUi.Input.command("/exit"));
             Main.runLoop(doneResumeUi, agent, "glm-5.3-flash");
-            expect("возобновление завершённой задачи отклоняется (она активна, но в done)",
+            expect("возобновление завершённой задачи отклоняется с объяснением завершения",
                     doneResumeUi.errors.stream().anyMatch(t ->
-                            t.contains("Задача уже активна")));
+                            t.contains("Задача завершена: возобновить её нельзя")
+                                    && t.contains("/task start <описание>")));
             FakeUi clearUi = new FakeUi(
                     TerminalUi.Input.command("/task clear"),
                     TerminalUi.Input.command("/task start новая задача"),

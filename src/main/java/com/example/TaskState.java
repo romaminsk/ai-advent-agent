@@ -172,6 +172,10 @@ public record TaskState(TaskStage stage,
 
     /** Смена статуса (ACTIVE ↔ PAUSED, ACTIVE ↔ BLOCKED; произвольные — ошибка). */
     public TaskState withStatus(TaskStatus target, Instant now) {
+        if (target == TaskStatus.ACTIVE && stage == TaskStage.DONE) {
+            throw new AgentException("Задача завершена: возобновить её нельзя. "
+                    + "Для новой работы: /task start <описание>.");
+        }
         if (target == status) {
             throw new AgentException(sameStatusMessage(target));
         }
@@ -183,6 +187,30 @@ public record TaskState(TaskStage stage,
         return new TaskState(stage, target, currentStep, expectedAction,
                 completedSteps, localInvariants, description, now.toString(),
                 plan, planApproved, validationResult, validationPassed);
+    }
+
+    /**
+     * Ближайшее допустимое действие для текущего состояния задачи — единый
+     * источник подсказок при отказах (используется в сообщениях об отказах;
+     * для интерфейса — {@link CommandHints#nextTaskAction}).
+     */
+    private String nextStepHint() {
+        if (status != TaskStatus.ACTIVE) {
+            return status == TaskStatus.PAUSED
+                    ? "Сначала /task resume." : "Сначала снимите блокировку: /task unblock.";
+        }
+        return switch (stage) {
+            case PLANNING -> plan == null
+                    ? "Сначала зафиксируйте план: /task plan <текст>."
+                    : (!planApproved
+                    ? "Сначала утвердите план: /task approve."
+                    : "План утверждён: переход к выполнению — /task stage execution.");
+            case EXECUTION -> "Когда работа готова к проверке, переведите задачу "
+                    + "на этап validation: /task stage validation.";
+            case VALIDATION -> "Опишите результат проверки: "
+                    + "/task validate pass|fail <результат проверки>.";
+            case DONE -> "Задача завершена: для новой работы — /task start <описание>.";
+        };
     }
 
     private static String sameStatusMessage(TaskStatus target) {
@@ -366,9 +394,8 @@ public record TaskState(TaskStage stage,
                     + (status == TaskStatus.PAUSED ? "/task resume." : "/task unblock."));
         }
         if (stage != TaskStage.VALIDATION) {
-            throw new AgentException("Результат проверки фиксируется на этапе validation "
-                    + "(сейчас " + stage.lowerName() + "): сначала /task stage validation, "
-                    + "после проверки — /task validate pass|fail <результат>.");
+            throw new AgentException("Результат проверки фиксируется только на этапе "
+                    + "validation (сейчас " + stage.lowerName() + "). " + nextStepHint());
         }
         if (result == null || result.isBlank()) {
             throw new AgentException("Текст результата проверки обязателен: "
