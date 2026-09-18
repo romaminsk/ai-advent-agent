@@ -129,6 +129,10 @@ public record TaskState(TaskStage stage,
                         + " запрещён: завершённая задача не продолжается — начните новую: "
                         + "/task start <описание>.");
             }
+            if (stage == TaskStage.EXECUTION && target == TaskStage.DONE) {
+                throw new AgentException("Переход execution → done запрещён: проверку (validation) "
+                        + "пропускать нельзя. Ближайший допустимый переход: /task stage validation.");
+            }
             throw new AgentException("Переход этапа " + stage.lowerName() + " → "
                     + target.lowerName() + " не разрешён: этапы идут только вперёд "
                     + "planning → execution → validation → done (допустим возврат "
@@ -142,7 +146,8 @@ public record TaskState(TaskStage stage,
         }
         if (stage == TaskStage.VALIDATION && target == TaskStage.DONE && !validationPassed) {
             throw new AgentException("Переход на этап done требует зафиксированного успешного "
-                    + "результата проверки: /task validate pass <результат проверки>. "
+                    + "результата проверки. Сначала фактически проверьте результат, затем "
+                    + "зафиксируйте успех: /task validate pass <результат проверки>. "
                     + "Сообщение модели «всё проверено» результат не фиксирует.");
         }
         if (stage.isBackwardTransitionTo(target)) {

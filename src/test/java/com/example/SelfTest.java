@@ -6809,6 +6809,23 @@ public final class SelfTest {
         expect("пустой результат проверки не принимается",
                 expectError(() -> redone.withValidationResult(true, "  ", now))
                         .contains("Текст результата проверки обязателен"));
+        String executionDoneRefusal = expectError(() -> execution.withStage(
+                TaskStage.DONE, null, now));
+        expect("пропуск проверки execution → done: отказ с ближайшим переходом, "
+                        + "без предложения validate pass на текущем этапе",
+                executionDoneRefusal.contains("пропускать нельзя")
+                        && executionDoneRefusal.contains("/task stage validation")
+                        && !executionDoneRefusal.contains("/task validate pass"));
+        String validationDoneRefusal = expectError(() -> redone.withStage(
+                TaskStage.DONE, null, now));
+        expect("done без результата: отказ предлагает сначала фактическую проверку, "
+                        + "затем фиксацию успеха",
+                validationDoneRefusal.contains("фактически проверьте результат")
+                        && validationDoneRefusal.contains("/task validate pass"));
+        expect("repeat: неуспешная проверка DONE без успеха — сообщение не предлагает pass сразу",
+                expectError(() -> redone.withValidationResult(false, "нашли ошибку", now)
+                        .withStage(TaskStage.DONE, null, now))
+                        .contains("фактически проверьте результат"));
         expect("фиксация результата вне validation отклоняется",
                 expectError(() -> execution.withValidationResult(true, "успех", now))
                         .contains("validation"));
@@ -6825,26 +6842,38 @@ public final class SelfTest {
                         .contains("/task start"));
 
         // Смена этапа и подтверждения только в ACTIVE.
-        TaskState steppedBeforePause = validation.withValidationResult(true, "ок", now);
+        TaskState steppedBeforePause = validation.withValidationResult(true, "ок", now)
+                .withLocalInvariant(new Invariant("id-pause-1", "только Java 21",
+                        "stack", List.of(), java.time.Instant.now()), now);
         TaskState pausedStage = steppedBeforePause.withStatus(TaskStatus.PAUSED, now);
+        expect("пауза/resume сохраняют план, утверждение, результат проверки и локальные инварианты",
+                resumedEqualsPaused(pausedStage.withStatus(TaskStatus.ACTIVE, now),
+                        steppedBeforePause));
         expect("смена этапа на паузе отклоняется (PAUSED нельзя обойти сменой этапа)",
                 expectError(() -> pausedStage.withStage(TaskStage.EXECUTION, "доработка", now))
                         .contains("только для активной задачи")
                         && expectError(() -> pausedStage.withStage(TaskStage.DONE, null, now))
                         .contains("только для активной задачи"));
-        expect("утверждение плана на паузе отклоняется",
+        TaskState pausedSnapshot = pausedStage;
+        expect("утверждение плана на паузе отклоняется без изменения всего TaskState",
                 expectError(() -> pausedStage.approvePlan(now))
                         .contains("только для активной задачи"));
-        expect("фиксация результата проверки на паузе отклоняется",
+        expect("фиксация результата проверки на паузе отклоняется без изменения всего TaskState",
                 expectError(() -> pausedStage.withValidationResult(true, "ок", now))
                         .contains("только для активной задачи"));
-        expect("замена плана на паузе отклоняется",
+        expect("замена плана на паузе отклоняется без изменения всего TaskState",
                 expectError(() -> pausedStage.withPlan("новый план", now))
                         .contains("только для активной задачи"));
+        expect("недопустимые действия на паузе не меняют весь TaskState",
+                pausedStage.equals(pausedSnapshot));
         TaskState blockedStage = steppedBeforePause.withStatus(TaskStatus.BLOCKED, now);
         expect("завершение задачи при блокировке отклоняется",
                 expectError(() -> blockedStage.withStage(TaskStage.DONE, null, now))
                         .contains("только для активной задачи"));
+        expect("локальные инварианты сохраняются при блокировке и разблокировке",
+                blockedStage.localInvariantsView().size() == 1
+                        && blockedStage.withStatus(TaskStatus.ACTIVE, now)
+                        .localInvariantsView().size() == 1);
 
         TaskState stepped = execution.withStep("собрать цифры", now);
         TaskState paused = stepped.withStatus(TaskStatus.PAUSED, now);
@@ -6875,7 +6904,12 @@ public final class SelfTest {
                 && java.util.Objects.equals(resumed.currentStep(), paused.currentStep())
                 && java.util.Objects.equals(resumed.expectedAction(), paused.expectedAction())
                 && resumed.completedSteps().equals(paused.completedSteps())
-                && java.util.Objects.equals(resumed.description(), paused.description());
+                && java.util.Objects.equals(resumed.description(), paused.description())
+                && java.util.Objects.equals(resumed.plan(), paused.plan())
+                && resumed.planApproved() == paused.planApproved()
+                && java.util.Objects.equals(resumed.validationResult(), paused.validationResult())
+                && resumed.validationPassed() == paused.validationPassed()
+                && resumed.localInvariantsView().equals(paused.localInvariantsView());
     }
 
     /** Сообщение AgentException, если действие отклонено; "" — не отклонено. */
@@ -7422,11 +7456,20 @@ public final class SelfTest {
             agent.taskStage("validation", null);
             agent.taskValidate(true, "расхождений нет");
             agent.taskStage("done", null);
-            FakeUi newTaskUi = new FakeUi(
+            agent.remember("кодовое слово: ЯКОРЬ-42");
+            agent.setProfileName("Шеф");
+            FakeUi doneResumeUi = new FakeUi(
+                    TerminalUi.Input.command("/task resume"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(doneResumeUi, agent, "glm-5.3-flash");
+            expect("возобновление завершённой задачи отклоняется (она активна, но в done)",
+                    doneResumeUi.errors.stream().anyMatch(t ->
+                            t.contains("Задача уже активна")));
+            FakeUi clearUi = new FakeUi(
                     TerminalUi.Input.command("/task clear"),
                     TerminalUi.Input.command("/task start новая задача"),
                     TerminalUi.Input.command("/exit"));
-            Main.runLoop(newTaskUi, agent, "glm-5.3-flash");
+            Main.runLoop(clearUi, agent, "glm-5.3-flash");
             TaskState fresh = agent.taskState();
             expect("новая задача не наследует план и подтверждения прежней",
                     fresh.stage() == TaskStage.PLANNING
@@ -7437,6 +7480,9 @@ public final class SelfTest {
             expect("после /task clear локальных инвариантов нет",
                     agent.taskInvariantsView().isEmpty()
                             && agent.invariantsView().isEmpty());
+            expect("очистка задачи не меняет долговременную память и профиль",
+                    agent.longTermMemoryCount() == 1
+                            && "Шеф".equals(agent.userProfile().name()));
 
             FakeUi invariantUi = new FakeUi(
                     TerminalUi.Input.command("/task invariant add только Java 21 stack"),
