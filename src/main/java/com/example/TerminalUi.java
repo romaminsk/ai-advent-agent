@@ -375,11 +375,18 @@ public interface TerminalUi extends AutoCloseable {
                       /task                            — состояние; в интерактивном терминале — меню
                       /task start <описание>          — начать (этап planning)
                       /task <текст>                    — короткая форма задания описания
+                      /task plan <текст>               — зафиксировать/заменить план (planning)
+                      /task approve                    — утвердить зафиксированный план
                       /task stage <этап> [причина]     — planning|execution|validation|done
+                      /task validate pass <результат>  — зафиксировать успешную проверку
+                      /task validate fail <результат>  — зафиксировать неуспешную проверку
                       /task step <текст>               — текущий шаг (прежний — в выполненные)
                       /task expect <текст>             — ожидаемое действие
                       /task pause · /task resume       — пауза и продолжение
-                      /task block · /task unblock      — ожидание внешних данных
+                      /task block · /task unblock      — ожидание внешних данных: обычные
+                                                          сообщения при блокировке сохраняются
+                                                          как заметки и не отправляются модели;
+                                                          выполнение закрывается до /task unblock
                       /task invariant                  — локальные рамки задачи (жизненный
                                                           цикл — с задачей; /task clear их стирает)
                       /task invariant add <текст> [категория] [запрещено: …]
@@ -389,14 +396,32 @@ public interface TerminalUi extends AutoCloseable {
 
                     Примеры
                       /task start подготовить отчёт к среде
+                      /task plan сверить цифры по двух источникам
+                      /task approve
                       /task stage execution
+                      /task stage validation
+                      /task validate pass расхождения не найдены
                       /task stage execution не сошлись итоговые цифры
 
                     Эффекты
                      этапы — только вперёд planning → execution → validation → done;
-                      возврат validation → execution — с причиной; DONE → planning
-                      нельзя (это новая задача). Пауза замораживает этап, шаг и
-                      выполненные шаги; возобновление — только /task resume.
+                      вход в execution — только после утверждения плана (/task approve,
+                      простая смена этапа план не утверждает); вход в done — только
+                      после успешного результата проверки (/task validate pass;
+                      реплика «всё проверено» результат не фиксирует); возврат
+                      validation → execution — с причиной и сбросом результата.
+                      DONE → planning нельзя (это новая задача). Подтверждения,
+                      валидация и смены этапов — только для активной задачи
+                      (/task plan/approve/validate/stage при паузе или блокировке
+                      отклоняются). Замена плана сбрасывает его утверждение.
+                      При блокировке обычные сообщения не доходят до модели:
+                      они сохраняются как заметки блокировки (суммарно до 20
+                      сообщений / 4000 символов, предупреждение при превышении)
+                      и после /task unblock передаются модели как данные
+                      пользователя, а не инструкции; полнота сведений
+                      автоматически не проверяется.
+                      Пауза замораживает этап, шаг и выполненные шаги;
+                      возобновление — только /task resume.
                       Состояние подставляется в каждый запрос блоком
                       «СОСТОЯНИЕ ЗАДАЧИ» и живёт до /task clear или /clear
                       (текущий запуск). Локальные инварианты (/task invariant)
@@ -757,5 +782,43 @@ public interface TerminalUi extends AutoCloseable {
             };
         }
         return noColor == null || noColor.isEmpty();
+    }
+
+    /**
+     * Категория служебного сообщения по первому маркеру строки и её цвет:
+     * «!» — предупреждение/блокировка (жёлтый), «✓» — успех (зелёный),
+     * «?» — вопрос (циан, как акцент интерфейса). Иные строки не
+     * подсвечиваются. Вызывается только в цветном (TTY) режиме; в plain
+     * режиме текст выводится как есть без ANSI. RESET добавляется в конец,
+     * если исходная строка не содержит закрывающей последовательности.
+     */
+    static String categoryColor(String text) {
+        if (text == null) {
+            return text;
+        }
+        String color = categoryColorFor(text);
+        if (color == null) {
+            return text;
+        }
+        return color + text + (text.endsWith(ANSI_RESET) ? "" : ANSI_RESET);
+    }
+
+    /** ANSI reset (используется и в цветном рендере ответов). */
+    static final String ANSI_RESET = "\u001b[0m";
+
+    static String categoryColorFor(String text) {
+        if (text == null) {
+            return null;
+        }
+        if (text.startsWith("!")) {
+            return "\u001b[33m";
+        }
+        if (text.startsWith("✓") || text.startsWith("OK ")) {
+            return "\u001b[32m";
+        }
+        if (text.startsWith("?")) {
+            return "\u001b[36m";
+        }
+        return null;
     }
 }

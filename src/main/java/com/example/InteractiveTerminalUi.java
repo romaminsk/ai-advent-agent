@@ -267,7 +267,7 @@ final class InteractiveTerminalUi implements TerminalUi {
     @Override
     public void showSystem(String text) {
         String clean = text == null ? "" : text;
-        terminal.writer().println(colorByMarker(glyph(clean), "!", YELLOW));
+        terminal.writer().println(colors ? TerminalUi.categoryColor(glyph(clean)) : glyph(clean));
         terminal.writer().flush();
     }
 

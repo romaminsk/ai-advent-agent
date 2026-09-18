@@ -11,18 +11,44 @@ public final class CommandHints {
     private CommandHints() {
     }
 
-    /** После /task start: план и затем переход к выполнению. */
+    /** После /task start: план, утверждение и переход к выполнению. */
     public static String afterTaskStart() {
-        return "Дальше: /task stage execution, когда план готов · /task expect <действие>";
+        return "Дальше: /task plan <текст> — зафиксировать план · /task approve — утвердить "
+                + "· /task stage execution — после утверждения плана";
     }
 
     /** После перехода на этап: следующий логичный шаг цепочки. */
     public static String afterTaskStage(TaskStage stage) {
         return switch (stage) {
-            case PLANNING -> "Дальше: /task step <шаг> — что делаем прямо сейчас";
-            case EXECUTION -> "Дальше: /task step <шаг>, /task expect <действие> — уточнение хода";
-            case VALIDATION -> "Дальше: /task stage done, когда проверка пройдена";
+            case PLANNING -> "Дальше: /task plan <текст> — зафиксировать план · "
+                    + "/task approve — утвердить · /task stage execution — после утверждения";
+            case EXECUTION -> "Дальше: /task step <шаг>, /task expect <действие> "
+                    + "· /task stage validation — когда готов к проверке";
+            case VALIDATION -> "Дальше: /task validate pass|fail <результат> — зафиксировать "
+                    + "результат · /task stage execution <причина> — при доработке "
+                    + "· /task stage done — после успешной проверки";
             case DONE -> "Начать новую: /task start <описание>";
+        };
+    }
+
+    /** Ближайшее допустимое управляющее действие для текущего состояния задачи. */
+    public static String nextTaskAction(TaskState state) {
+        return switch (state.status()) {
+            case PAUSED -> "/task resume — продолжить после паузы";
+            case BLOCKED -> "/task unblock — снять блокировку";
+            case ACTIVE -> switch (state.stage()) {
+                case PLANNING -> state.plan() == null
+                        ? "/task plan <текст> — зафиксировать план"
+                        : (state.planApproved()
+                        ? "/task stage execution — перейти к выполнению"
+                        : "/task approve — утвердить план");
+                case EXECUTION -> "/task stage validation — перейти к проверке, "
+                        + "когда текущий шаг готов";
+                case VALIDATION -> !state.validationPassed()
+                        ? "/task validate pass|fail <результат> — зафиксировать результат проверки"
+                        : "/task stage done — завершить задачу";
+                case DONE -> "/task start <описание> — начать новую задачу";
+            };
         };
     }
 
