@@ -783,4 +783,42 @@ public interface TerminalUi extends AutoCloseable {
         }
         return noColor == null || noColor.isEmpty();
     }
+
+    /**
+     * Категория служебного сообщения по первому маркеру строки и её цвет:
+     * «!» — предупреждение/блокировка (жёлтый), «✓» — успех (зелёный),
+     * «?» — вопрос (циан, как акцент интерфейса). Иные строки не
+     * подсвечиваются. Вызывается только в цветном (TTY) режиме; в plain
+     * режиме текст выводится как есть без ANSI. RESET добавляется в конец,
+     * если исходная строка не содержит закрывающей последовательности.
+     */
+    static String categoryColor(String text) {
+        if (text == null) {
+            return text;
+        }
+        String color = categoryColorFor(text);
+        if (color == null) {
+            return text;
+        }
+        return color + text + (text.endsWith(ANSI_RESET) ? "" : ANSI_RESET);
+    }
+
+    /** ANSI reset (используется и в цветном рендере ответов). */
+    static final String ANSI_RESET = "\u001b[0m";
+
+    static String categoryColorFor(String text) {
+        if (text == null) {
+            return null;
+        }
+        if (text.startsWith("!")) {
+            return "\u001b[33m";
+        }
+        if (text.startsWith("✓") || text.startsWith("OK ")) {
+            return "\u001b[32m";
+        }
+        if (text.startsWith("?")) {
+            return "\u001b[36m";
+        }
+        return null;
+    }
 }

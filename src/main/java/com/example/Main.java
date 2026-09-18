@@ -205,7 +205,9 @@ public final class Main {
                             LlmAgent.BlockedNoteResult note = activeAgent
                                     .blockedNote(input.text());
                             if (note.message() != null) {
-                                ui.showSystem(note.message());
+                                // «!» — категория предупреждения/блокировки:
+                                // жёлтая подсветка в TTY, plain показывает маркер.
+                                ui.showSystem(warn(note.message()));
                             }
                             break;
                         }
@@ -860,8 +862,9 @@ public final class Main {
                 }
                 case "block" -> {
                     agent.taskBlock();
-                    ui.showSystem("✓ Задача помечена как blocked: ожидание внешних данных. "
-                            + "Модель будет запрашивать недостающее. Снять: /task unblock.");
+                    ui.showSystem("Задача помечена как blocked: ожидание внешних данных. "
+                            + "Сообщения сохраняются как заметки без вызова модели "
+                            + "и без выполнения задачи. Снять блокировку: /task unblock.");
                 }
                 case "unblock" -> {
                     TaskState state = agent.taskUnblock();
@@ -1167,8 +1170,9 @@ public final class Main {
             }));
             items.add(new MenuItem("ожидание данных", () -> {
                 agent.taskBlock();
-                ui.showSystem("✓ Задача помечена как blocked: модель будет "
-                        + "запрашивать недостающее. Снять: /task unblock.");
+                ui.showSystem("Задача помечена как blocked: ожидание внешних данных. "
+                        + "Сообщения сохраняются как заметки без вызова модели "
+                        + "и без выполнения задачи. Снять блокировку: /task unblock.");
             }));
             if (state.stage() == TaskStage.DONE) {
                 items.add(new MenuItem("начать новую задачу", () -> {

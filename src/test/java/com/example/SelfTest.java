@@ -3056,6 +3056,37 @@ public final class SelfTest {
         expect("маркер «!» не дублируется",
                 Main.warn("! текст").equals("! текст") && Main.warn("текст").equals("! текст"));
 
+        // Категории цветов служебных сообщений (только TTY/цветной режим):
+        // «!» жёлтый, «✓» зелёный, «?» циан, остальное без подсветки.
+        expect("категория предупреждения «!» — жёлтый ANSI-код",
+                TerminalUi.categoryColorFor("! лимит превышен").equals("\u001b[33m")
+                        && TerminalUi.categoryColor("! лимит превышен")
+                        .startsWith("\u001b[33m! ")
+                        && TerminalUi.categoryColor("! лимит превышен").endsWith("\u001b[0m"));
+        expect("маркер успеха «✓» — зелёный",
+                TerminalUi.categoryColorFor("✓ Задача задана").equals("\u001b[32m")
+                        && TerminalUi.categoryColor("✓ готово").contains("✓"));
+        expect("маркер вопроса «?» — циан-акцент",
+                TerminalUi.categoryColorFor("? уточнить").equals("\u001b[36m"));
+        expect("строка без категорийного маркера не подсвечивается",
+                TerminalUi.categoryColorFor("обычный текст") == null
+                        && TerminalUi.categoryColor("обычный текст").equals("обычный текст"));
+        expect("RESET не дублируется, если уже в конце строки",
+                TerminalUi.categoryColor("! уже с reset\u001b[0m")
+                        .startsWith("\u001b[33m")
+                        && countSubstring(TerminalUi.categoryColor("! уже с reset\u001b[0m"),
+                        "\u001b[0m") == 1);
+
+        // plain-режим: без ANSI, маркер «!» сохраняется как есть.
+        CapturedStream errPlain = capturingStream();
+        PlainTerminalUi plainWarn = new PlainTerminalUi(reader(""),
+                capturingStream().stream, errPlain.stream);
+        plainWarn.showSystem(Main.warn("Внимание: превышение"));
+        String plainWarnText = errPlain.text();
+        expect("plain-режим не добавляет ANSI и не теряет маркер «!»",
+                plainWarnText.contains("! Внимание: превышение")
+                        && !plainWarnText.contains("\u001b["));
+
         String rendered = MarkdownTerminal.render(
                 "# Заголовок\n"
                         + "- пункт списка\n"
@@ -7046,6 +7077,12 @@ public final class SelfTest {
             expect("подтверждение блокировки даёт подсказку /task unblock",
                     pauseUi.systems.stream().anyMatch(t -> t.contains("blocked")
                             && t.contains("/task unblock")));
+            String systemsJoined = String.join("\n", pauseUi.systems);
+            expect("blocked-сообщение: предупреждение с заметками и подсказкой unblock",
+                    systemsJoined.contains("Задача помечена как blocked")
+                            && systemsJoined.contains(
+                            "Сообщения сохраняются как заметки без вызова модели")
+                            && !systemsJoined.contains("запрашивать недостающее"));
 
             FakeUi stage2Ui = new FakeUi(
                     TerminalUi.Input.command("/task stage validation"),
@@ -7447,6 +7484,15 @@ public final class SelfTest {
         expect("/task status показывает DONE после отказов",
                 hintsUi.systems.stream().anyMatch(t -> t.contains("Состояние задачи")
                         && t.contains("этап: done")));
+    }
+
+    /** Число непересекающихся вхождений подстроки (для проверок ANSI). */
+    private static int countSubstring(String text, String needle) {
+        int count = 0;
+        for (int i = text.indexOf(needle); i >= 0; i = text.indexOf(needle, i + needle.length())) {
+            count++;
+        }
+        return count;
     }
 
     /** true, если список отказов содержит подстроку (для читаемости сценариев). */
