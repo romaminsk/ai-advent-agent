@@ -1396,6 +1396,43 @@ public final class LlmAgent {
         return updated;
     }
 
+    /** Результат барьера BLOCKED: сохранена ли заметка и детерминированный текст ответа. */
+    public record BlockedNoteResult(boolean stored, String message) {
+    }
+
+    /**
+     * Детерминированный барьер BLOCKED (вызывается обработчиком обычного
+     * сообщения до любых вызовов модели и её побочных операций). Сообщение
+     * сохраняется как заметка блокировки в TaskState (данные пользователя);
+     * этап, статус, шаги, план и подтверждения не изменяются, модель не
+     * вызывается. Превышение лимита — отказ с честным сообщением без
+     * подтверждения сохранения.
+     */
+    public BlockedNoteResult blockedNote(String text) {
+        TaskState state = requireTaskState();
+        if (text == null || text.isBlank()) {
+            return new BlockedNoteResult(false, state.status() == TaskStatus.BLOCKED
+                    ? "Пустое сообщение не сохранено. Продолжение: /task unblock." : null);
+        }
+        TaskState updated = state.withBlockedNote(text, java.time.Instant.now());
+        workingMemory.setTaskState(updated);
+        StringBuilder message = new StringBuilder("Задача заблокирована: сообщение сохранено "
+                + "как заметка без выполнения задачи и без автоматической проверки полноты; "
+                + "модель не вызывалась.\n  Продолжение — только после /task unblock.");
+        if (updated.expectedAction() != null) {
+            message.append("\n  Ранее зафиксированное ожидаемое действие: «")
+                    .append(updated.expectedAction()).append("»")
+                    .append(" — это не подтверждение того, что сведения всё ещё отсутствуют.");
+        }
+        return new BlockedNoteResult(true, message.toString());
+    }
+
+    /** Заметки блокировки текущей задачи; null — задачи нет, пусто — заметок нет. */
+    public List<String> blockNotesView() {
+        TaskState state = workingMemory.taskState();
+        return state == null ? List.of() : List.copyOf(state.blockNotes());
+    }
+
     /** Состояние задачи обязательно: команды этапов и статусов требуют начатую задачу. */
     private TaskState requireTaskState() {
         TaskState state = workingMemory.taskState();

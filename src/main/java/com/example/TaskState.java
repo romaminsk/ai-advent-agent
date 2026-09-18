@@ -46,14 +46,15 @@ public record TaskState(TaskStage stage,
                         String plan,
                         boolean planApproved,
                         String validationResult,
-                        boolean validationPassed) {
+                        boolean validationPassed,
+                        List<String> blockNotes) {
 
     /** Совместимый конструктор без плана, подтверждений и результата проверки. */
     public TaskState(TaskStage stage, TaskStatus status, String currentStep,
                      String expectedAction, List<String> completedSteps,
                      String description, String updatedAt) {
         this(stage, status, currentStep, expectedAction, completedSteps,
-                List.of(), description, updatedAt, null, false, null, false);
+                List.of(), description, updatedAt, null, false, null, false, List.of());
     }
 
     /** Совместимый конструктор без плана, подтверждений и результата проверки. */
@@ -62,7 +63,7 @@ public record TaskState(TaskStage stage,
                      List<Invariant> localInvariants, String description,
                      String updatedAt) {
         this(stage, status, currentStep, expectedAction, completedSteps,
-                localInvariants, description, updatedAt, null, false, null, false);
+                localInvariants, description, updatedAt, null, false, null, false, List.of());
     }
 
     public TaskState {
@@ -95,6 +96,47 @@ public record TaskState(TaskStage stage,
         return new TaskState(TaskStage.PLANNING, TaskStatus.ACTIVE,
                 "сформулировать план", "агент предлагает план",
                 List.of(), description, now.toString());
+    }
+
+    // ================= Сведения периода блокировки =================
+
+    /** Максимум заметок одной блокировки; превышение обрабатывается честно. */
+    public static final int MAX_BLOCKED_NOTES = 20;
+    /** Суммарный лимит символов заметок блокировки (не silent-усечение). */
+    public static final int MAX_BLOCKED_CHARS = 4000;
+
+    /**
+     * Добавляет сведения, сообщённые пользователем во время блокировки
+     * (обычным сообщением через детерминированный барьер). Изменяет только
+     * компонент blockNotes и updatedAt: этап, статус, шаги, план и
+     * подтверждения не трогаются. Пустая заметка отклоняется; превышение
+     * лимита не отбрасывает старые заметки и не «подтверждает сохранение»
+     * нового сообщения — сообщается об отказе явно.
+     */
+    public TaskState withBlockedNote(String note, Instant now) {
+        if (status != TaskStatus.BLOCKED) {
+            throw new AgentException("Заметки блокировки добавляются, только пока задача заблокирована.");
+        }
+        if (note == null || note.isBlank()) {
+            throw new AgentException("Пустая заметка блокировки не сохраняется.");
+        }
+        String trimmed = note.strip();
+        if (blockNotes.size() >= MAX_BLOCKED_NOTES) {
+            throw new AgentException("Превышен лимит заметок блокировки ("
+                    + MAX_BLOCKED_NOTES + " сообщений). Новая заметка НЕ сохранена: "
+                    + "после /task unblock отправьте её как обычное сообщение.");
+        }
+        int total = blockNotes.stream().mapToInt(String::length).sum();
+        if (total + trimmed.length() > MAX_BLOCKED_CHARS) {
+            throw new AgentException("Превышен лимит суммарного объёма заметок блокировки ("
+                    + MAX_BLOCKED_CHARS + " символов). Новая заметка не сохранена — "
+                    + "не теряйте её: после /task unblock отправьте как обычное сообщение.");
+        }
+        List<String> copy = new ArrayList<>(blockNotes);
+        copy.add(trimmed);
+        return new TaskState(stage, status, currentStep, expectedAction,
+                completedSteps, localInvariants, description, now.toString(),
+                plan, planApproved, validationResult, validationPassed, copy);
     }
 
     /**
@@ -167,7 +209,7 @@ public record TaskState(TaskStage stage,
                 localInvariants, description, now.toString(),
                 plan, planApproved,
                 keepValidation ? validationResult : null,
-                keepValidation && validationPassed);
+                keepValidation && validationPassed, blockNotes);
     }
 
     /** Смена статуса (ACTIVE ↔ PAUSED, ACTIVE ↔ BLOCKED; произвольные — ошибка). */
@@ -186,7 +228,7 @@ public record TaskState(TaskStage stage,
         }
         return new TaskState(stage, target, currentStep, expectedAction,
                 completedSteps, localInvariants, description, now.toString(),
-                plan, planApproved, validationResult, validationPassed);
+                plan, planApproved, validationResult, validationPassed, blockNotes);
     }
 
     /**
@@ -238,7 +280,7 @@ public record TaskState(TaskStage stage,
         }
         return new TaskState(stage, status, newStep, expectedAction, completed,
                 localInvariants, description, now.toString(),
-                plan, planApproved, validationResult, validationPassed);
+                plan, planApproved, validationResult, validationPassed, blockNotes);
     }
 
     /** Задание ожидаемого действия (что должен сделать агент или пользователь дальше). */
@@ -248,7 +290,7 @@ public record TaskState(TaskStage stage,
         }
         return new TaskState(stage, status, currentStep, action, completedSteps,
                 localInvariants, description, now.toString(),
-                plan, planApproved, validationResult, validationPassed);
+                plan, planApproved, validationResult, validationPassed, blockNotes);
     }
 
     /** Обновление описания задачи (этап, шаги, план и статус не трогаются). */
@@ -258,7 +300,7 @@ public record TaskState(TaskStage stage,
         }
         return new TaskState(stage, status, currentStep, expectedAction,
                 completedSteps, localInvariants, newDescription, now.toString(),
-                plan, planApproved, validationResult, validationPassed);
+                plan, planApproved, validationResult, validationPassed, blockNotes);
     }
 
     // ================= Локальные инварианты задачи =================
@@ -277,7 +319,7 @@ public record TaskState(TaskStage stage,
         copy.add(invariant);
         return new TaskState(stage, status, currentStep, expectedAction,
                 completedSteps, copy, description, now.toString(),
-                plan, planApproved, validationResult, validationPassed);
+                plan, planApproved, validationResult, validationPassed, blockNotes);
     }
 
     /** Результат /task invariant remove: новое состояние и удалённая запись. */
@@ -303,7 +345,7 @@ public record TaskState(TaskStage stage,
         }
         TaskState updated = new TaskState(stage, status, currentStep, expectedAction,
                 completedSteps, remaining, description, now.toString(),
-                plan, planApproved, validationResult, validationPassed);
+                plan, planApproved, validationResult, validationPassed, blockNotes);
         return new TaskInvariantRemove(updated, removedInvariant);
     }
 
@@ -311,7 +353,7 @@ public record TaskState(TaskStage stage,
     public TaskState withoutLocalInvariants(Instant now) {
         return new TaskState(stage, status, currentStep, expectedAction,
                 completedSteps, List.of(), description, now.toString(),
-                plan, planApproved, validationResult, validationPassed);
+                plan, planApproved, validationResult, validationPassed, blockNotes);
     }
 
     // ================= План и его утверждение =================
@@ -345,7 +387,7 @@ public record TaskState(TaskStage stage,
         }
         return new TaskState(stage, status, currentStep, expectedAction,
                 completedSteps, localInvariants, description, now.toString(),
-                trimmed, false, validationResult, validationPassed);
+                trimmed, false, validationResult, validationPassed, blockNotes);
     }
 
     /**
@@ -374,7 +416,7 @@ public record TaskState(TaskStage stage,
         }
         return new TaskState(stage, status, currentStep, expectedAction,
                 completedSteps, localInvariants, description, now.toString(),
-                plan, true, validationResult, validationPassed);
+                plan, true, validationResult, validationPassed, blockNotes);
     }
 
     // ================= Результат проверки (валидация) =================
@@ -403,6 +445,6 @@ public record TaskState(TaskStage stage,
         }
         return new TaskState(stage, status, currentStep, expectedAction,
                 completedSteps, localInvariants, description, now.toString(),
-                plan, planApproved, result.trim(), passed);
+                plan, planApproved, result.trim(), passed, blockNotes);
     }
 }

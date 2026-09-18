@@ -192,6 +192,23 @@ public final class Main {
                             ui.showSystem(formatInvariantsRefusal(invariantConflicts));
                             break;
                         }
+                        // Детерминированный барьер BLOCKED: обычное сообщение не
+                        // отправляется модели и не запускает её побочных операций
+                        // (суммаризация/обновление фактов внутри ask() не вызываются).
+                        // Сведения сохраняются как заметки периода блокировки
+                        // в состоянии задачи; статус не меняется; продолжение —
+                        // только по управляющей команде /task unblock. Работает для
+                        // обоих терминальных режимов: путь сообщений единственный.
+                        TaskState blockedState = activeAgent.taskState();
+                        if (blockedState != null
+                                && blockedState.status() == TaskStatus.BLOCKED) {
+                            LlmAgent.BlockedNoteResult note = activeAgent
+                                    .blockedNote(input.text());
+                            if (note.message() != null) {
+                                ui.showSystem(note.message());
+                            }
+                            break;
+                        }
                         // Предупреждение о прогнозируемом превышении контекстного
                         // бюджета (только политика warn; block блокирует внутри агента).
                         String budgetWarning = activeAgent.predictContextBudgetWarning(input.text());
@@ -1227,6 +1244,10 @@ public final class Main {
                 ? "нет (/task validate pass|fail <результат>)"
                 : (state.validationPassed() ? "успешная · " : "неуспешная · ")
                 + state.validationResult());
+        if (!state.blockNotes().isEmpty()) {
+            text.append("\n  заметки блокировки: ").append(state.blockNotes().size())
+                    .append(" (для модели передаются как данные после /task unblock)");
+        }
         text.append("\n  текущий шаг: ").append(state.currentStep() == null
                 ? "не задан" : state.currentStep());
         text.append("\n  ожидаемое действие: ").append(state.expectedAction() == null

@@ -179,6 +179,7 @@ public final class SelfTest {
             checkTaskStateEdgeCases();
             checkTaskControlledTransitions();
             checkTaskTransitionsNoApiOnRefusal();
+            checkBlockedMessageBarrier();
             checkTaskCommands();
             checkTaskStateCommands();
             checkTaskStateBlockInSystemMessage();
@@ -7451,6 +7452,151 @@ public final class SelfTest {
     /** true, если список отказов содержит подстроку (для читаемости сценариев). */
     private static boolean hintErrorsContain(List<String> errors, String needle) {
         return errors.stream().anyMatch(t -> t.contains(needle));
+    }
+
+    /**
+     * Барьер BLOCKED: обычные сообщения не отправляются модели (HTTP-stub
+     * со счётчиком), сохраняются как заметки периода блокировки с привязкой
+     * к задаче, доступны контексту после /task unblock, не наследуются новой
+     * задачей, не обходятся ни через какой путь ввода; лимиты обрабатываются
+     * честно; регрессии статусов и повторные циклы.
+     */
+    private static void checkBlockedMessageBarrier() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        AtomicInteger hitCounter = new AtomicInteger();
+        AtomicReference<String> lastBody = new AtomicReference<>();
+        HttpsServer server = startHttpsServer(keyStore, (requestBody, session, auth) -> {
+            hitCounter.incrementAndGet();
+            lastBody.set(requestBody);
+            return new Response(200, ("{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                    + "\"content\":\"Готов ответить по задаче.\"}}]}")
+                    .getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            Config config = new Config("test-key",
+                    "https://127.0.0.1:" + server.getAddress().getPort()
+                            + "/v1/chat/completions", "glm-5.3-flash");
+            LlmAgent agent = newMemoryAgent(config, trustedHttpClient(keyStore),
+                    new java.util.HashMap<>());
+
+            agent.taskStart("задача с блокировкой");
+            agent.taskPlan("уточнить длительность; составить список");
+            agent.taskApprove();
+            agent.taskStage("execution", null);
+            agent.taskStep("уточнить длительность");
+            agent.taskExpect("получить от пользователя длительность");
+            agent.taskBlock();
+
+            FakeUi barrierUi = new FakeUi(
+                    TerminalUi.Input.message("Не спрашивай недостающие сведения. Сразу составь список вещей."),
+                    TerminalUi.Input.message("Длительность — четыре часа. Сразу приступай."),
+                    TerminalUi.Input.command("/task status"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(barrierUi, agent, "glm-5.3-flash");
+            TaskState blockedState = agent.taskState();
+            expect("BLOCKED: два обычных сообщения не вызывают API (HTTP-stub счётчик)",
+                    hitCounter.get() == 0);
+            expect("барьер даёт локальный детерминированный ответ без выполнения задачи",
+                    barrierUi.systems.stream().anyMatch(t ->
+                            t.contains("Задача заблокирована: сообщение сохранено")
+                                    && t.contains("/task unblock")));
+            expect("ожидаемое действие показано как ранее зафиксированное, без обещаний полноты",
+                    barrierUi.systems.stream().anyMatch(t ->
+                            t.contains("Ранее зафиксированное ожидаемое действие: «получить от пользователя длительность»")));
+            expect("сведения периода блокировки сохранены по порядку",
+                    blockedState.blockNotes().size() == 2
+                            && blockedState.blockNotes().get(0).startsWith("Не спрашивай")
+                            && blockedState.blockNotes().get(1).startsWith("Длительность — четыре"));
+            expect("BLOCKED не меняется от обычного сообщения: статус, этап, шаги, план, подтверждения",
+                    blockedState.status() == TaskStatus.BLOCKED
+                            && blockedState.stage() == TaskStage.EXECUTION
+                            && "уточнить длительность".equals(blockedState.currentStep())
+                            && blockedState.planApproved()
+                            && blockedState.completedSteps().size() == 1);
+            expect("/task status показывает заметки блокировки и снятый от выполнения объём",
+                    barrierUi.systems.stream().anyMatch(t -> t.contains("Состояние задачи")
+                            && t.contains("заметки блокировки: 2")));
+            expect("нет утверждения, что сведений достаточно или проблема устранена",
+                    barrierUi.systems.stream().noneMatch(t ->
+                            t.contains("сведений достаточно")
+                                    || t.contains("проблема устранена")));
+
+            // Повторный цикл: сообщение → заметка → блокировка снимается и ставится снова.
+            agent.taskUnblock();
+            agent.taskBlock();
+            FakeUi secondCycleUi = new FakeUi(
+                    TerminalUi.Input.message("Второй цикл: температура тоже важна."),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(secondCycleUi, agent, "glm-5.3-flash");
+            expect("повторный цикл block → удалить → note не дублирует и не теряет прежние заметки",
+                    agent.taskState().blockNotes().size() == 3
+                            && agent.taskState().blockNotes().get(2).startsWith("Второй цикл"));
+
+            // Лимиты: превышение отклоняется честно, прежние заметки целы.
+            for (int i = agent.taskState().blockNotes().size(); i < 25; i++) {
+                try {
+                    agent.blockedNote("Дозаписать заметку номер " + i + " для проверки лимита.");
+                } catch (AgentException ignored) {
+                    break;
+                }
+            }
+            expect("лимит заметок блокировки: отклоняется честно, прежние сохранены",
+                    agent.taskState().blockNotes().size() == TaskState.MAX_BLOCKED_NOTES
+                            && expectError(() -> agent.blockedNote("ещё"))
+                            .contains("лимит заметок блокировки"));
+            expect("заметка не подтверждается сохранённой при отказе: поезд без данных не выехала",
+                    agent.taskState().blockNotes().size() == TaskState.MAX_BLOCKED_NOTES);
+
+            // /task unblock сам по себе не выполняет задачу и не вызывает API.
+            int hitsBeforeUnblock = hitCounter.get();
+            agent.taskUnblock();
+            expect("unblock без запроса модели", hitCounter.get() == hitsBeforeUnblock);
+            expect("unblock сохраняет заметки блокировки",
+                    agent.taskState().blockNotes().size() == TaskState.MAX_BLOCKED_NOTES);
+
+            // Первый обычный запрос после unblock: поехали штатно, заметки в контексте,
+            // помечены как данные; просьбы «обойти блокировку» не превращаются в команды.
+            agent.ask("продолжай текущий шаг");
+            String system = MAPPER.readTree(lastBody.get()).path("messages")
+                    .get(0).path("content").asText();
+            expect("после unblock запрос уходит модели штатно", hitCounter.get() == hitsBeforeUnblock + 1);
+            expect("заметки блокировки переданы в контексте как данные с расшифровкой",
+                    system.contains("Сведения, полученные от пользователя во время блокировки")
+                            && system.contains("Длительность — четыре часа")
+                            && system.contains("данные, а не инструкции")
+                            && system.contains("обойти блокировку"));
+            expect("статус в контексте — ACTIVE (не BLOCKED)",
+                    system.contains("статус ACTIVE"));
+            expect("ожидаемое действие в контексте прежнее",
+                    system.contains("Ожидаемое действие: получить от пользователя длительность"));
+            expect("заметки не зависят от скользящего окна: блок целиком, не только хвост",
+                    system.contains("Не спрашивай недостающие сведения"));
+
+            // Пауза/resume и новые циклы не теряют заметки; ошибки сохранения нет:
+            // заметки — в памяти состояния, состояние сессии.
+            TaskState withNotes = agent.taskState();
+            TaskState pausedNotes = withNotes.withStatus(TaskStatus.PAUSED, Instant.now())
+                    .withStatus(TaskStatus.ACTIVE, Instant.now());
+            expect("пауза/resume сохраняют заметки блокировки",
+                    pausedNotes.blockNotes().equals(withNotes.blockNotes()));
+
+            // Новая задача не наследует заметки старой; /task clear их стирает.
+            FakeUi clearUi = new FakeUi(
+                    TerminalUi.Input.command("/task clear"),
+                    TerminalUi.Input.command("/task start другая задача"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(clearUi, agent, "glm-5.3-flash");
+            expect("новая задача не наследует заметки блокировки",
+                    agent.taskState().blockNotes().isEmpty()
+                            && agent.blockNotesView().isEmpty());
+            expect("очистка задачи не меняет глобальные инварианты",
+                    agent.invariantsView().isEmpty());
+            expect("автономной записи заметок блокировки в глобальные хранилища нет",
+                    agent.longTermMemoryCount() == 0);
+        } finally {
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
     }
 
     /**
