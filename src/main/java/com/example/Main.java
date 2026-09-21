@@ -158,6 +158,9 @@ public final class Main {
                                 || normalized.startsWith("/invariant ")) {
                             LlmAgent activeAgent = activeAgent(demoRef, agent);
                             handleInvariantCommand(ui, activeAgent, input.text(), demoRef);
+                        } else if (normalized.equals("/mcp")
+                                || normalized.startsWith("/mcp ")) {
+                            handleMcpCommand(ui, input.text());
                         } else if (normalized.equals("/profile")
                                 || normalized.startsWith("/profile ")
                                 || normalized.equals("/skill")
@@ -3123,6 +3126,7 @@ public final class Main {
             }
             case "/status" -> ui.showSystem(formatStatus(agent));
             case "/history" -> ui.showHistory(agent.getHistory());
+            case "/mcp" -> handleMcpCommand(ui, command);
             case "/tokens" -> ui.showSystem(formatTokens(agent, model));
             case "/stats" -> ui.showSystem(formatStats(agent));
             case "/limit" -> handleLimitCommand(ui, agent, "/limit");
@@ -3174,6 +3178,23 @@ public final class Main {
             }
         }
         return false;
+    }
+
+    private static void handleMcpCommand(TerminalUi ui, String raw) {
+        String argument = raw.length() > "/mcp".length()
+                ? raw.substring("/mcp".length()).trim() : "";
+        if (!argument.regionMatches(true, 0, "tools ", 0, "tools ".length())
+                || argument.substring("tools ".length()).isBlank()) {
+            ui.showSystem("Использование: /mcp tools <URL или команда запуска>.");
+            return;
+        }
+        String server = argument.substring("tools ".length()).trim();
+        try {
+            McpClientComponent.ToolListResult result = new McpClientComponent().listTools(server);
+            ui.showSystem(McpClientComponent.format(result));
+        } catch (McpClientComponent.McpClientException e) {
+            ui.showError(e.getMessage());
+        }
     }
 
     // ================= Ведущий интерфейс: подсказки, меню, обзор =================
@@ -3356,6 +3377,7 @@ public final class Main {
         out.println("/history, /status, /tokens, /stats, /limit, /reset, /clear,");
         out.println("/profile, /skill, /pipeline, /invariant, /memory, /remember,");
         out.println("/forget, /task,");
+        out.println("/mcp tools <URL или команда> (подключение и tools/list),");
         out.println("/context [full|summary], /context compare <вопрос>, /summary [refresh],");
         out.println("/multiline, /exit (также exit, quit).");
     }

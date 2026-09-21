@@ -198,7 +198,7 @@ public interface TerminalUi extends AutoCloseable {
                         "формат ответа, длинный ввод, измерения"),
                 new Row("Статистика", "/tokens /stats /limit /status",
                         "расход и обзор состояния"),
-                new Row("Прочее", "/help /exit (также exit, quit)", ""),
+                new Row("Прочее", "/mcp /help /exit (также exit, quit)", ""),
         };
         StringBuilder out = new StringBuilder();
         for (Row row : rows) {
@@ -227,7 +227,7 @@ public interface TerminalUi extends AutoCloseable {
                 "/profile", "/skill", "/pipeline", "/invariant", "/clear", "/reset",
                 "/mode", "/multiline", "/paste", "/demo",
                 "/context", "/summary", "/strategy", "/facts", "/branch",
-                "/tokens", "/stats", "/limit", "/status", "/exit",
+                "/tokens", "/stats", "/limit", "/status", "/mcp", "/exit",
         };
     }
 
@@ -299,6 +299,23 @@ public interface TerminalUi extends AutoCloseable {
                       /help /task
 
                     Связано: любая /команда.""";
+            case "/mcp" -> """
+                    /mcp — получить список инструментов MCP
+
+                    Использование
+                      /mcp tools <URL>
+                      /mcp tools <команда> [аргументы]
+
+                    Примеры
+                      /mcp tools https://example.invalid/mcp
+                      /mcp tools npx -y @modelcontextprotocol/server-everything
+
+                    Эффекты
+                      устанавливает соединение, выполняет tools/list и закрывает
+                      соединение. Вызов инструментов и передача их модели не выполняются.
+                      URL использует Streamable HTTP; команда — stdio.
+
+                    Связано: MCP_AUTH_TOKEN (только HTTP, значение не выводится).""";
             case "/status" -> """
                     /status — обзор состояния одним экраном (без API)
 

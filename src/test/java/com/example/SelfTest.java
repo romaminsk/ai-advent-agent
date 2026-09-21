@@ -148,6 +148,12 @@ public final class SelfTest {
         System.out.println("OK: " + description);
     }
     public static void main(String[] args) throws Exception {
+        if (args.length > 0 && "mcp".equals(args[0])) {
+            group("MCP");
+            checkMcpClient();
+            System.out.println("OK: MCP checks passed (" + passed + ").");
+            return;
+        }
         baseTempDir = Files.createTempDirectory("selftest-day8");
         try {
             // --- Диалог с моделью (локальный HTTPS-сервер, без платных запросов) ---
@@ -287,6 +293,10 @@ public final class SelfTest {
             checkOnboardingFirstLaunch();
             checkInvariantHelpAndIndex();
 
+            // --- MCP: локальный stdio-сервер, без сети и внешних секретов ---
+            group("MCP");
+            checkMcpClient();
+
             // --- Режим измерений /demo ---
             group("Измерения");
             checkClearCommand();
@@ -317,6 +327,75 @@ public final class SelfTest {
         }
 
         System.out.println("OK: все проверки пройдены (" + passed + ").");
+    }
+
+    private static void checkMcpClient() throws Exception {
+        String java = ProcessHandle.current().info().command().orElse("java");
+        String classpath = Path.of("target/test-classes").toAbsolutePath()
+                + File.pathSeparator
+                + Path.of("target/classes").toAbsolutePath()
+                + File.pathSeparator + System.getProperty("java.class.path");
+        String command = java + " -cp \"" + classpath + "\" " + McpStubServer.class.getName();
+        McpClientComponent client = new McpClientComponent();
+
+        McpClientComponent.ToolListResult result = client.listTools(command);
+        expect("MCP stdio соединение устанавливается", result.transport()
+                == McpClientComponent.TransportType.STDIO);
+        expect("tools/list возвращает ожидаемый инструмент", result.tools().size() == 1
+                && "greet".equals(result.tools().get(0).name()));
+        expect("описание инструмента сохраняется", "Returns a greeting".equals(
+                result.tools().get(0).description()));
+
+        McpClientComponent.ToolListResult empty = client.listTools(command + " empty");
+        expect("пустой tools/list обрабатывается", empty.tools().isEmpty()
+                && McpClientComponent.format(empty).contains("Инструментов нет"));
+
+        try {
+            client.listTools("/path/that/does/not/exist");
+            expect("ошибка недоступного MCP-сервера обрабатывается", false);
+        } catch (McpClientComponent.McpClientException e) {
+            expect("ошибка недоступного MCP-сервера обрабатывается",
+                    !e.getMessage().contains("время ожидания"));
+        }
+
+        try {
+            client.listTools(command + " stderr");
+            expect("stderr ошибки запуска показывается кратко", false);
+        } catch (McpClientComponent.McpClientException e) {
+            expect("stderr ошибки запуска показывается кратко",
+                    e.getMessage().contains("Не удалось запустить")
+                            && !e.getMessage().contains("время ожидания"));
+            expect("stderr ошибки запуска не содержит секрет", !e.getMessage().contains(secretValue()));
+        }
+
+        try {
+            new McpClientComponent(Duration.ofMillis(100)).listTools(command + " timeout");
+            expect("таймаут MCP обрабатывается", false);
+        } catch (McpClientComponent.McpClientException e) {
+            expect("таймаут MCP обрабатывается", e.getMessage().contains("время ожидания"));
+        }
+
+        try {
+            client.listTools("http://127.0.0.1:1/mcp");
+            expect("ошибка HTTP MCP обрабатывается", false);
+        } catch (McpClientComponent.McpClientException e) {
+            expect("ошибка HTTP MCP не маскируется под stdio или timeout",
+                    e.getMessage().contains("подключиться")
+                            && !e.getMessage().contains("stdio")
+                            && !e.getMessage().contains("время ожидания"));
+        }
+
+        String secret = "secret-value-must-not-leak";
+        try {
+            client.listTools("/missing " + secret);
+        } catch (McpClientComponent.McpClientException e) {
+            expect("секрет не попадает в ошибку", !e.getMessage().contains(secret));
+        }
+        expect("формат списка не печатает секреты", !McpClientComponent.format(result).contains(secret));
+    }
+
+    private static String secretValue() {
+        return "secret-value-must-not-leak";
     }
 
     /** Агент с изолированной долговременной памятью: реальный memory.json не мешает. */
