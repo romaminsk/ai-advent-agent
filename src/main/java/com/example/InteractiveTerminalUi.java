@@ -73,6 +73,7 @@ final class InteractiveTerminalUi implements TerminalUi {
                         "/task invariant remove ", "/task invariant clear",
                          "/mcp tools ",
                          "/mcp call ",
+                         "/mcp git tools ", "/mcp git status ", "/mcp explain",
                         "/exit", "exit", "quit"))
                 .build();
         // История ввода хранится только в памяти: файл истории не подключается.

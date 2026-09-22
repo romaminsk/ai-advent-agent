@@ -147,6 +147,10 @@ public final class McpClientComponent {
                     || message.contains("timeout") || message.contains("timed out")) {
                 return "Истекло время ожидания запроса tools/call MCP.";
             }
+            if (message.contains("not found") || message.contains("unknown tool")
+                    || message.contains("tool (") && message.contains("not")) {
+                return "Инструмент MCP не найден.";
+            }
             current = current.getCause();
         }
         return "MCP-сервер вернул ошибку при выполнении tools/call.";

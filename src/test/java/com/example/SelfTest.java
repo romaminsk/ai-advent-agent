@@ -152,10 +152,16 @@ public final class SelfTest {
     }
     public static void main(String[] args) throws Exception {
         if (args.length > 0 && "mcp".equals(args[0])) {
-            group("MCP");
-            checkMcpClient();
-            checkTrackerMcpServer();
-            System.out.println("OK: MCP checks passed (" + passed + ").");
+            baseTempDir = Files.createTempDirectory("selftest-mcp");
+            try {
+                group("MCP");
+                checkMcpClient();
+                checkTrackerMcpServer();
+                checkGitMcp();
+                System.out.println("OK: MCP checks passed (" + passed + ").");
+            } finally {
+                deleteRecursively(baseTempDir);
+            }
             return;
         }
         baseTempDir = Files.createTempDirectory("selftest-day8");
@@ -300,6 +306,8 @@ public final class SelfTest {
             // --- MCP: локальный stdio-сервер, без сети и внешних секретов ---
             group("MCP");
             checkMcpClient();
+            checkTrackerMcpServer();
+            checkGitMcp();
 
             // --- Режим измерений /demo ---
             group("Измерения");
@@ -468,6 +476,194 @@ public final class SelfTest {
                     .content().toString().contains("Таймаут"));
         } finally {
             slow.stop(0);
+        }
+    }
+
+    private static void checkGitMcp() throws Exception {
+        expect("Git MCP регистрирует get-repository-status",
+                GitMcpServer.TOOL_NAME.equals(GitMcpServer.toolDefinition().name()));
+        expect("Git MCP schema требует только repoPath",
+                GitMcpServer.toolDefinition().inputSchema().get("required").toString().contains("repoPath")
+                        && GitMcpServer.toolDefinition().inputSchema().get("additionalProperties").equals(false));
+
+        Path repo = Files.createTempDirectory(baseTempDir, "git-repo-");
+        git(repo, "init", "-q");
+        Files.writeString(repo.resolve("tracked.txt"), "one\n", StandardCharsets.UTF_8);
+        git(repo, "add", "tracked.txt");
+        git(repo, "-c", "user.name=SelfTest", "-c", "user.email=selftest@example.invalid",
+                "commit", "-qm", "initial");
+        GitRepositoryReader reader = new GitRepositoryReader(repo);
+        GitRepositoryStatus clean = reader.read(repo);
+        expect("чистый репозиторий определяется", clean.clean() && clean.headCommit() != null
+                && !clean.detachedHead());
+
+        Files.writeString(repo.resolve("tracked.txt"), "two\n", StandardCharsets.UTF_8);
+        Files.writeString(repo.resolve("stage.txt"), "stage\n", StandardCharsets.UTF_8);
+        git(repo, "add", "stage.txt");
+        Path unusual = repo.resolve("space кирилл\nname.txt");
+        Files.writeString(unusual, "untracked\n", StandardCharsets.UTF_8);
+        GitRepositoryStatus mixed = reader.read(repo);
+        expect("staged, unstaged и untracked разделяются", mixed.staged().contains("stage.txt")
+                && mixed.unstaged().contains("tracked.txt")
+                && mixed.untracked().contains("space кирилл\nname.txt") && !mixed.clean());
+
+        git(repo, "add", "tracked.txt");
+        Files.writeString(repo.resolve("tracked.txt"), "three\n", StandardCharsets.UTF_8);
+        GitRepositoryStatus both = reader.read(repo);
+        expect("файл может быть staged и unstaged одновременно",
+                both.staged().contains("tracked.txt") && both.unstaged().contains("tracked.txt"));
+
+        git(repo, "mv", "stage.txt", "renamed file.txt");
+        GitRepositoryStatus renamed = reader.read(repo);
+        expect("переименование возвращает новый путь", renamed.staged().contains("renamed file.txt")
+                && !renamed.staged().contains("stage.txt"));
+
+        Path deletedRepo = Files.createTempDirectory(baseTempDir, "git-deleted-");
+        git(deletedRepo, "init", "-q");
+        Files.writeString(deletedRepo.resolve("deleted.txt"), "delete\n", StandardCharsets.UTF_8);
+        git(deletedRepo, "add", "deleted.txt");
+        git(deletedRepo, "-c", "user.name=SelfTest", "-c", "user.email=selftest@example.invalid",
+                "commit", "-qm", "initial");
+        git(deletedRepo, "rm", "-q", "deleted.txt");
+        GitRepositoryStatus deleted = new GitRepositoryReader(deletedRepo).read(deletedRepo);
+        expect("удаление определяется как staged", deleted.staged().contains("deleted.txt"));
+
+        Path conflictRepo = Files.createTempDirectory(baseTempDir, "git-conflict-");
+        git(conflictRepo, "init", "-q");
+        Files.writeString(conflictRepo.resolve("conflict.txt"), "base\n", StandardCharsets.UTF_8);
+        git(conflictRepo, "add", "conflict.txt");
+        git(conflictRepo, "-c", "user.name=SelfTest", "-c", "user.email=selftest@example.invalid",
+                "commit", "-qm", "base");
+        git(conflictRepo, "checkout", "-qb", "side");
+        Files.writeString(conflictRepo.resolve("conflict.txt"), "side\n", StandardCharsets.UTF_8);
+        git(conflictRepo, "commit", "-qam", "side");
+        git(conflictRepo, "checkout", "-q", "-");
+        Files.writeString(conflictRepo.resolve("conflict.txt"), "main\n", StandardCharsets.UTF_8);
+        git(conflictRepo, "commit", "-qam", "main");
+        Process merge = new ProcessBuilder("git", "-C", conflictRepo.toString(), "merge", "side")
+                .redirectErrorStream(true).start();
+        merge.getInputStream().readAllBytes();
+        merge.waitFor();
+        GitRepositoryStatus conflict = new GitRepositoryReader(conflictRepo).read(conflictRepo);
+        expect("конфликт выделяется отдельно", conflict.conflicts().contains("conflict.txt")
+                && !conflict.staged().contains("conflict.txt") && !conflict.unstaged().contains("conflict.txt"));
+
+        Path detachedRepo = Files.createTempDirectory(baseTempDir, "git-detached-");
+        git(detachedRepo, "init", "-q");
+        Files.writeString(detachedRepo.resolve("a.txt"), "a\n", StandardCharsets.UTF_8);
+        git(detachedRepo, "add", "a.txt");
+        git(detachedRepo, "-c", "user.name=SelfTest", "-c", "user.email=selftest@example.invalid",
+                "commit", "-qm", "initial");
+        git(detachedRepo, "checkout", "--detach", "-q", "HEAD");
+        GitRepositoryStatus detached = new GitRepositoryReader(detachedRepo).read(detachedRepo);
+        expect("detached HEAD определяется", detached.detachedHead() && detached.branch() == null);
+
+        Path empty = Files.createTempDirectory(baseTempDir, "git-empty-");
+        git(empty, "init", "-q");
+        GitRepositoryStatus noCommits = new GitRepositoryReader(empty).read(empty);
+        expect("репозиторий без коммитов читается", noCommits.headCommit() == null && noCommits.branch() != null);
+
+        Path outside = Files.createTempDirectory(baseTempDir, "git-outside-");
+        try {
+            reader.read(outside);
+            expect("путь вне разрешённого корня отклоняется", false);
+        } catch (GitRepositoryReader.GitRepositoryException e) {
+            expect("путь вне разрешённого корня отклоняется", e.getMessage().contains("вне"));
+        }
+        Path nested = repo.resolve("nested");
+        Files.createDirectories(nested);
+        git(nested, "init", "-q");
+        try {
+            reader.read(nested);
+            expect("вложенный репозиторий отклоняется", false);
+        } catch (GitRepositoryReader.GitRepositoryException e) {
+            expect("вложенный репозиторий отклоняется", e.getMessage().contains("другому"));
+        }
+        try {
+            reader.read(Path.of("relative-repository"));
+            expect("относительный путь отклоняется", false);
+        } catch (GitRepositoryReader.GitRepositoryException e) {
+            expect("относительный путь отклоняется", e.getMessage().contains("абсолютным"));
+        }
+        try {
+            reader.read(baseTempDir.resolve("does-not-exist").toAbsolutePath());
+            expect("несуществующий путь отклоняется", false);
+        } catch (GitRepositoryReader.GitRepositoryException e) {
+            expect("несуществующий путь отклоняется", e.getMessage().contains("не существует"));
+        }
+        Path bare = Files.createTempDirectory(baseTempDir, "git-bare-");
+        git(bare, "init", "--bare", "-q");
+        try {
+            new GitRepositoryReader(bare);
+            expect("bare-репозиторий отклоняется", false);
+        } catch (GitRepositoryReader.GitRepositoryException e) {
+            expect("bare-репозиторий отклоняется", e.getMessage().contains("Bare"));
+        }
+
+        Path worktree = Files.createTempDirectory(baseTempDir, "git-worktree-");
+        Files.delete(worktree);
+        git(repo, "worktree", "add", "-q", "-b", "selftest-worktree", worktree.toString());
+        GitRepositoryStatus worktreeStatus = new GitRepositoryReader(worktree).read(worktree);
+        expect("Git worktree читается как выбранный корень", worktreeStatus.repositoryRoot()
+                .equals(worktree.toRealPath().toString()));
+
+        McpSchema.CallToolResult valid = new GitMcpServer(repo).handle(
+                McpSchema.CallToolRequest.builder().name(GitMcpServer.TOOL_NAME)
+                        .arguments(Map.of("repoPath", repo.toString())).build());
+        expect("Git MCP tools/call возвращает структуру", !Boolean.TRUE.equals(valid.isError())
+                && valid.structuredContent().toString().contains("repositoryRoot"));
+        McpSchema.CallToolResult invalid = new GitMcpServer(repo).handle(
+                McpSchema.CallToolRequest.builder().name(GitMcpServer.TOOL_NAME)
+                        .arguments(Map.of()).build());
+        expect("пропущенный repoPath возвращает ошибку", Boolean.TRUE.equals(invalid.isError()));
+        McpSchema.CallToolResult extra = new GitMcpServer(repo).handle(
+                McpSchema.CallToolRequest.builder().name(GitMcpServer.TOOL_NAME)
+                        .arguments(Map.of("repoPath", repo.toString(), "extra", true)).build());
+        expect("лишний аргумент отклоняется", Boolean.TRUE.equals(extra.isError()));
+        checkGitExplainGuards(repo);
+    }
+
+    private static void checkGitExplainGuards(Path repo) throws Exception {
+        Config config = new Config("test-key", "https://127.0.0.1:1/v1/chat/completions", "test-model");
+        LlmAgent clearAgent = newAgentWithTempStore(config);
+        String statusCommand = "/mcp git status " + repo;
+        FakeUi clearUi = new FakeUi(TerminalUi.Input.command(statusCommand),
+                TerminalUi.Input.command("/clear"), TerminalUi.Input.command("/mcp explain"),
+                TerminalUi.Input.command("/exit"));
+        clearUi.confirmClearAnswer = true;
+        Main.runLoop(clearUi, clearAgent, "test-model");
+        expect("/clear очищает последний Git-снимок",
+                clearUi.systems.stream().anyMatch(s -> s.contains("Успешного Git-снимка нет")));
+
+        LlmAgent blockedAgent = newAgentWithTempStore(config);
+        blockedAgent.taskStart("Git explain guard");
+        blockedAgent.taskBlock();
+        FakeUi blockedUi = new FakeUi(TerminalUi.Input.command("/mcp explain"),
+                TerminalUi.Input.command("/exit"));
+        Main.runLoop(blockedUi, blockedAgent, "test-model");
+        expect("BLOCKED запрещает /mcp explain без вызова модели",
+                blockedUi.systems.stream().anyMatch(s -> s.contains("/mcp explain не вызывает модель"))
+                        && blockedAgent.getHistory().isEmpty());
+
+        LlmAgent failedStatusAgent = newAgentWithTempStore(config);
+        FakeUi failedStatusUi = new FakeUi(TerminalUi.Input.command(statusCommand),
+                TerminalUi.Input.command("/mcp git status " + repo.resolve("missing")),
+                TerminalUi.Input.command("/mcp explain"), TerminalUi.Input.command("/exit"));
+        Main.runLoop(failedStatusUi, failedStatusAgent, "test-model");
+        expect("ошибка нового Git status инвалидирует прежний снимок",
+                failedStatusUi.systems.stream().anyMatch(s -> s.contains("Успешного Git-снимка нет")));
+    }
+
+    private static void git(Path directory, String... args) throws Exception {
+        List<String> command = new ArrayList<>();
+        command.add("git");
+        command.add("-C");
+        command.add(directory.toString());
+        command.addAll(List.of(args));
+        Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
+        String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        if (process.waitFor() != 0) {
+            throw new AssertionError("SelfTest git command failed: " + output);
         }
     }
 

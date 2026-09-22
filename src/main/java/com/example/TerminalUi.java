@@ -310,10 +310,15 @@ public interface TerminalUi extends AutoCloseable {
                       /mcp tools https://example.invalid/mcp
                       /mcp tools npx -y @modelcontextprotocol/server-everything
                       /mcp call ./tracker-mcp get-issue {"issueKey":"TEST-123"}
+                      /mcp git tools /absolute/path/to/repository
+                      /mcp git status /absolute/path/to/repository
+                      /mcp explain
 
                     Эффекты
                        tools выполняет tools/list, call выполняет tools/call и закрывает
-                       соединение. Инструменты не передаются модели и автоматически не выбираются.
+                       соединение. git status получает снимок локального Git через MCP;
+                       explain явно передаёт последний успешный снимок модели.
+                       Автоматического выбора инструмента и управления задачей нет.
                       URL использует Streamable HTTP; команда — stdio.
 
                      Связано: MCP_AUTH_TOKEN (HTTP MCP), TRACKER_OAUTH_TOKEN (сервер Трекера).
