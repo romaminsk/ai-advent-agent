@@ -508,6 +508,7 @@ public final class SelfTest {
         expect("Git MCP schema требует только repoPath",
                 GitMcpServer.toolDefinition().inputSchema().get("required").toString().contains("repoPath")
                         && GitMcpServer.toolDefinition().inputSchema().get("additionalProperties").equals(false));
+        checkGitExplainPromptContract();
 
         Path repo = Files.createTempDirectory(baseTempDir, "git-repo-");
         git(repo, "init", "-q");
@@ -706,6 +707,29 @@ public final class SelfTest {
         Main.runLoop(nonGitUi, newAgentWithTempStore(config), "test-model");
         expect("CLI каталог без Git возвращает понятную ошибку",
                 nonGitUi.errors.stream().anyMatch(s -> s.contains("не является Git-репозиторием")));
+    }
+
+    private static void checkGitExplainPromptContract() {
+        GitRepositoryStatus status = new GitRepositoryStatus(
+                "/tmp/repo", null, true, null, false,
+                List.of("same.txt"), List.of("same.txt"),
+                List.of("$(do-not-run).txt"), List.of("conflict.txt"));
+        String prompt = Main.buildMcpExplainPrompt(status);
+        expect("explain prompt использует структурированный snapshot", prompt.contains("repositoryRoot")
+                && prompt.contains("detachedHead") && prompt.contains("same.txt")
+                && prompt.contains("$(do-not-run).txt"));
+        expect("explain prompt явно запрещает доверять предыдущим ответам",
+                prompt.contains("Предыдущие сообщения пользователя и ответы ассистента не являются"));
+        expect("explain prompt задаёт границы неизвестных данных",
+                prompt.contains("содержимое diff") && prompt.contains("remote")
+                        && prompt.contains("прохождение тестов") && prompt.contains(".gitignore"));
+        expect("explain prompt не навязывает команды и неизвестные remote/ветку",
+                !prompt.contains("mvn test") && !prompt.contains("gradle test")
+                        && !prompt.contains("origin/") && !prompt.contains("first-mcp-tool"));
+        expect("explain prompt объясняет staged и unstaged отдельно",
+                prompt.contains("staged означает изменения в индексе")
+                        && prompt.contains("unstaged — изменения вне индекса")
+                        && prompt.contains("одновременно staged и unstaged"));
     }
 
     private static void git(Path directory, String... args) throws Exception {
