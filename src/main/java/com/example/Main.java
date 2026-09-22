@@ -3239,11 +3239,14 @@ public final class Main {
     private static void handleGitTools(TerminalUi ui, String repoPath) {
         try {
             java.nio.file.Path path = absoluteRepoPath(repoPath);
+            GitRepositoryReader.RepositoryLocation location = GitRepositoryReader.resolveLocation(path);
             McpClientComponent.ToolListResult result = new McpClientComponent()
-                    .listTools(GitMcpServer.command(path));
+                    .listTools(GitMcpServer.command(location.repositoryRoot()));
             ui.showSystem(McpClientComponent.format(result)
-                    + "\nРазрешённый репозиторий: " + path);
+                    + "\nРазрешённый репозиторий: " + location.repositoryRoot());
         } catch (IllegalArgumentException | IllegalStateException e) {
+            ui.showError(e.getMessage());
+        } catch (GitRepositoryReader.GitRepositoryException e) {
             ui.showError(e.getMessage());
         } catch (McpClientComponent.McpClientException e) {
             ui.showError(e.getMessage());
@@ -3253,9 +3256,10 @@ public final class Main {
     private static void handleGitStatus(TerminalUi ui, String repoPath, McpSnapshotRef snapshot) {
         try {
             java.nio.file.Path path = absoluteRepoPath(repoPath);
+            GitRepositoryReader.RepositoryLocation location = GitRepositoryReader.resolveLocation(path);
             McpClientComponent.ToolCallResult result = new McpClientComponent()
-                    .callTool(GitMcpServer.command(path), GitMcpServer.TOOL_NAME,
-                            Map.of("repoPath", path.toString()));
+                    .callTool(GitMcpServer.command(location.repositoryRoot()), GitMcpServer.TOOL_NAME,
+                            Map.of("repoPath", location.requestedPath().toString()));
             GitRepositoryStatus status = GitRepositoryStatus.fromStructured(result.structuredContent());
             if (result.error() || status == null) {
                 snapshot.clear();
@@ -3265,6 +3269,9 @@ public final class Main {
             snapshot.set(status, result.text());
             ui.showSystem(GitRepositoryStatus.formatForTerminal(status));
         } catch (IllegalArgumentException | IllegalStateException e) {
+            snapshot.clear();
+            ui.showError(e.getMessage());
+        } catch (GitRepositoryReader.GitRepositoryException e) {
             snapshot.clear();
             ui.showError(e.getMessage());
         } catch (McpClientComponent.McpClientException e) {

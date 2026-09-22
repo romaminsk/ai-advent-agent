@@ -13,13 +13,16 @@ public final class McpStubServer {
             System.err.println("npm ERR! 404 Not Found - package does not exist");
             return;
         }
+        if ("exit".equals(mode)) {
+            return;
+        }
         try (BufferedReader input = new BufferedReader(
                 new InputStreamReader(System.in, StandardCharsets.UTF_8))) {
             String line;
             while ((line = input.readLine()) != null) {
                 if (line.contains("\"method\":\"initialize\"")) {
-                    if ("timeout".equals(mode)) {
-                        Thread.sleep(2_000);
+                    if ("timeout".equals(mode) || "long-timeout".equals(mode)) {
+                        Thread.sleep("long-timeout".equals(mode) ? 20_000 : 2_000);
                     }
                     reply(line, "{\"protocolVersion\":\"2025-11-25\","
                             + "\"capabilities\":{\"tools\":{}},"

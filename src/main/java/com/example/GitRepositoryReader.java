@@ -25,20 +25,21 @@ public final class GitRepositoryReader {
 
     private final Path allowedRoot;
 
+    public record RepositoryLocation(Path requestedPath, Path repositoryRoot) {
+    }
+
     public GitRepositoryReader(Path allowedRoot) throws GitRepositoryException {
         this.allowedRoot = canonicalDirectory(allowedRoot, "Разрешённый корень репозитория");
         ensureRepository(this.allowedRoot);
     }
 
     public GitRepositoryStatus read(Path repoPath) throws GitRepositoryException {
-        if (repoPath == null || !repoPath.isAbsolute()) {
-            throw new GitRepositoryException("repoPath должен быть абсолютным путём.");
-        }
         Path requested = canonicalDirectory(repoPath, "Путь репозитория");
         if (!requested.startsWith(allowedRoot)) {
             throw new GitRepositoryException("Путь находится вне разрешённого репозитория.");
         }
-        Path actualRoot = repositoryRoot(requested);
+        RepositoryLocation location = resolveLocation(requested);
+        Path actualRoot = location.repositoryRoot();
         if (!allowedRoot.equals(actualRoot)) {
             throw new GitRepositoryException("Путь относится к другому или вложенному репозиторию.");
         }
@@ -61,7 +62,23 @@ public final class GitRepositoryReader {
         return allowedRoot;
     }
 
+    /** Разрешает пользовательский путь и возвращает его корень Git без чтения status. */
+    public static RepositoryLocation resolveLocation(Path repoPath) throws GitRepositoryException {
+        Path requested = canonicalDirectory(repoPath, "Путь репозитория");
+        validateGitDirectory(requested);
+        Path root = repositoryRoot(requested);
+        validateGitDirectory(root);
+        return new RepositoryLocation(requested, root);
+    }
+
     private void ensureRepository(Path path) throws GitRepositoryException {
+        validateGitDirectory(path);
+        if (!path.equals(repositoryRoot(path))) {
+            throw new GitRepositoryException("Разрешённый путь не совпадает с корнем Git-репозитория.");
+        }
+    }
+
+    private static void validateGitDirectory(Path path) throws GitRepositoryException {
         CommandResult bare = runAllowFailure(List.of("git", "-C", path.toString(),
                 "rev-parse", "--is-bare-repository"));
         if (bare.exitCode() != 0) {
@@ -74,12 +91,9 @@ public final class GitRepositoryReader {
                 "rev-parse", "--is-inside-work-tree")).stdout()))) {
             throw new GitRepositoryException("Путь не является рабочим Git-репозиторием.");
         }
-        if (!path.equals(repositoryRoot(path))) {
-            throw new GitRepositoryException("Разрешённый путь не совпадает с корнем Git-репозитория.");
-        }
     }
 
-    private Path repositoryRoot(Path path) throws GitRepositoryException {
+    private static Path repositoryRoot(Path path) throws GitRepositoryException {
         CommandResult root = run(List.of("git", "-C", path.toString(), "rev-parse", "--show-toplevel"));
         try {
             return Path.of(text(root.stdout())).toRealPath();
@@ -134,7 +148,7 @@ public final class GitRepositoryReader {
                 List.copyOf(untracked), List.copyOf(conflicts));
     }
 
-    private CommandResult run(List<String> command) throws GitRepositoryException {
+    private static CommandResult run(List<String> command) throws GitRepositoryException {
         CommandResult result = runAllowFailure(command);
         if (result.exitCode() != 0) {
             throw new GitRepositoryException("Git не смог прочитать состояние репозитория.");
@@ -142,7 +156,7 @@ public final class GitRepositoryReader {
         return result;
     }
 
-    private CommandResult runAllowFailure(List<String> command) throws GitRepositoryException {
+    private static CommandResult runAllowFailure(List<String> command) throws GitRepositoryException {
         Process process;
         try {
             process = new ProcessBuilder(command).start();

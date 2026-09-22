@@ -416,6 +416,29 @@ public final class SelfTest {
             expect("ошибка неизвестного инструмента обрабатывается",
                     e.getMessage().contains("tools/call"));
         }
+        try {
+            client.callTool(command + " stderr", "greet", Map.of());
+            expect("раннее завершение stdio со stderr обрабатывается", false);
+        } catch (McpClientComponent.McpClientException e) {
+            expect("раннее завершение stdio со stderr не маскируется timeout",
+                    e.getMessage().contains("запустить")
+                            && !e.getMessage().contains("времени ожидания"));
+        }
+        try {
+            client.callTool(command + " exit", "greet", Map.of());
+            expect("раннее завершение stdio без stderr обрабатывается", false);
+        } catch (McpClientComponent.McpClientException e) {
+            expect("раннее завершение stdio без stderr не маскируется timeout",
+                    !e.getMessage().contains("времени ожидания"));
+        }
+        try {
+            new McpClientComponent(Duration.ofMillis(100))
+                    .callTool(command + " long-timeout", "greet", Map.of());
+            expect("живой MCP-процесс без ответа даёт timeout", false);
+        } catch (McpClientComponent.McpClientException e) {
+            expect("живой MCP-процесс без ответа даёт timeout",
+                    e.getMessage().contains("время ожидания"));
+        }
     }
 
     private static void checkTrackerMcpServer() throws Exception {
@@ -620,6 +643,28 @@ public final class SelfTest {
                 McpSchema.CallToolRequest.builder().name(GitMcpServer.TOOL_NAME)
                         .arguments(Map.of("repoPath", repo.toString(), "extra", true)).build());
         expect("лишний аргумент отклоняется", Boolean.TRUE.equals(extra.isError()));
+        Files.writeString(repo.resolve("outside-root.txt"), "outside\n", StandardCharsets.UTF_8);
+        Path subdirectory = repo.resolve("subdir");
+        Files.createDirectories(subdirectory);
+        FakeUi subdirUi = new FakeUi(
+                TerminalUi.Input.command("/mcp git tools " + subdirectory),
+                TerminalUi.Input.command("/mcp git status " + subdirectory),
+                TerminalUi.Input.command("/exit"));
+        String previousClasspath = System.getProperty("java.class.path");
+        try {
+            System.setProperty("java.class.path", buildClasspath());
+            Main.runLoop(subdirUi, newAgentWithTempStore(
+                    new Config("test-key", "https://127.0.0.1:1/v1/chat/completions", "test-model")),
+                    "test-model");
+        } finally {
+            System.setProperty("java.class.path", previousClasspath);
+        }
+        String repositoryRoot = repo.toRealPath().toString();
+        expect("CLI tools принимает подкаталог и запускает сервер с корнем",
+                subdirUi.systems.stream().anyMatch(s -> s.contains("get-repository-status")));
+        expect("CLI status подкаталога возвращает состояние всего репозитория",
+                subdirUi.systems.stream().anyMatch(s -> s.contains(repositoryRoot)
+                        && s.contains("outside-root.txt")));
         checkGitExplainGuards(repo);
     }
 
@@ -652,6 +697,15 @@ public final class SelfTest {
         Main.runLoop(failedStatusUi, failedStatusAgent, "test-model");
         expect("ошибка нового Git status инвалидирует прежний снимок",
                 failedStatusUi.systems.stream().anyMatch(s -> s.contains("Успешного Git-снимка нет")));
+        expect("ошибка предварительной проверки пути понятна",
+                failedStatusUi.errors.stream().anyMatch(s -> s.contains("не существует")));
+
+        Path nonGit = Files.createTempDirectory(baseTempDir, "git-cli-non-git-");
+        FakeUi nonGitUi = new FakeUi(TerminalUi.Input.command(
+                "/mcp git status " + nonGit), TerminalUi.Input.command("/exit"));
+        Main.runLoop(nonGitUi, newAgentWithTempStore(config), "test-model");
+        expect("CLI каталог без Git возвращает понятную ошибку",
+                nonGitUi.errors.stream().anyMatch(s -> s.contains("не является Git-репозиторием")));
     }
 
     private static void git(Path directory, String... args) throws Exception {
@@ -5048,6 +5102,15 @@ public final class SelfTest {
         addCodeSource(entries, com.fasterxml.jackson.core.JsonFactory.class);
         addCodeSource(entries, com.fasterxml.jackson.annotation.JsonValue.class);
         addCodeSource(entries, org.jline.terminal.Terminal.class);
+        addCodeSource(entries, io.modelcontextprotocol.spec.McpSchema.class);
+        addCodeSource(entries, io.modelcontextprotocol.json.jackson3.JacksonMcpJsonMapperSupplier.class);
+        addCodeSource(entries, reactor.core.publisher.Mono.class);
+        addCodeSource(entries, org.reactivestreams.Publisher.class);
+        addCodeSource(entries, tools.jackson.databind.ObjectMapper.class);
+        addCodeSource(entries, tools.jackson.core.JacksonException.class);
+        addCodeSource(entries, com.networknt.schema.dialect.Dialects.class);
+        addCodeSource(entries, org.slf4j.LoggerFactory.class);
+        addCodeSource(entries, org.slf4j.nop.NOPServiceProvider.class);
         StringBuilder classpath = new StringBuilder();
         for (String entry : entries) {
             if (classpath.length() > 0) {

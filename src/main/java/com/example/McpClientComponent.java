@@ -81,8 +81,9 @@ public final class McpClientComponent {
 
     private ToolCallResult callStdioTool(String commandLine, String toolName,
                                          Map<String, Object> arguments) throws McpClientException {
-        return callToolOnTransport(createStdioTransport(commandLine), TransportType.STDIO,
-                toolName, arguments, new AtomicReference<>(""));
+        AtomicReference<String> stderr = new AtomicReference<>("");
+        return callToolOnTransport(createStdioTransport(commandLine, stderr), TransportType.STDIO,
+                toolName, arguments, stderr);
     }
 
     private ToolCallResult callHttpTool(String endpoint, String toolName,
@@ -106,6 +107,10 @@ public final class McpClientComponent {
                 .initializationTimeout(timeout).requestTimeout(timeout).build()) {
             try {
                 client.initialize();
+            } catch (Exception e) {
+                throw new McpClientException(classifyConnectionError(e, stderr.get(), transportType));
+            }
+            try {
                 McpSchema.CallToolResult result = client.callTool(McpSchema.CallToolRequest.builder()
                         .name(toolName).arguments(arguments == null ? Map.of() : arguments).build());
                 String text = result.content() == null ? "" : result.content().stream()
@@ -124,7 +129,9 @@ public final class McpClientComponent {
         }
     }
 
-    private StdioClientTransport createStdioTransport(String commandLine) throws McpClientException {
+    private StdioClientTransport createStdioTransport(String commandLine,
+                                                      AtomicReference<String> stderr)
+            throws McpClientException {
         List<String> parts;
         try {
             parts = splitCommand(commandLine);
@@ -136,7 +143,15 @@ public final class McpClientComponent {
         }
         StdioClientTransport transport = new StdioClientTransport(ServerParameters.builder(parts.get(0))
                 .args(parts.subList(1, parts.size())).build(), new JacksonMcpJsonMapperSupplier().get());
+        transport.setStdErrorHandler(message -> appendStderr(stderr, message));
         return transport;
+    }
+
+    private static void appendStderr(AtomicReference<String> stderr, String message) {
+        stderr.updateAndGet(previous -> {
+            String next = previous + (message == null ? "" : message) + "\n";
+            return next.length() > 4096 ? next.substring(0, 4096) : next;
+        });
     }
 
     private static String classifyCallError(Exception e) {
@@ -178,7 +193,7 @@ public final class McpClientComponent {
                 parameters, new JacksonMcpJsonMapperSupplier().get());
         AtomicReference<String> stderr = new AtomicReference<>("");
         transport.setStdErrorHandler(message -> {
-            stderr.updateAndGet(previous -> previous + message + "\n");
+            appendStderr(stderr, message);
         });
         return discover(transport, TransportType.STDIO, stderr);
     }
