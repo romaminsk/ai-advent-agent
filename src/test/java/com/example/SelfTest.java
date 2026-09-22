@@ -4,8 +4,10 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.modelcontextprotocol.spec.McpSchema;
 import com.sun.net.httpserver.HttpsConfigurator;
 import com.sun.net.httpserver.HttpsServer;
+import com.sun.net.httpserver.HttpServer;
 
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
@@ -21,6 +23,7 @@ import java.io.StringReader;
 import java.io.StringWriter;
 import java.math.BigDecimal;
 import java.net.InetSocketAddress;
+import java.net.URI;
 import java.net.http.HttpClient;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -151,6 +154,7 @@ public final class SelfTest {
         if (args.length > 0 && "mcp".equals(args[0])) {
             group("MCP");
             checkMcpClient();
+            checkTrackerMcpServer();
             System.out.println("OK: MCP checks passed (" + passed + ").");
             return;
         }
@@ -392,6 +396,93 @@ public final class SelfTest {
             expect("секрет не попадает в ошибку", !e.getMessage().contains(secret));
         }
         expect("формат списка не печатает секреты", !McpClientComponent.format(result).contains(secret));
+
+        McpClientComponent.ToolCallResult call = client.callTool(command, "greet",
+                Map.of("name", "Ada"));
+        expect("tools/call возвращает результат", !call.error() && call.text().contains("ok"));
+        try {
+            McpClientComponent.ToolCallResult missing = client.callTool(command, "missing", Map.of());
+            expect("ошибка неизвестного инструмента обрабатывается",
+                    missing.error() && missing.text().contains("not found"));
+        } catch (McpClientComponent.McpClientException e) {
+            expect("ошибка неизвестного инструмента обрабатывается",
+                    e.getMessage().contains("tools/call"));
+        }
+    }
+
+    private static void checkTrackerMcpServer() throws Exception {
+        expect("Tracker MCP регистрирует get-issue", "get-issue".equals(
+                TrackerMcpServer.toolDefinition().name()));
+        expect("inputSchema требует только issueKey",
+                TrackerMcpServer.toolDefinition().inputSchema().get("required").toString()
+                        .contains("issueKey"));
+        HttpServer api = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        api.createContext("/v2/issues/TEST-123", exchange -> respond(exchange, 200,
+                "{\"key\":\"TEST-123\",\"summary\":\"First MCP\","
+                        + "\"status\":{\"name\":\"Open\"},\"assignee\":{\"display\":\"Ada\"},"
+                        + "\"priority\":{\"name\":\"High\"}}"));
+        api.createContext("/v2/issues/MISSING-1", exchange -> respond(exchange, 404, "{}"));
+        api.createContext("/v2/issues/SECRET-1", exchange -> respond(exchange, 401, "{}"));
+        api.start();
+        try (TrackerMcpServer server = new TrackerMcpServer(HttpClient.newHttpClient(),
+                URI.create("http://127.0.0.1:" + api.getAddress().getPort() + "/v2/"),
+                "secret-token")) {
+            McpSchema.CallToolResult valid = server.handle(McpSchema.CallToolRequest.builder()
+                    .name("get-issue").arguments(Map.of("issueKey", "TEST-123")).build());
+            expect("get-issue возвращает структурированный результат",
+                    !Boolean.TRUE.equals(valid.isError()) && valid.structuredContent().toString().contains("First MCP"));
+            expect("секрет не попадает в успешный результат", !valid.toString().contains("secret-token"));
+            expect("404 превращается в понятную ошибку", server.handle(request("MISSING-1")).content()
+                    .toString().contains("не найдена"));
+            McpSchema.CallToolResult unauthorized = server.handle(request("SECRET-1"));
+            expect("401 превращается в безопасную ошибку", unauthorized.content().toString()
+                    .toLowerCase().contains("токен") && !unauthorized.toString().contains("secret-token"));
+            expect("пустой issueKey отклоняется", server.handle(request(" ")).content().toString().contains("Неверные аргументы"));
+        } finally {
+            api.stop(0);
+        }
+        try (TrackerMcpServer unavailable = new TrackerMcpServer(HttpClient.newHttpClient(),
+                URI.create("http://127.0.0.1:1/v2/"), "secret-token")) {
+            expect("недоступный Tracker API обрабатывается", unavailable.handle(request("TEST-123"))
+                    .content().toString().contains("недоступен"));
+        }
+        try (TrackerMcpServer noToken = new TrackerMcpServer(HttpClient.newHttpClient(),
+                URI.create("http://127.0.0.1:1/v2/"), null)) {
+            expect("отсутствующий токен обрабатывается без запроса", noToken.handle(request("TEST-123"))
+                    .content().toString().contains("не задан"));
+        }
+        HttpServer slow = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        slow.createContext("/v2/issues/TEST-123", exchange -> {
+            try {
+                Thread.sleep(200);
+                respond(exchange, 200, "{}");
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        slow.start();
+        try (TrackerMcpServer timeout = new TrackerMcpServer(HttpClient.newHttpClient(),
+                URI.create("http://127.0.0.1:" + slow.getAddress().getPort() + "/v2/"),
+                "secret-token", Duration.ofMillis(50))) {
+            expect("таймаут Tracker API обрабатывается", timeout.handle(request("TEST-123"))
+                    .content().toString().contains("Таймаут"));
+        } finally {
+            slow.stop(0);
+        }
+    }
+
+    private static McpSchema.CallToolRequest request(String key) {
+        return McpSchema.CallToolRequest.builder().name("get-issue")
+                .arguments(Map.of("issueKey", key)).build();
+    }
+
+    private static void respond(com.sun.net.httpserver.HttpExchange exchange, int status, String body)
+            throws IOException {
+        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+        exchange.sendResponseHeaders(status, bytes.length);
+        try (var output = exchange.getResponseBody()) {
+            output.write(bytes);
+        }
     }
 
     private static String secretValue() {

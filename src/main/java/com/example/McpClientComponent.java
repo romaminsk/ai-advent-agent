@@ -14,11 +14,12 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Map;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.atomic.AtomicReference;
 
-/** Изолированный MCP-клиент: подключение и только discovery через tools/list. */
+/** Изолированный MCP-клиент: discovery и явный вызов tools/call. */
 public final class McpClientComponent {
 
     static final Duration TIMEOUT = Duration.ofSeconds(10);
@@ -28,6 +29,10 @@ public final class McpClientComponent {
     }
 
     public record ToolListResult(TransportType transport, List<ToolInfo> tools) {
+    }
+
+    public record ToolCallResult(TransportType transport, boolean error, String text,
+                                 Object structuredContent) {
     }
 
     public enum TransportType {
@@ -57,6 +62,94 @@ public final class McpClientComponent {
             throw new McpClientException("URL MCP должна начинаться с http:// или https://.");
         }
         return listStdioTools(value);
+    }
+
+    public ToolCallResult callTool(String server, String toolName, Map<String, Object> arguments)
+            throws McpClientException {
+        if (server == null || server.isBlank() || toolName == null || toolName.isBlank()) {
+            throw new McpClientException("Сервер и имя инструмента должны быть заданы.");
+        }
+        String value = server.trim();
+        if (value.startsWith("http://") || value.startsWith("https://")) {
+            return callHttpTool(value, toolName, arguments);
+        }
+        if (value.matches("^[A-Za-z][A-Za-z0-9+.-]*://.*")) {
+            throw new McpClientException("URL MCP должна начинаться с http:// или https://.");
+        }
+        return callStdioTool(value, toolName, arguments);
+    }
+
+    private ToolCallResult callStdioTool(String commandLine, String toolName,
+                                         Map<String, Object> arguments) throws McpClientException {
+        return callToolOnTransport(createStdioTransport(commandLine), TransportType.STDIO,
+                toolName, arguments, new AtomicReference<>(""));
+    }
+
+    private ToolCallResult callHttpTool(String endpoint, String toolName,
+                                        Map<String, Object> arguments) throws McpClientException {
+        HttpClientStreamableHttpTransport.Builder builder = HttpClientStreamableHttpTransport.builder(endpoint)
+                .connectTimeout(timeout);
+        String token = System.getenv(AUTH_TOKEN_ENV);
+        if (token != null && !token.isBlank()) {
+            builder.httpRequestCustomizer((request, method, uri, body, context) ->
+                    request.header("Authorization", "Bearer " + token));
+        }
+        return callToolOnTransport(builder.build(), TransportType.STREAMABLE_HTTP, toolName,
+                arguments, new AtomicReference<>(""));
+    }
+
+    private ToolCallResult callToolOnTransport(io.modelcontextprotocol.spec.McpClientTransport transport,
+                                               TransportType transportType, String toolName,
+                                               Map<String, Object> arguments,
+                                               AtomicReference<String> stderr) throws McpClientException {
+        try (McpSyncClient client = McpClient.sync(transport)
+                .initializationTimeout(timeout).requestTimeout(timeout).build()) {
+            try {
+                client.initialize();
+                McpSchema.CallToolResult result = client.callTool(McpSchema.CallToolRequest.builder()
+                        .name(toolName).arguments(arguments == null ? Map.of() : arguments).build());
+                String text = result.content() == null ? "" : result.content().stream()
+                        .filter(McpSchema.TextContent.class::isInstance)
+                        .map(McpSchema.TextContent.class::cast)
+                        .map(McpSchema.TextContent::text).reduce((a, b) -> a + "\n" + b).orElse("");
+                return new ToolCallResult(transportType, Boolean.TRUE.equals(result.isError()), text,
+                        result.structuredContent());
+            } catch (Exception e) {
+                throw new McpClientException(classifyCallError(e));
+            }
+        } catch (McpClientException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new McpClientException(classifyConnectionError(e, stderr.get(), transportType));
+        }
+    }
+
+    private StdioClientTransport createStdioTransport(String commandLine) throws McpClientException {
+        List<String> parts;
+        try {
+            parts = splitCommand(commandLine);
+        } catch (IllegalArgumentException e) {
+            throw new McpClientException("Неверная команда MCP: " + e.getMessage());
+        }
+        if (parts.isEmpty() || !commandExists(parts.get(0))) {
+            throw new McpClientException("Не удалось запустить MCP stdio-сервер. Проверьте команду или пакет.");
+        }
+        StdioClientTransport transport = new StdioClientTransport(ServerParameters.builder(parts.get(0))
+                .args(parts.subList(1, parts.size())).build(), new JacksonMcpJsonMapperSupplier().get());
+        return transport;
+    }
+
+    private static String classifyCallError(Exception e) {
+        Throwable current = e;
+        while (current != null) {
+            String message = current.getMessage() == null ? "" : current.getMessage().toLowerCase(Locale.ROOT);
+            if (current instanceof java.util.concurrent.TimeoutException
+                    || message.contains("timeout") || message.contains("timed out")) {
+                return "Истекло время ожидания запроса tools/call MCP.";
+            }
+            current = current.getCause();
+        }
+        return "MCP-сервер вернул ошибку при выполнении tools/call.";
     }
 
     private ToolListResult listStdioTools(String commandLine) throws McpClientException {

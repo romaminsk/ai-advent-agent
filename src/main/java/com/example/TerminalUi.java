@@ -300,7 +300,7 @@ public interface TerminalUi extends AutoCloseable {
 
                     Связано: любая /команда.""";
             case "/mcp" -> """
-                    /mcp — получить список инструментов MCP
+                    /mcp — подключиться к MCP и явно вызвать инструмент
 
                     Использование
                       /mcp tools <URL>
@@ -309,13 +309,15 @@ public interface TerminalUi extends AutoCloseable {
                     Примеры
                       /mcp tools https://example.invalid/mcp
                       /mcp tools npx -y @modelcontextprotocol/server-everything
+                      /mcp call ./tracker-mcp get-issue {"issueKey":"TEST-123"}
 
                     Эффекты
-                      устанавливает соединение, выполняет tools/list и закрывает
-                      соединение. Вызов инструментов и передача их модели не выполняются.
+                       tools выполняет tools/list, call выполняет tools/call и закрывает
+                       соединение. Инструменты не передаются модели и автоматически не выбираются.
                       URL использует Streamable HTTP; команда — stdio.
 
-                    Связано: MCP_AUTH_TOKEN (только HTTP, значение не выводится).""";
+                     Связано: MCP_AUTH_TOKEN (HTTP MCP), TRACKER_OAUTH_TOKEN (сервер Трекера).
+                     Значения токенов не выводятся.""";
             case "/status" -> """
                     /status — обзор состояния одним экраном (без API)
 

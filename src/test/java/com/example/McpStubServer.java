@@ -29,6 +29,13 @@ public final class McpStubServer {
                             : "[{\"name\":\"greet\",\"description\":\"Returns a greeting\","
                             + "\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]";
                     reply(line, "{\"tools\":" + tools + "}");
+                } else if (line.contains("\"method\":\"tools/call\"")) {
+                    if (line.contains("missing")) {
+                        reply(line, "{\"content\":[{\"type\":\"text\",\"text\":\"tool not found\"}],\"isError\":true}");
+                    } else {
+                        reply(line, "{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"ok\\\":true}\"}],"
+                                + "\"structuredContent\":{\"ok\":true}}");
+                    }
                 }
             }
         }

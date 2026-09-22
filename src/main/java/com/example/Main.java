@@ -2,7 +2,9 @@ package com.example;
 
 import java.math.BigDecimal;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Консольное приложение агента. Координирует работу: создаёт конфигурацию,
@@ -3183,6 +3185,10 @@ public final class Main {
     private static void handleMcpCommand(TerminalUi ui, String raw) {
         String argument = raw.length() > "/mcp".length()
                 ? raw.substring("/mcp".length()).trim() : "";
+        if (argument.regionMatches(true, 0, "call ", 0, "call ".length())) {
+            handleMcpCallCommand(ui, argument.substring("call ".length()).trim());
+            return;
+        }
         if (!argument.regionMatches(true, 0, "tools ", 0, "tools ".length())
                 || argument.substring("tools ".length()).isBlank()) {
             ui.showSystem("Использование: /mcp tools <URL или команда запуска>.");
@@ -3192,6 +3198,39 @@ public final class Main {
         try {
             McpClientComponent.ToolListResult result = new McpClientComponent().listTools(server);
             ui.showSystem(McpClientComponent.format(result));
+        } catch (McpClientComponent.McpClientException e) {
+            ui.showError(e.getMessage());
+        }
+    }
+
+    private static void handleMcpCallCommand(TerminalUi ui, String raw) {
+        int jsonStart = raw.indexOf('{');
+        if (jsonStart < 0) {
+            ui.showSystem("Использование: /mcp call <сервер> <инструмент> <JSON-аргументы>.");
+            return;
+        }
+        String prefix = raw.substring(0, jsonStart).trim();
+        String json = raw.substring(jsonStart).trim();
+        int toolEnd = prefix.lastIndexOf(' ');
+        if (toolEnd <= 0 || toolEnd == prefix.length() - 1) {
+            ui.showSystem("Использование: /mcp call <сервер> <инструмент> <JSON-аргументы>.");
+            return;
+        }
+        String server = prefix.substring(0, toolEnd).trim();
+        String tool = prefix.substring(toolEnd + 1).trim();
+        try {
+            Map<String, Object> arguments = new com.fasterxml.jackson.databind.ObjectMapper()
+                    .readValue(json, new com.fasterxml.jackson.core.type.TypeReference<>() {
+                    });
+            McpClientComponent.ToolCallResult result = new McpClientComponent()
+                    .callTool(server, tool, arguments);
+            if (result.error()) {
+                ui.showError(result.text());
+            } else {
+                ui.showSystem("✓ MCP подключён (tools/call).\n" + result.text());
+            }
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            ui.showError("Неверный JSON аргументов инструмента.");
         } catch (McpClientComponent.McpClientException e) {
             ui.showError(e.getMessage());
         }
@@ -3365,7 +3404,8 @@ public final class Main {
         out.println("LLM_CONTEXT_MODE (full/summary), LLM_CONTEXT_KEEP_LAST_MESSAGES,");
         out.println("LLM_SUMMARY_BATCH_MESSAGES, LLM_SUMMARY_MAX_OUTPUT_TOKENS,");
         out.println("LLM_DIAGNOSTICS, LLM_HISTORY_FILE, LLM_MEMORY_FILE, LLM_PROFILE_FILE,");
-        out.println("LLM_INVARIANT_FILE");
+        out.println("LLM_INVARIANT_FILE, MCP_AUTH_TOKEN,");
+        out.println("TRACKER_OAUTH_TOKEN или TRACKER_IAM_TOKEN (для TrackerMcpServer)");
         out.println("(при запуске через launcher загружаются из локального .env проекта).");
         out.println();
         out.println("История беседы хранится в JSON в ~/.ai-advent-agent/");
@@ -3378,6 +3418,7 @@ public final class Main {
         out.println("/profile, /skill, /pipeline, /invariant, /memory, /remember,");
         out.println("/forget, /task,");
         out.println("/mcp tools <URL или команда> (подключение и tools/list),");
+        out.println("/mcp call <сервер> <инструмент> <JSON-аргументы> (tools/call),");
         out.println("/context [full|summary], /context compare <вопрос>, /summary [refresh],");
         out.println("/multiline, /exit (также exit, quit).");
     }
