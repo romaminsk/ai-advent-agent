@@ -4,8 +4,10 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.modelcontextprotocol.spec.McpSchema;
 import com.sun.net.httpserver.HttpsConfigurator;
 import com.sun.net.httpserver.HttpsServer;
+import com.sun.net.httpserver.HttpServer;
 
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
@@ -21,6 +23,7 @@ import java.io.StringReader;
 import java.io.StringWriter;
 import java.math.BigDecimal;
 import java.net.InetSocketAddress;
+import java.net.URI;
 import java.net.http.HttpClient;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -149,9 +152,16 @@ public final class SelfTest {
     }
     public static void main(String[] args) throws Exception {
         if (args.length > 0 && "mcp".equals(args[0])) {
-            group("MCP");
-            checkMcpClient();
-            System.out.println("OK: MCP checks passed (" + passed + ").");
+            baseTempDir = Files.createTempDirectory("selftest-mcp");
+            try {
+                group("MCP");
+                checkMcpClient();
+                checkTrackerMcpServer();
+                checkGitMcp();
+                System.out.println("OK: MCP checks passed (" + passed + ").");
+            } finally {
+                deleteRecursively(baseTempDir);
+            }
             return;
         }
         baseTempDir = Files.createTempDirectory("selftest-day8");
@@ -296,6 +306,8 @@ public final class SelfTest {
             // --- MCP: локальный stdio-сервер, без сети и внешних секретов ---
             group("MCP");
             checkMcpClient();
+            checkTrackerMcpServer();
+            checkGitMcp();
 
             // --- Режим измерений /demo ---
             group("Измерения");
@@ -392,6 +404,359 @@ public final class SelfTest {
             expect("секрет не попадает в ошибку", !e.getMessage().contains(secret));
         }
         expect("формат списка не печатает секреты", !McpClientComponent.format(result).contains(secret));
+
+        McpClientComponent.ToolCallResult call = client.callTool(command, "greet",
+                Map.of("name", "Ada"));
+        expect("tools/call возвращает результат", !call.error() && call.text().contains("ok"));
+        try {
+            McpClientComponent.ToolCallResult missing = client.callTool(command, "missing", Map.of());
+            expect("ошибка неизвестного инструмента обрабатывается",
+                    missing.error() && missing.text().contains("not found"));
+        } catch (McpClientComponent.McpClientException e) {
+            expect("ошибка неизвестного инструмента обрабатывается",
+                    e.getMessage().contains("tools/call"));
+        }
+        try {
+            client.callTool(command + " stderr", "greet", Map.of());
+            expect("раннее завершение stdio со stderr обрабатывается", false);
+        } catch (McpClientComponent.McpClientException e) {
+            expect("раннее завершение stdio со stderr не маскируется timeout",
+                    e.getMessage().contains("запустить")
+                            && !e.getMessage().contains("времени ожидания"));
+        }
+        try {
+            client.callTool(command + " exit", "greet", Map.of());
+            expect("раннее завершение stdio без stderr обрабатывается", false);
+        } catch (McpClientComponent.McpClientException e) {
+            expect("раннее завершение stdio без stderr не маскируется timeout",
+                    !e.getMessage().contains("времени ожидания"));
+        }
+        try {
+            new McpClientComponent(Duration.ofMillis(100))
+                    .callTool(command + " long-timeout", "greet", Map.of());
+            expect("живой MCP-процесс без ответа даёт timeout", false);
+        } catch (McpClientComponent.McpClientException e) {
+            expect("живой MCP-процесс без ответа даёт timeout",
+                    e.getMessage().contains("время ожидания"));
+        }
+    }
+
+    private static void checkTrackerMcpServer() throws Exception {
+        expect("Tracker MCP регистрирует get-issue", "get-issue".equals(
+                TrackerMcpServer.toolDefinition().name()));
+        expect("inputSchema требует только issueKey",
+                TrackerMcpServer.toolDefinition().inputSchema().get("required").toString()
+                        .contains("issueKey"));
+        HttpServer api = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        api.createContext("/v2/issues/TEST-123", exchange -> respond(exchange, 200,
+                "{\"key\":\"TEST-123\",\"summary\":\"First MCP\","
+                        + "\"status\":{\"name\":\"Open\"},\"assignee\":{\"display\":\"Ada\"},"
+                        + "\"priority\":{\"name\":\"High\"}}"));
+        api.createContext("/v2/issues/MISSING-1", exchange -> respond(exchange, 404, "{}"));
+        api.createContext("/v2/issues/SECRET-1", exchange -> respond(exchange, 401, "{}"));
+        api.start();
+        try (TrackerMcpServer server = new TrackerMcpServer(HttpClient.newHttpClient(),
+                URI.create("http://127.0.0.1:" + api.getAddress().getPort() + "/v2/"),
+                "secret-token")) {
+            McpSchema.CallToolResult valid = server.handle(McpSchema.CallToolRequest.builder()
+                    .name("get-issue").arguments(Map.of("issueKey", "TEST-123")).build());
+            expect("get-issue возвращает структурированный результат",
+                    !Boolean.TRUE.equals(valid.isError()) && valid.structuredContent().toString().contains("First MCP"));
+            expect("секрет не попадает в успешный результат", !valid.toString().contains("secret-token"));
+            expect("404 превращается в понятную ошибку", server.handle(request("MISSING-1")).content()
+                    .toString().contains("не найдена"));
+            McpSchema.CallToolResult unauthorized = server.handle(request("SECRET-1"));
+            expect("401 превращается в безопасную ошибку", unauthorized.content().toString()
+                    .toLowerCase().contains("токен") && !unauthorized.toString().contains("secret-token"));
+            expect("пустой issueKey отклоняется", server.handle(request(" ")).content().toString().contains("Неверные аргументы"));
+        } finally {
+            api.stop(0);
+        }
+        try (TrackerMcpServer unavailable = new TrackerMcpServer(HttpClient.newHttpClient(),
+                URI.create("http://127.0.0.1:1/v2/"), "secret-token")) {
+            expect("недоступный Tracker API обрабатывается", unavailable.handle(request("TEST-123"))
+                    .content().toString().contains("недоступен"));
+        }
+        try (TrackerMcpServer noToken = new TrackerMcpServer(HttpClient.newHttpClient(),
+                URI.create("http://127.0.0.1:1/v2/"), null)) {
+            expect("отсутствующий токен обрабатывается без запроса", noToken.handle(request("TEST-123"))
+                    .content().toString().contains("не задан"));
+        }
+        HttpServer slow = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        slow.createContext("/v2/issues/TEST-123", exchange -> {
+            try {
+                Thread.sleep(200);
+                respond(exchange, 200, "{}");
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        slow.start();
+        try (TrackerMcpServer timeout = new TrackerMcpServer(HttpClient.newHttpClient(),
+                URI.create("http://127.0.0.1:" + slow.getAddress().getPort() + "/v2/"),
+                "secret-token", Duration.ofMillis(50))) {
+            expect("таймаут Tracker API обрабатывается", timeout.handle(request("TEST-123"))
+                    .content().toString().contains("Таймаут"));
+        } finally {
+            slow.stop(0);
+        }
+    }
+
+    private static void checkGitMcp() throws Exception {
+        expect("Git MCP регистрирует get-repository-status",
+                GitMcpServer.TOOL_NAME.equals(GitMcpServer.toolDefinition().name()));
+        expect("Git MCP schema требует только repoPath",
+                GitMcpServer.toolDefinition().inputSchema().get("required").toString().contains("repoPath")
+                        && GitMcpServer.toolDefinition().inputSchema().get("additionalProperties").equals(false));
+        checkGitExplainPromptContract();
+
+        Path repo = Files.createTempDirectory(baseTempDir, "git-repo-");
+        git(repo, "init", "-q");
+        Files.writeString(repo.resolve("tracked.txt"), "one\n", StandardCharsets.UTF_8);
+        git(repo, "add", "tracked.txt");
+        git(repo, "-c", "user.name=SelfTest", "-c", "user.email=selftest@example.invalid",
+                "commit", "-qm", "initial");
+        GitRepositoryReader reader = new GitRepositoryReader(repo);
+        GitRepositoryStatus clean = reader.read(repo);
+        expect("чистый репозиторий определяется", clean.clean() && clean.headCommit() != null
+                && !clean.detachedHead());
+
+        Files.writeString(repo.resolve("tracked.txt"), "two\n", StandardCharsets.UTF_8);
+        Files.writeString(repo.resolve("stage.txt"), "stage\n", StandardCharsets.UTF_8);
+        git(repo, "add", "stage.txt");
+        Path unusual = repo.resolve("space кирилл\nname.txt");
+        Files.writeString(unusual, "untracked\n", StandardCharsets.UTF_8);
+        GitRepositoryStatus mixed = reader.read(repo);
+        expect("staged, unstaged и untracked разделяются", mixed.staged().contains("stage.txt")
+                && mixed.unstaged().contains("tracked.txt")
+                && mixed.untracked().contains("space кирилл\nname.txt") && !mixed.clean());
+
+        git(repo, "add", "tracked.txt");
+        Files.writeString(repo.resolve("tracked.txt"), "three\n", StandardCharsets.UTF_8);
+        GitRepositoryStatus both = reader.read(repo);
+        expect("файл может быть staged и unstaged одновременно",
+                both.staged().contains("tracked.txt") && both.unstaged().contains("tracked.txt"));
+
+        git(repo, "mv", "stage.txt", "renamed file.txt");
+        GitRepositoryStatus renamed = reader.read(repo);
+        expect("переименование возвращает новый путь", renamed.staged().contains("renamed file.txt")
+                && !renamed.staged().contains("stage.txt"));
+
+        Path deletedRepo = Files.createTempDirectory(baseTempDir, "git-deleted-");
+        git(deletedRepo, "init", "-q");
+        Files.writeString(deletedRepo.resolve("deleted.txt"), "delete\n", StandardCharsets.UTF_8);
+        git(deletedRepo, "add", "deleted.txt");
+        git(deletedRepo, "-c", "user.name=SelfTest", "-c", "user.email=selftest@example.invalid",
+                "commit", "-qm", "initial");
+        git(deletedRepo, "rm", "-q", "deleted.txt");
+        GitRepositoryStatus deleted = new GitRepositoryReader(deletedRepo).read(deletedRepo);
+        expect("удаление определяется как staged", deleted.staged().contains("deleted.txt"));
+
+        Path conflictRepo = Files.createTempDirectory(baseTempDir, "git-conflict-");
+        git(conflictRepo, "init", "-q");
+        Files.writeString(conflictRepo.resolve("conflict.txt"), "base\n", StandardCharsets.UTF_8);
+        git(conflictRepo, "add", "conflict.txt");
+        git(conflictRepo, "-c", "user.name=SelfTest", "-c", "user.email=selftest@example.invalid",
+                "commit", "-qm", "base");
+        git(conflictRepo, "checkout", "-qb", "side");
+        Files.writeString(conflictRepo.resolve("conflict.txt"), "side\n", StandardCharsets.UTF_8);
+        git(conflictRepo, "commit", "-qam", "side");
+        git(conflictRepo, "checkout", "-q", "-");
+        Files.writeString(conflictRepo.resolve("conflict.txt"), "main\n", StandardCharsets.UTF_8);
+        git(conflictRepo, "commit", "-qam", "main");
+        Process merge = new ProcessBuilder("git", "-C", conflictRepo.toString(), "merge", "side")
+                .redirectErrorStream(true).start();
+        merge.getInputStream().readAllBytes();
+        merge.waitFor();
+        GitRepositoryStatus conflict = new GitRepositoryReader(conflictRepo).read(conflictRepo);
+        expect("конфликт выделяется отдельно", conflict.conflicts().contains("conflict.txt")
+                && !conflict.staged().contains("conflict.txt") && !conflict.unstaged().contains("conflict.txt"));
+
+        Path detachedRepo = Files.createTempDirectory(baseTempDir, "git-detached-");
+        git(detachedRepo, "init", "-q");
+        Files.writeString(detachedRepo.resolve("a.txt"), "a\n", StandardCharsets.UTF_8);
+        git(detachedRepo, "add", "a.txt");
+        git(detachedRepo, "-c", "user.name=SelfTest", "-c", "user.email=selftest@example.invalid",
+                "commit", "-qm", "initial");
+        git(detachedRepo, "checkout", "--detach", "-q", "HEAD");
+        GitRepositoryStatus detached = new GitRepositoryReader(detachedRepo).read(detachedRepo);
+        expect("detached HEAD определяется", detached.detachedHead() && detached.branch() == null);
+
+        Path empty = Files.createTempDirectory(baseTempDir, "git-empty-");
+        git(empty, "init", "-q");
+        GitRepositoryStatus noCommits = new GitRepositoryReader(empty).read(empty);
+        expect("репозиторий без коммитов читается", noCommits.headCommit() == null && noCommits.branch() != null);
+
+        Path outside = Files.createTempDirectory(baseTempDir, "git-outside-");
+        try {
+            reader.read(outside);
+            expect("путь вне разрешённого корня отклоняется", false);
+        } catch (GitRepositoryReader.GitRepositoryException e) {
+            expect("путь вне разрешённого корня отклоняется", e.getMessage().contains("вне"));
+        }
+        Path nested = repo.resolve("nested");
+        Files.createDirectories(nested);
+        git(nested, "init", "-q");
+        try {
+            reader.read(nested);
+            expect("вложенный репозиторий отклоняется", false);
+        } catch (GitRepositoryReader.GitRepositoryException e) {
+            expect("вложенный репозиторий отклоняется", e.getMessage().contains("другому"));
+        }
+        try {
+            reader.read(Path.of("relative-repository"));
+            expect("относительный путь отклоняется", false);
+        } catch (GitRepositoryReader.GitRepositoryException e) {
+            expect("относительный путь отклоняется", e.getMessage().contains("абсолютным"));
+        }
+        try {
+            reader.read(baseTempDir.resolve("does-not-exist").toAbsolutePath());
+            expect("несуществующий путь отклоняется", false);
+        } catch (GitRepositoryReader.GitRepositoryException e) {
+            expect("несуществующий путь отклоняется", e.getMessage().contains("не существует"));
+        }
+        Path bare = Files.createTempDirectory(baseTempDir, "git-bare-");
+        git(bare, "init", "--bare", "-q");
+        try {
+            new GitRepositoryReader(bare);
+            expect("bare-репозиторий отклоняется", false);
+        } catch (GitRepositoryReader.GitRepositoryException e) {
+            expect("bare-репозиторий отклоняется", e.getMessage().contains("Bare"));
+        }
+
+        Path worktree = Files.createTempDirectory(baseTempDir, "git-worktree-");
+        Files.delete(worktree);
+        git(repo, "worktree", "add", "-q", "-b", "selftest-worktree", worktree.toString());
+        GitRepositoryStatus worktreeStatus = new GitRepositoryReader(worktree).read(worktree);
+        expect("Git worktree читается как выбранный корень", worktreeStatus.repositoryRoot()
+                .equals(worktree.toRealPath().toString()));
+
+        McpSchema.CallToolResult valid = new GitMcpServer(repo).handle(
+                McpSchema.CallToolRequest.builder().name(GitMcpServer.TOOL_NAME)
+                        .arguments(Map.of("repoPath", repo.toString())).build());
+        expect("Git MCP tools/call возвращает структуру", !Boolean.TRUE.equals(valid.isError())
+                && valid.structuredContent().toString().contains("repositoryRoot"));
+        McpSchema.CallToolResult invalid = new GitMcpServer(repo).handle(
+                McpSchema.CallToolRequest.builder().name(GitMcpServer.TOOL_NAME)
+                        .arguments(Map.of()).build());
+        expect("пропущенный repoPath возвращает ошибку", Boolean.TRUE.equals(invalid.isError()));
+        McpSchema.CallToolResult extra = new GitMcpServer(repo).handle(
+                McpSchema.CallToolRequest.builder().name(GitMcpServer.TOOL_NAME)
+                        .arguments(Map.of("repoPath", repo.toString(), "extra", true)).build());
+        expect("лишний аргумент отклоняется", Boolean.TRUE.equals(extra.isError()));
+        Files.writeString(repo.resolve("outside-root.txt"), "outside\n", StandardCharsets.UTF_8);
+        Path subdirectory = repo.resolve("subdir");
+        Files.createDirectories(subdirectory);
+        FakeUi subdirUi = new FakeUi(
+                TerminalUi.Input.command("/mcp git tools " + subdirectory),
+                TerminalUi.Input.command("/mcp git status " + subdirectory),
+                TerminalUi.Input.command("/exit"));
+        String previousClasspath = System.getProperty("java.class.path");
+        try {
+            System.setProperty("java.class.path", buildClasspath());
+            Main.runLoop(subdirUi, newAgentWithTempStore(
+                    new Config("test-key", "https://127.0.0.1:1/v1/chat/completions", "test-model")),
+                    "test-model");
+        } finally {
+            System.setProperty("java.class.path", previousClasspath);
+        }
+        String repositoryRoot = repo.toRealPath().toString();
+        expect("CLI tools принимает подкаталог и запускает сервер с корнем",
+                subdirUi.systems.stream().anyMatch(s -> s.contains("get-repository-status")));
+        expect("CLI status подкаталога возвращает состояние всего репозитория",
+                subdirUi.systems.stream().anyMatch(s -> s.contains(repositoryRoot)
+                        && s.contains("outside-root.txt")));
+        checkGitExplainGuards(repo);
+    }
+
+    private static void checkGitExplainGuards(Path repo) throws Exception {
+        Config config = new Config("test-key", "https://127.0.0.1:1/v1/chat/completions", "test-model");
+        LlmAgent clearAgent = newAgentWithTempStore(config);
+        String statusCommand = "/mcp git status " + repo;
+        FakeUi clearUi = new FakeUi(TerminalUi.Input.command(statusCommand),
+                TerminalUi.Input.command("/clear"), TerminalUi.Input.command("/mcp explain"),
+                TerminalUi.Input.command("/exit"));
+        clearUi.confirmClearAnswer = true;
+        Main.runLoop(clearUi, clearAgent, "test-model");
+        expect("/clear очищает последний Git-снимок",
+                clearUi.systems.stream().anyMatch(s -> s.contains("Успешного Git-снимка нет")));
+
+        LlmAgent blockedAgent = newAgentWithTempStore(config);
+        blockedAgent.taskStart("Git explain guard");
+        blockedAgent.taskBlock();
+        FakeUi blockedUi = new FakeUi(TerminalUi.Input.command("/mcp explain"),
+                TerminalUi.Input.command("/exit"));
+        Main.runLoop(blockedUi, blockedAgent, "test-model");
+        expect("BLOCKED запрещает /mcp explain без вызова модели",
+                blockedUi.systems.stream().anyMatch(s -> s.contains("/mcp explain не вызывает модель"))
+                        && blockedAgent.getHistory().isEmpty());
+
+        LlmAgent failedStatusAgent = newAgentWithTempStore(config);
+        FakeUi failedStatusUi = new FakeUi(TerminalUi.Input.command(statusCommand),
+                TerminalUi.Input.command("/mcp git status " + repo.resolve("missing")),
+                TerminalUi.Input.command("/mcp explain"), TerminalUi.Input.command("/exit"));
+        Main.runLoop(failedStatusUi, failedStatusAgent, "test-model");
+        expect("ошибка нового Git status инвалидирует прежний снимок",
+                failedStatusUi.systems.stream().anyMatch(s -> s.contains("Успешного Git-снимка нет")));
+        expect("ошибка предварительной проверки пути понятна",
+                failedStatusUi.errors.stream().anyMatch(s -> s.contains("не существует")));
+
+        Path nonGit = Files.createTempDirectory(baseTempDir, "git-cli-non-git-");
+        FakeUi nonGitUi = new FakeUi(TerminalUi.Input.command(
+                "/mcp git status " + nonGit), TerminalUi.Input.command("/exit"));
+        Main.runLoop(nonGitUi, newAgentWithTempStore(config), "test-model");
+        expect("CLI каталог без Git возвращает понятную ошибку",
+                nonGitUi.errors.stream().anyMatch(s -> s.contains("не является Git-репозиторием")));
+    }
+
+    private static void checkGitExplainPromptContract() {
+        GitRepositoryStatus status = new GitRepositoryStatus(
+                "/tmp/repo", null, true, null, false,
+                List.of("same.txt"), List.of("same.txt"),
+                List.of("$(do-not-run).txt"), List.of("conflict.txt"));
+        String prompt = Main.buildMcpExplainPrompt(status);
+        expect("explain prompt использует структурированный snapshot", prompt.contains("repositoryRoot")
+                && prompt.contains("detachedHead") && prompt.contains("same.txt")
+                && prompt.contains("$(do-not-run).txt"));
+        expect("explain prompt явно запрещает доверять предыдущим ответам",
+                prompt.contains("Предыдущие сообщения пользователя и ответы ассистента не являются"));
+        expect("explain prompt задаёт границы неизвестных данных",
+                prompt.contains("содержимое diff") && prompt.contains("remote")
+                        && prompt.contains("прохождение тестов") && prompt.contains(".gitignore"));
+        expect("explain prompt не навязывает команды и неизвестные remote/ветку",
+                !prompt.contains("mvn test") && !prompt.contains("gradle test")
+                        && !prompt.contains("origin/") && !prompt.contains("first-mcp-tool"));
+        expect("explain prompt объясняет staged и unstaged отдельно",
+                prompt.contains("staged означает изменения в индексе")
+                        && prompt.contains("unstaged — изменения вне индекса")
+                        && prompt.contains("одновременно staged и unstaged"));
+    }
+
+    private static void git(Path directory, String... args) throws Exception {
+        List<String> command = new ArrayList<>();
+        command.add("git");
+        command.add("-C");
+        command.add(directory.toString());
+        command.addAll(List.of(args));
+        Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
+        String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        if (process.waitFor() != 0) {
+            throw new AssertionError("SelfTest git command failed: " + output);
+        }
+    }
+
+    private static McpSchema.CallToolRequest request(String key) {
+        return McpSchema.CallToolRequest.builder().name("get-issue")
+                .arguments(Map.of("issueKey", key)).build();
+    }
+
+    private static void respond(com.sun.net.httpserver.HttpExchange exchange, int status, String body)
+            throws IOException {
+        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+        exchange.sendResponseHeaders(status, bytes.length);
+        try (var output = exchange.getResponseBody()) {
+            output.write(bytes);
+        }
     }
 
     private static String secretValue() {
@@ -4761,6 +5126,15 @@ public final class SelfTest {
         addCodeSource(entries, com.fasterxml.jackson.core.JsonFactory.class);
         addCodeSource(entries, com.fasterxml.jackson.annotation.JsonValue.class);
         addCodeSource(entries, org.jline.terminal.Terminal.class);
+        addCodeSource(entries, io.modelcontextprotocol.spec.McpSchema.class);
+        addCodeSource(entries, io.modelcontextprotocol.json.jackson3.JacksonMcpJsonMapperSupplier.class);
+        addCodeSource(entries, reactor.core.publisher.Mono.class);
+        addCodeSource(entries, org.reactivestreams.Publisher.class);
+        addCodeSource(entries, tools.jackson.databind.ObjectMapper.class);
+        addCodeSource(entries, tools.jackson.core.JacksonException.class);
+        addCodeSource(entries, com.networknt.schema.dialect.Dialects.class);
+        addCodeSource(entries, org.slf4j.LoggerFactory.class);
+        addCodeSource(entries, org.slf4j.nop.NOPServiceProvider.class);
         StringBuilder classpath = new StringBuilder();
         for (String entry : entries) {
             if (classpath.length() > 0) {
