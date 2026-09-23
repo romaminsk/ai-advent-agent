@@ -20,6 +20,18 @@ import java.util.Map;
 public final class Main {
 
     public static void main(String[] args) {
+        if (args.length >= 2 && "--mcp-server".equals(args[0])) {
+            int exitCode = switch (args[1]) {
+                case "git-monitor" -> GitMonitorMcpServer.run();
+                case "git" -> GitMcpServer.run(java.util.Arrays.copyOfRange(args, 2, args.length));
+                default -> {
+                    System.err.println("Неизвестный MCP-сервер: " + args[1]);
+                    yield 2;
+                }
+            };
+            if (exitCode != 0) System.exit(exitCode);
+            return;
+        }
         boolean plainRequested = false;
         for (String arg : args) {
             if ("--help".equals(arg) || "-h".equals(arg)) {
@@ -3231,6 +3243,11 @@ public final class Main {
             }
             return;
         }
+        if (argument.regionMatches(true, 0, "monitor call ", 0, "monitor call ".length())) {
+            handleMcpCallCommand(ui, GitMonitorMcpServer.command() + " "
+                    + argument.substring("monitor call ".length()).trim(), mcpSnapshot);
+            return;
+        }
         if (argument.regionMatches(true, 0, "call ", 0, "call ".length())) {
             handleMcpCallCommand(ui, argument.substring("call ".length()).trim(), mcpSnapshot);
             return;
@@ -3688,6 +3705,7 @@ public final class Main {
         out.println("/mcp call <сервер> <инструмент> <JSON-аргументы> (tools/call),");
         out.println("/mcp git tools <абсолютный путь>, /mcp git status <абсолютный путь>,");
         out.println("/mcp explain (объяснить последний Git-снимок моделью),");
+        out.println("/mcp monitor tools, /mcp monitor call <tool> <JSON-аргументы>,");
         out.println("/monitor add|list|enable|disable|remove|run|status|summary,");
         out.println("/context [full|summary], /context compare <вопрос>, /summary [refresh],");
         out.println("/multiline, /exit (также exit, quit).");

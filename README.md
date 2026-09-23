@@ -57,16 +57,14 @@ SSE намеренно не включён в CLI. Если HTTP-сервер т
 
 ```text
 export TRACKER_OAUTH_TOKEN='...'
-mvn -q package
-java -cp target/ai-advent-agent-1.0-SNAPSHOT.jar com.example.TrackerMcpServer
 ```
 
 Для IAM можно использовать `TRACKER_IAM_TOKEN`; сервер отправит его как Bearer.
 В обычном CLI удобнее передать команду запуска сервера прямо в команду MCP:
 
 ```text
-/mcp tools java -cp target/ai-advent-agent-1.0-SNAPSHOT.jar com.example.TrackerMcpServer
-/mcp call java -cp target/ai-advent-agent-1.0-SNAPSHOT.jar com.example.TrackerMcpServer get-issue {"issueKey":"TEST-123"}
+/mcp tools <команда запуска TrackerMcpServer>
+/mcp call <команда запуска TrackerMcpServer> get-issue {"issueKey":"TEST-123"}
 ```
 
 Инструмент принимает ровно `{"issueKey":"TEST-123"}` и возвращает JSON:
@@ -140,7 +138,13 @@ background/systemd режим будут отдельным этапом.
 
 ```text
 /mcp monitor tools
-/mcp call <команда GitMonitorMcpServer> get-git-monitor-summary {"scheduleId":"<id>"}
+/mcp monitor call get-git-monitor-summary {"scheduleId":"<id>"}
+```
+
+Для внешних MCP-клиентов мониторинг запускается переносимо:
+
+```text
+ai-agent --mcp-server git-monitor
 ```
 
 ## Интерфейс терминала

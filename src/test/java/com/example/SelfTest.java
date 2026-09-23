@@ -809,6 +809,26 @@ public final class SelfTest {
                     .callTool(monitorCommand, "schedule-git-monitor", Map.of("extra", true));
             expect("Git monitor MCP отклоняет неверные аргументы",
                     invalidMonitorCall.error());
+            McpClientComponent.ToolListResult portable = new McpClientComponent()
+                    .listTools("ai-agent --mcp-server git-monitor");
+            expect("portable ai-agent MCP режим возвращает monitor tools",
+                    portable.tools().size() == 4
+                            && portable.tools().stream().anyMatch(t -> t.name().equals("get-git-monitor-summary")));
+            try {
+                new McpClientComponent().listTools("ai-agent --mcp-server unknown");
+                expect("неизвестный portable MCP server отклоняется", false);
+            } catch (McpClientComponent.McpClientException e) {
+                expect("неизвестный portable MCP server отклоняется",
+                        !e.getMessage().contains("target/") && !e.getMessage().contains("stack trace"));
+            }
+            FakeUi routed = new FakeUi(
+                    TerminalUi.Input.command("/mcp monitor call schedule-git-monitor {\"extra\":true}"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(routed, newAgentWithTempStore(
+                    new Config("test-key", "https://127.0.0.1:1/v1/chat/completions", "test-model")),
+                    "test-model");
+            expect("/mcp monitor call маршрутизируется в monitor MCP",
+                    routed.errors.stream().noneMatch(s -> s.contains("Использование: /mcp tools")));
         } finally {
             System.setProperty("java.class.path", previousClasspath);
         }

@@ -310,6 +310,7 @@ public interface TerminalUi extends AutoCloseable {
                       /mcp tools https://example.invalid/mcp
                       /mcp tools npx -y @modelcontextprotocol/server-everything
                       /mcp call ./tracker-mcp get-issue {"issueKey":"TEST-123"}
+                      /mcp monitor call get-git-monitor-summary {"scheduleId":"..."}
                       /mcp git tools /absolute/path/to/repository
                       /mcp git status /absolute/path/to/repository
                       /mcp explain

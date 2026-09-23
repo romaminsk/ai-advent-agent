@@ -64,6 +64,15 @@ if [ -z "$JAR_PATH" ]; then
 fi
 JAR_NAME="$(basename "$JAR_PATH")"
 
+# Храним копию JAR рядом с launcher, а не в каталоге проекта. Поэтому
+# установленный MCP stdio-процесс продолжает запускаться, если проект временно
+# переименован или недоступен.
+INSTALL_DIR="${HOME}/.local/share/ai-advent-agent"
+INSTALL_JAR="$INSTALL_DIR/ai-agent.jar"
+mkdir -p "$INSTALL_DIR" 2>/dev/null || fail "не удалось создать каталог $INSTALL_DIR"
+cp "$JAR_PATH" "$INSTALL_JAR" || fail "не удалось установить JAR в $INSTALL_JAR"
+chmod 600 "$INSTALL_JAR" 2>/dev/null || true
+
 # Каталог установки — только для пользователя, без sudo.
 BIN_DIR="${HOME}/.local/bin"
 TARGET="$BIN_DIR/ai-agent"
@@ -90,14 +99,13 @@ fi
 {
     printf '#!/usr/bin/env bash\n'
     printf '# AI_ADVENT_AGENT_LAUNCHER v1 — установлен install-cli.sh из проекта ai-advent-agent.\n'
-    printf '# Команда привязана к директории проекта ниже; после перемещения проекта\n'
-    printf '# выполните ./install-cli.sh повторно — это также обновляет сборку.\n'
+    printf '# JAR установлен отдельно от проекта; повторный install-cli.sh обновляет его.\n'
     printf 'set -u\n'
     printf 'PROJECT_DIR=%q\n' "$PROJECT_DIR"
-    printf 'JAR_NAME=%q\n' "$JAR_NAME"
+    printf 'INSTALL_JAR=%q\n' "$INSTALL_JAR"
     cat <<'LAUNCHER_BODY'
 
-JAR="$PROJECT_DIR/target/$JAR_NAME"
+JAR="$INSTALL_JAR"
 if [ ! -f "$JAR" ]; then
     echo "Ошибка: JAR не найден: $JAR" >&2
     echo "Выполните ./install-cli.sh из директории проекта для пересборки и переустановки." >&2

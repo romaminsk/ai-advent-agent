@@ -116,6 +116,7 @@ public final class GitMonitorMcpServer implements AutoCloseable {
     public void close() { server.closeGracefully(); }
 
     public static String command() {
+        if (commandExists("ai-agent")) return "ai-agent --mcp-server git-monitor";
         try {
             String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
             Path location = Path.of(GitMonitorMcpServer.class.getProtectionDomain().getCodeSource()
@@ -128,10 +129,26 @@ public final class GitMonitorMcpServer implements AutoCloseable {
 
     private static String quote(String value) { return "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\""; }
 
+    private static boolean commandExists(String command) {
+        String path = System.getenv("PATH");
+        if (path == null) return false;
+        for (String directory : path.split(java.io.File.pathSeparator)) {
+            if (java.nio.file.Files.isExecutable(Path.of(directory, command))) return true;
+        }
+        return false;
+    }
+
     public static void main(String[] args) {
+        int exitCode = run();
+        if (exitCode != 0) System.exit(exitCode);
+    }
+
+    static int run() {
         try (GitMonitorMcpServer ignored = new GitMonitorMcpServer()) {
             Thread.currentThread().join();
+            return 0;
         } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-        catch (RuntimeException e) { System.err.println("Git monitor MCP: не удалось запустить сервер."); }
+        catch (RuntimeException e) { System.err.println("Git monitor MCP: не удалось запустить сервер."); return 2; }
+        return 0;
     }
 }

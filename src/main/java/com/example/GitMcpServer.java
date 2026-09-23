@@ -92,9 +92,12 @@ public final class GitMcpServer implements AutoCloseable {
 
     public static String command(Path allowedRoot) {
         try {
-            String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
             Path location = Path.of(GitMcpServer.class.getProtectionDomain().getCodeSource()
                     .getLocation().toURI()).toAbsolutePath();
+            if (java.nio.file.Files.isRegularFile(location) && commandExists("ai-agent")) {
+                return "ai-agent --mcp-server git --repo-root " + quote(allowedRoot.toString());
+            }
+            String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
             String classpath = location.toString();
             if (java.nio.file.Files.isDirectory(location)) {
                 String runtimeClasspath = System.getProperty("java.class.path", "");
@@ -113,19 +116,37 @@ public final class GitMcpServer implements AutoCloseable {
         return "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
     }
 
+    private static boolean commandExists(String command) {
+        String path = System.getenv("PATH");
+        if (path == null) return false;
+        for (String directory : path.split(java.io.File.pathSeparator)) {
+            if (java.nio.file.Files.isExecutable(Path.of(directory, command))) return true;
+        }
+        return false;
+    }
+
     public static void main(String[] args) {
+        int exitCode = run(args);
+        if (exitCode != 0) System.exit(exitCode);
+    }
+
+    static int run(String[] args) {
         if (args.length != 2 || !ROOT_ARGUMENT.equals(args[0])) {
             System.err.println("Git MCP: требуется " + ROOT_ARGUMENT + " <корень репозитория>");
-            return;
+            return 2;
         }
         try (GitMcpServer ignored = new GitMcpServer(Path.of(args[1]))) {
             Thread.currentThread().join();
+            return 0;
         } catch (GitRepositoryReader.GitRepositoryException e) {
             System.err.println("Git MCP: " + e.getMessage());
+            return 2;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            return 0;
         } catch (RuntimeException e) {
             System.err.println("Git MCP: не удалось запустить сервер.");
+            return 2;
         }
     }
 }
