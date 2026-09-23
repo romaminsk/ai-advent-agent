@@ -4,10 +4,12 @@ After=network-online.target
 
 [Service]
 ExecStart=%h/.local/bin/ai-agent --background
+Environment=LANG=C.UTF-8 LC_ALL=C.UTF-8
 Restart=on-failure
 RestartSec=10s
 TimeoutStopSec=30s
 NoNewPrivileges=true
+SuccessExitStatus=143
 
 [Install]
 WantedBy=default.target

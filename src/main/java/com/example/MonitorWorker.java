@@ -40,8 +40,13 @@ public final class MonitorWorker {
     }
 
     public int run() {
+        installSignalHandler(Thread.currentThread());
         try {
             Files.createDirectories(dir);
+            if (!running.get()) {
+                writeHeartbeat("stopped", 0);
+                return 0;
+            }
             try (FileChannel channel = FileChannel.open(lockPath, StandardOpenOption.CREATE,
                     StandardOpenOption.READ, StandardOpenOption.WRITE)) {
                 FileLock lock;
@@ -50,6 +55,10 @@ public final class MonitorWorker {
                 if (lock == null) {
                     System.err.println("Monitor worker уже запущен.");
                     return 2;
+                }
+                if (!running.get()) {
+                    writeHeartbeat("stopped", 0);
+                    return 0;
                 }
                 ownerOnly(lockPath);
                 FileLock heldLock = lock;
@@ -69,7 +78,6 @@ public final class MonitorWorker {
             writeHeartbeat("stopped", activeSchedules());
         }, "monitor-worker-stop");
         Runtime.getRuntime().addShutdownHook(shutdown);
-        installSignalHandler(workerThread);
         long lastHeartbeat = 0;
         startedAt = Instant.now(clock).toString();
         writeHeartbeat("running", 0);
@@ -81,7 +89,11 @@ public final class MonitorWorker {
                     writeHeartbeat("running", activeSchedules());
                     lastHeartbeat = now;
                 }
-                tick(MonitorStore.openDefault());
+                try {
+                    tick(MonitorStore.openDefault());
+                } catch (RuntimeException e) {
+                    if (running.get()) throw e;
+                }
                 try { Thread.sleep(POLL_MILLIS); }
                 catch (InterruptedException e) { running.set(false); Thread.currentThread().interrupt(); }
             }

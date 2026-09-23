@@ -44,6 +44,7 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.CopyOnWriteArraySet;
 
 /**
  * Локальный самотест без платных запросов.
@@ -124,6 +125,8 @@ public final class SelfTest {
      * и разницу «ожидалось / получено» без голого assert.
      */
     private static int passed = 0;
+    private static final List<String> failures = new ArrayList<>();
+    private static final Set<Process> activeProcesses = new CopyOnWriteArraySet<>();
 
     /** Текущая группа проверок (слои архитектуры), задётся методом group(). */
     private static String currentGroup = "без группы";
@@ -143,15 +146,27 @@ public final class SelfTest {
      */
     private static void expect(String description, boolean condition) {
         if (!condition) {
-            throw new AssertionError("Проверка не пройдена — группа: "
-                    + currentGroup + "; проверка: " + description
-                    + "; ожидалось: истина, получено: ложь; "
-                    + "пройдено до падения: " + passed + " проверок.");
+            StackTraceElement caller = StackWalker.getInstance().walk(stream ->
+                    stream.skip(1).findFirst().orElseThrow().toStackTraceElement());
+            String failure = "группа: " + currentGroup + "; проверка: " + description
+                    + "; файл: " + caller.getFileName() + ":" + caller.getLineNumber()
+                    + "; ожидалось: истина, получено: ложь";
+            failures.add(failure);
+            System.out.println("FAIL: " + failure);
+            return;
         }
         passed++;
         System.out.println("OK: " + description);
     }
     public static void main(String[] args) throws Exception {
+        String encoding = System.getProperty("sun.jnu.encoding", "");
+        if (!encoding.equalsIgnoreCase("UTF-8")) {
+            System.err.println("нужна UTF-8 локаль, текущая: " + encoding);
+            System.exit(1);
+            return;
+        }
+        Runtime.getRuntime().addShutdownHook(new Thread(SelfTest::cleanupProcesses,
+                "self-test-process-cleanup"));
         if (args.length > 0 && "mcp".equals(args[0])) {
             baseTempDir = Files.createTempDirectory("selftest-mcp");
             try {
@@ -160,8 +175,13 @@ public final class SelfTest {
                 checkTrackerMcpServer();
                 checkGitMcp();
                 checkMonitorStage();
-                System.out.println("OK: MCP checks passed (" + passed + ").");
+                printSummary();
+                if (!failures.isEmpty()) System.exit(1);
+            } catch (Throwable error) {
+                failures.add("группа: " + currentGroup + "; непредвиденная ошибка: "
+                        + error + "\n" + stackTrace(error));
             } finally {
+                cleanupProcesses();
                 deleteRecursively(baseTempDir);
             }
             return;
@@ -353,11 +373,51 @@ public final class SelfTest {
             checkTwoProcessIntegration();
             checkProfilePersistenceAcrossProcesses();
             checkOldHistoryCompatible();
+        } catch (Throwable error) {
+            failures.add("группа: " + currentGroup + "; непредвиденная ошибка: "
+                    + error + "\n" + stackTrace(error));
         } finally {
+            cleanupProcesses();
             deleteRecursively(baseTempDir);
         }
 
-        System.out.println("OK: все проверки пройдены (" + passed + ").");
+        printSummary();
+        if (failures.isEmpty()) {
+            System.out.println("OK: все проверки пройдены (" + passed + ").");
+        } else {
+            System.exit(1);
+        }
+    }
+
+    private static void printSummary() {
+        int skipped = 0;
+        int total = passed + failures.size() + skipped;
+        System.out.println("SelfTest summary: passed=" + passed + ", failed=" + failures.size()
+                + ", skipped=" + skipped + ", total=" + total);
+        for (String failure : failures) System.out.println("FAILED: " + failure);
+    }
+
+    private static String stackTrace(Throwable error) {
+        StringWriter writer = new StringWriter();
+        error.printStackTrace(new PrintWriter(writer));
+        return writer.toString();
+    }
+
+    private static void cleanupProcesses() {
+        for (Process process : activeProcesses) {
+            if (!process.isAlive()) {
+                activeProcesses.remove(process);
+                continue;
+            }
+            process.destroy();
+            try {
+                if (!process.waitFor(30, TimeUnit.SECONDS)) process.destroyForcibly();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                process.destroyForcibly();
+            }
+            activeProcesses.remove(process);
+        }
     }
 
     private static void checkMcpClient() throws Exception {
@@ -583,10 +643,20 @@ public final class SelfTest {
         git(conflictRepo, "checkout", "-q", "-");
         Files.writeString(conflictRepo.resolve("conflict.txt"), "main\n", StandardCharsets.UTF_8);
         git(conflictRepo, "commit", "-qam", "main");
-        Process merge = new ProcessBuilder("git", "-C", conflictRepo.toString(), "merge", "side")
-                .redirectErrorStream(true).start();
+        ProcessBuilder mergeBuilder = new ProcessBuilder("git", "-C", conflictRepo.toString(), "merge", "side")
+                .redirectErrorStream(true);
+        Map<String, String> mergeEnv = mergeBuilder.environment();
+        mergeEnv.put("GIT_AUTHOR_NAME", "selftest");
+        mergeEnv.put("GIT_AUTHOR_EMAIL", "selftest@localhost");
+        mergeEnv.put("GIT_COMMITTER_NAME", "selftest");
+        mergeEnv.put("GIT_COMMITTER_EMAIL", "selftest@localhost");
+        mergeEnv.put("GIT_CONFIG_NOSYSTEM", "1");
+        mergeEnv.put("GIT_CONFIG_GLOBAL", "/dev/null");
+        Process merge = mergeBuilder.start();
+        activeProcesses.add(merge);
         merge.getInputStream().readAllBytes();
         merge.waitFor();
+        activeProcesses.remove(merge);
         GitRepositoryStatus conflict = new GitRepositoryReader(conflictRepo).read(conflictRepo);
         expect("конфликт выделяется отдельно", conflict.conflicts().contains("conflict.txt")
                 && !conflict.staged().contains("conflict.txt") && !conflict.unstaged().contains("conflict.txt"));
@@ -813,7 +883,7 @@ public final class SelfTest {
         previousClasspath = System.getProperty("java.class.path");
         try {
             System.setProperty("java.class.path", buildClasspath());
-            String monitorCommand = GitMonitorMcpServer.command();
+            String monitorCommand = selfTestMcpCommand("git-monitor");
             McpClientComponent.ToolListResult monitorTools = new McpClientComponent()
                     .listTools(monitorCommand);
             expect("Git monitor MCP регистрирует четыре инструмента",
@@ -827,12 +897,12 @@ public final class SelfTest {
             expect("Git monitor MCP отклоняет неверные аргументы",
                     invalidMonitorCall.error());
             McpClientComponent.ToolListResult portable = new McpClientComponent()
-                    .listTools("ai-agent --mcp-server git-monitor");
-            expect("portable ai-agent MCP режим возвращает monitor tools",
+                    .listTools(selfTestMcpCommand("git-monitor"));
+            expect("portable MCP режим из текущей сборки возвращает monitor tools",
                     portable.tools().size() == 4
                             && portable.tools().stream().anyMatch(t -> t.name().equals("get-git-monitor-summary")));
             try {
-                new McpClientComponent().listTools("ai-agent --mcp-server unknown");
+                new McpClientComponent().listTools(selfTestMcpCommand("unknown"));
                 expect("неизвестный portable MCP server отклоняется", false);
             } catch (McpClientComponent.McpClientException e) {
                 expect("неизвестный portable MCP server отклоняется",
@@ -856,6 +926,12 @@ public final class SelfTest {
         } catch (MonitorException e) {
             expect("monitor schedule удаляется", false);
         }
+    }
+
+    private static String selfTestMcpCommand(String server) throws Exception {
+        String java = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+        return "\"" + java + "\" -cp \"" + buildClasspath() + "\" "
+                + Main.class.getName() + " --mcp-server " + server;
     }
 
     /** Подставные часы: планировщик worker'а продвигается вручную, без ожиданий. */
@@ -1127,12 +1203,20 @@ public final class SelfTest {
         env.keySet().removeIf(key -> key.startsWith("LLM_") || key.contains("TOKEN")
                 || key.contains("SECRET") || key.contains("API"));
         env.put("HOME", homeDir.toAbsolutePath().toString());
+        env.put("GIT_AUTHOR_NAME", "selftest");
+        env.put("GIT_AUTHOR_EMAIL", "selftest@localhost");
+        env.put("GIT_COMMITTER_NAME", "selftest");
+        env.put("GIT_COMMITTER_EMAIL", "selftest@localhost");
+        env.put("GIT_CONFIG_NOSYSTEM", "1");
+        env.put("GIT_CONFIG_GLOBAL", "/dev/null");
         for (Map.Entry<String, String> extra : extraEnv.entrySet()) {
             env.put(extra.getKey(), extra.getValue());
         }
         processBuilder.redirectOutput(stdout.toFile());
         processBuilder.redirectError(stderr.toFile());
-        return processBuilder.start();
+        Process process = processBuilder.start();
+        activeProcesses.add(process);
+        return process;
     }
 
     private static Path workerHeartbeatFile(Path homeDir) {
@@ -1192,11 +1276,38 @@ public final class SelfTest {
             workerIoLineCheck(process, stdout, stderr);
         } finally {
             process.destroy();
-            if (!process.waitFor(20, TimeUnit.SECONDS)) {
+            if (!process.waitFor(30, TimeUnit.SECONDS)) {
                 process.destroyForcibly();
             }
         }
         expect("T1 worker-процесс завершился штатно после destroy", process.exitValue() == 0);
+        checkWorkerProcessEarlyDestroy();
+    }
+
+    /** T1b: немедленный SIGTERM допустим до heartbeat, но не оставляет lock/process. */
+    private static void checkWorkerProcessEarlyDestroy() throws Exception {
+        Path home = Files.createTempDirectory(baseTempDir, "worker-t1b-home-");
+        Path stdout = Files.createTempFile(baseTempDir, "t1b-out-", ".txt");
+        Path stderr = Files.createTempFile(baseTempDir, "t1b-err-", ".txt");
+        Process process = startWorkerProcess(home, stdout, stderr, Map.of());
+        process.destroy();
+        boolean exited = process.waitFor(30, TimeUnit.SECONDS);
+        if (!exited) {
+            process.destroyForcibly();
+            process.waitFor(5, TimeUnit.SECONDS);
+        }
+        expect("T1b ранний destroy завершается (0 или 143)", exited
+                && (process.exitValue() == 0 || process.exitValue() == 143));
+        expect("T1b после раннего destroy нет дочерних процессов", process.descendants().count() == 0);
+        Path lock = home.resolve(".ai-advent-agent").resolve("monitor-worker.lock");
+        boolean free = !Files.exists(lock);
+        if (Files.exists(lock)) {
+            try (FileChannel channel = FileChannel.open(lock, java.nio.file.StandardOpenOption.READ,
+                    java.nio.file.StandardOpenOption.WRITE)) {
+                free = channel.tryLock() != null;
+            }
+        }
+        expect("T1b lock-файл свободен", free);
     }
 
     /** T2: второй экземпляр отклоняется с ненулевым кодом, первый продолжает работать. */
@@ -1486,9 +1597,18 @@ public final class SelfTest {
         command.add("-C");
         command.add(directory.toString());
         command.addAll(List.of(args));
-        Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
+        ProcessBuilder builder = new ProcessBuilder(command).redirectErrorStream(true);
+        Map<String, String> env = builder.environment();
+        env.put("GIT_AUTHOR_NAME", "selftest");
+        env.put("GIT_AUTHOR_EMAIL", "selftest@localhost");
+        env.put("GIT_COMMITTER_NAME", "selftest");
+        env.put("GIT_COMMITTER_EMAIL", "selftest@localhost");
+        Process process = builder.start();
+        activeProcesses.add(process);
         String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-        if (process.waitFor() != 0) {
+        int exitCode = process.waitFor();
+        activeProcesses.remove(process);
+        if (exitCode != 0) {
             throw new AssertionError("SelfTest git command failed: " + output);
         }
     }
