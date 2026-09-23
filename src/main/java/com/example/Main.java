@@ -32,6 +32,11 @@ public final class Main {
             if (exitCode != 0) System.exit(exitCode);
             return;
         }
+        if (args.length == 1 && "--background".equals(args[0])) {
+            int exitCode = new MonitorWorker().run();
+            if (exitCode != 0) System.exit(exitCode);
+            return;
+        }
         boolean plainRequested = false;
         for (String arg : args) {
             if ("--help".equals(arg) || "-h".equals(arg)) {
@@ -3286,6 +3291,10 @@ public final class Main {
                 }
                 return;
             }
+            if (rest.equals("worker status")) {
+                ui.showSystem(MonitorWorker.formatStatus());
+                return;
+            }
             if (rest.startsWith("add ")) {
                 java.util.regex.Matcher matcher = java.util.regex.Pattern.compile(
                         "^(.+?)\\s+(\\d+[smh])(?:\\s+summary\\s+(\\d+[smh]))?$").matcher(rest.substring(4).trim());
@@ -3332,6 +3341,8 @@ public final class Main {
                     ui.showSystem("Расписание " + schedule.id() + ": "
                             + (schedule.enabled() ? "enabled" : "disabled")
                             + ", запусков: " + runs.size()
+                            + ", missedCount=" + schedule.missedCount()
+                            + ", nextRunAt=" + (schedule.nextRunAt() == null ? "нет" : schedule.nextRunAt())
                             + (runs.isEmpty() ? "" : "\n" + formatMonitorRun(runs.get(runs.size() - 1))));
                 }
                 return;
@@ -3707,6 +3718,7 @@ public final class Main {
         out.println("/mcp explain (объяснить последний Git-снимок моделью),");
         out.println("/mcp monitor tools, /mcp monitor call <tool> <JSON-аргументы>,");
         out.println("/monitor add|list|enable|disable|remove|run|status|summary,");
+        out.println("/monitor worker status, ai-agent --background,");
         out.println("/context [full|summary], /context compare <вопрос>, /summary [refresh],");
         out.println("/multiline, /exit (также exit, quit).");
     }

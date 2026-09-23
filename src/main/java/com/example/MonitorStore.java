@@ -87,6 +87,15 @@ public final class MonitorStore {
         });
     }
 
+    public MonitorSchedule setTiming(String id, long missedCount, String nextRunAt) {
+        return withLock(state -> {
+            MonitorSchedule current = requireSchedule(state, id);
+            MonitorSchedule next = current.withTiming(missedCount, nextRunAt);
+            state.schedules.put(id, next);
+            return next;
+        });
+    }
+
     public void remove(String id) {
         withLock(state -> {
             requireSchedule(state, id);

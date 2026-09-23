@@ -1,0 +1,13 @@
+[Unit]
+Description=ai-agent git monitor
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/ai-agent --background
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=30s
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

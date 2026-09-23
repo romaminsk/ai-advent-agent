@@ -332,6 +332,7 @@ public interface TerminalUi extends AutoCloseable {
                       /monitor list
                       /monitor enable|disable|remove <id>
                       /monitor run|status|summary <id>
+                      /monitor worker status
 
                     Эффекты
                       add/list/enable/disable/remove изменяют только JSON-хранилище

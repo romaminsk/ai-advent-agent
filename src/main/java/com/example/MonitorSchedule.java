@@ -35,6 +35,11 @@ public record MonitorSchedule(String id, String repositoryRoot, long intervalSec
                 value, missedCount, nextRunAt, createdAt, Instant.now().toString());
     }
 
+    public MonitorSchedule withTiming(long missed, String nextRun) {
+        return new MonitorSchedule(id, repositoryRoot, intervalSeconds, summaryIntervalSeconds,
+                enabled, missed, nextRun, createdAt, Instant.now().toString());
+    }
+
     public static Duration parseInterval(String raw, String field, long minSeconds, long maxSeconds) {
         if (raw == null || raw.isBlank()) {
             throw new MonitorException(field + " обязателен в формате <число>s|m|h.");

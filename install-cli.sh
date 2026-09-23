@@ -190,7 +190,8 @@ case ":$PATH:" in
         echo
         echo "Каталог ~/.local/bin отсутствует в PATH. Настройте вручную:"
         echo "  текущая сессия:   export PATH=\"\$HOME/.local/bin:\$PATH\""
-        echo "  постоянно (zsh):  добавьте ту же строку в ~/.zshrc и выполните: source ~/.zshrc"
+        echo "  постоянно (bash): добавьте ту же строку в ~/.bashrc у Ubuntu или"
+        echo "  в ~/.zshrc на macOS и выполните: source ~/.bashrc (или ~/.zshrc)"
         echo "После PATH-настройки запустите: ai-agent"
         ;;
 esac

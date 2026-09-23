@@ -25,6 +25,7 @@ import java.math.BigDecimal;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.net.http.HttpClient;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -310,6 +311,22 @@ public final class SelfTest {
             checkTrackerMcpServer();
             checkGitMcp();
             checkMonitorStage();
+            group("Worker планировщик");
+            checkWorkerSchedulerInterval();
+            checkWorkerCoalesce();
+            checkWorkerBusyTicker();
+            checkWorkerSummaryRetention();
+            checkWorkerStoreRefresh();
+            checkWorkerScheduleIsolation();
+            group("Worker процесс");
+            checkWorkerProcessStarts();
+            checkWorkerSecondInstanceRejected();
+            checkWorkerHeartbeatAndShutdown();
+            checkWorkerNoSecretLeak();
+            group("Store и runner отказы");
+            checkStoreAtomicWriteFailure();
+            checkStoreConcurrentWriters();
+            checkRunnerRetrySilentMcp();
 
             // --- Режим измерений /demo ---
             group("Измерения");
@@ -840,6 +857,605 @@ public final class SelfTest {
             expect("monitor schedule удаляется", false);
         }
     }
+
+    /** Подставные часы: планировщик worker'а продвигается вручную, без ожиданий. */
+    private static final class FakeClock extends java.time.Clock {
+        private Instant current;
+
+        FakeClock(Instant start) {
+            this.current = start;
+        }
+
+        @Override
+        public java.time.ZoneId getZone() {
+            return java.time.ZoneOffset.UTC;
+        }
+
+        @Override
+        public java.time.Clock withZone(java.time.ZoneId zone) {
+            return this;
+        }
+
+        @Override
+        public Instant instant() {
+            return current;
+        }
+
+        void advanceSeconds(long seconds) {
+            current = current.plusSeconds(seconds);
+        }
+    }
+
+    /** Временный store для worker-тестов: только временные каталоги. */
+    private static MonitorStore workerStore(String label) throws IOException {
+        Path file = Files.createTempDirectory(baseTempDir, "worker-" + label + "-")
+                .resolve("git-monitor.json");
+        return new MonitorStore(file);
+    }
+
+    /** Создаёт реальный временный git-репозиторий и расписание для него. */
+    private static MonitorSchedule workerSchedule(MonitorStore store, Path baseTemp,
+                                                  String label) throws Exception {
+        Path repo = Files.createTempDirectory(baseTemp, "worker-" + label + "-repo-");
+        git(repo, "init", "-q");
+        return store.create(repo.toRealPath().toString(),
+                Duration.ofSeconds(30), Duration.ofMinutes(1));
+    }
+
+    /** Классpath для дочерних JVM MCP-сервера (тот же приём, что в checkMonitorStage). */
+    private static String withChildClasspath() {
+        try {
+            return buildClasspath();
+        } catch (Exception e) {
+            throw new AssertionError("buildClasspath failed", e);
+        }
+    }
+
+    private static final class ClasspathOverride implements AutoCloseable {
+        private final String previous;
+
+        ClasspathOverride() {
+            previous = System.getProperty("java.class.path");
+            System.setProperty("java.class.path", withChildClasspath());
+        }
+
+        @Override
+        public void close() {
+            System.setProperty("java.class.path", previous);
+        }
+    }
+
+    /** T4: запуск по interval; disabled не запускается; remove во время запуска не создаёт запись. */
+    private static void checkWorkerSchedulerInterval() throws Exception {
+        MonitorStore store = workerStore("t4");
+        FakeClock clock = new FakeClock(Instant.parse("2026-01-01T00:00:00Z"));
+        MonitorWorker worker = new MonitorWorker(clock);
+        MonitorSchedule schedule = workerSchedule(store, baseTempDir, "t4");
+
+        try (ClasspathOverride ignored = new ClasspathOverride()) {
+            worker.tick(store);
+        }
+        MonitorSchedule afterFirst = store.schedule(schedule.id());
+        expect("T4 первый тик запускает расписание (nextRunAt = now + interval)",
+                afterFirst.nextRunAt().equals(clock.instant().plusSeconds(30).toString()));
+        expect("T4 первый тик создаёт ровно один успешный запуск",
+                store.runs(schedule.id()).size() == 1
+                        && store.runs(schedule.id()).get(0).success());
+
+        store.setEnabled(schedule.id(), false);
+        clock.advanceSeconds(60);
+        worker.tick(store);
+        expect("T4 отключённое расписание не запускается тиком",
+                store.schedule(schedule.id()).nextRunAt()
+                        .equals(clock.instant().minusSeconds(30).toString())
+                        && store.runs(schedule.id()).size() == 1);
+
+        // Удаление: нагрузочный тик после remove не создаёт новых записей,
+        // а запись в store для удалённого id невозможна (guard на уровне store).
+        store.setEnabled(schedule.id(), true);
+        store.remove(schedule.id());
+        clock.advanceSeconds(60);
+        worker.tick(store);
+        expect("T4 тик после remove не создаёт записей для удалённого расписания",
+                store.schedule(schedule.id()) == null
+                        && store.runs(schedule.id()).isEmpty()
+                        && store.summaries(schedule.id()).isEmpty());
+        MonitorRun removedRun = new MonitorRun(schedule.id(), Instant.now().toString(),
+                Instant.now().toString(), true, 1, "main", false, null, true, 0, 0, 0, 0,
+                null, null);
+        try {
+            store.record(removedRun, null, null);
+            expect("T4 запись для удалённого расписания отклоняется store", false);
+        } catch (MonitorException e) {
+            expect("T4 запись для удалённого расписания отклоняется store", true);
+        }
+        expect("T4 после отклонённой записи run-ов для удалённого id нет",
+                store.runs(schedule.id()).isEmpty());
+    }
+
+    /** T6: простой в 3 интервала -> ровно один coalesce-запуск, missedCount верен. */
+    private static void checkWorkerCoalesce() throws Exception {
+        MonitorStore store = workerStore("t6");
+        FakeClock clock = new FakeClock(Instant.parse("2026-01-01T00:00:00Z"));
+        MonitorWorker worker = new MonitorWorker(clock);
+        MonitorSchedule schedule = workerSchedule(store, baseTempDir, "t6");
+        store.setTiming(schedule.id(), 0, clock.instant().toString());
+        clock.advanceSeconds(95);
+
+        try (ClasspathOverride ignored = new ClasspathOverride()) {
+            worker.tick(store);
+        }
+        MonitorSchedule after = store.schedule(schedule.id());
+        expect("T6 простой в 3 интервала даёт ровно один запуск",
+                store.runs(schedule.id()).size() == 1);
+        expect("T6 missedCount после пропуска = 3",
+                after != null && after.missedCount() == 3);
+        expect("T6 следующий запуск через один интервал",
+                after != null && after.nextRunAt().equals(clock.instant().plusSeconds(30).toString()));
+    }
+
+    /** T7: занятый runtime-lock -> тик пропущен с BUSY, без ожидания таймаута. */
+    private static void checkWorkerBusyTicker() throws Exception {
+        MonitorStore store = workerStore("t7");
+        FakeClock clock = new FakeClock(Instant.parse("2026-01-01T00:00:00Z"));
+        MonitorWorker worker = new MonitorWorker(clock);
+        MonitorSchedule schedule = workerSchedule(store, baseTempDir, "t7");
+        store.setTiming(schedule.id(), 0, clock.instant().toString());
+        clock.advanceSeconds(30);
+
+        long start = System.nanoTime();
+        try (MonitorStore.RuntimeLease lease = store.tryRuntimeLock(schedule.id())) {
+            worker.tick(store);
+        }
+        long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+        expect("T7 занятый runtime-lock приводит ровно к одному BUSY-запуску",
+                store.runs(schedule.id()).size() == 1
+                        && "BUSY".equals(store.runs(schedule.id()).get(0).errorCode())
+                        && store.runs(schedule.id()).get(0).attempt() == 0);
+        expect("T7 тик не ждёт таймаута (меньше 5 с)",
+                elapsedMillis < 5_000);
+    }
+
+    /** T9: сводка по summaryInterval после тика; retention 50 соблюдается. */
+    private static void checkWorkerSummaryRetention() throws Exception {
+        MonitorStore store = workerStore("t9");
+        FakeClock clock = new FakeClock(Instant.parse("2026-01-01T00:00:00Z"));
+        MonitorWorker worker = new MonitorWorker(clock);
+        MonitorSchedule schedule = workerSchedule(store, baseTempDir, "t9");
+
+        try (ClasspathOverride ignored = new ClasspathOverride()) {
+            worker.tick(store);
+            clock.advanceSeconds(30);
+            worker.tick(store);
+        }
+        expect("T9 каждый запуск тика добавляет ровно одну сводку",
+                store.summaries(schedule.id()).size() == 2);
+        MonitorSummary latest = store.summaries(schedule.id()).get(1);
+        expect("T9 окно сводки соответствует summaryInterval",
+                latest.windowStart() != null
+                        && latest.windowEnd() != null
+                        && java.time.Instant.parse(latest.windowStart())
+                                .isBefore(java.time.Instant.now()));
+        expect("T9 сводка фиксирует успех последнего запуска",
+                latest.successCount() == 2 && latest.failureCount() == 0
+                        && Boolean.TRUE.equals(latest.clean()));
+
+        for (int i = 0; i < 53; i++) {
+            store.recordSummary(new MonitorSummary(schedule.id(),
+                    Instant.now().minusSeconds(60).toString(), Instant.now().toString(),
+                    0, 0, 0, null, null, null, 0, 0, 0, 0, null, null, null, null,
+                    List.of(), List.of(), false));
+        }
+        expect("T9 retention сводок не превышает 50", store.summaries(schedule.id()).size() == 50);
+    }
+
+    /** T5: изменения store извне подхватываются работающим worker'ом без перезапуска. */
+    private static void checkWorkerStoreRefresh() throws Exception {
+        MonitorStore store = workerStore("t5");
+        FakeClock clock = new FakeClock(Instant.parse("2026-01-01T00:00:00Z"));
+        MonitorWorker worker = new MonitorWorker(clock);
+        MonitorSchedule first = workerSchedule(store, baseTempDir, "t5a");
+        store.setTiming(first.id(), 0, clock.instant().toString());
+        clock.advanceSeconds(30);
+
+        // «Внешнее» изменение: новое расписание и отключение первого.
+        MonitorSchedule second = workerSchedule(store, baseTempDir, "t5b");
+        store.setEnabled(first.id(), false);
+
+        try (ClasspathOverride ignored = new ClasspathOverride()) {
+            worker.tick(store);
+        }
+        expect("T5 отключённое извне расписание не запускается",
+                store.runs(first.id()).isEmpty());
+        expect("T5 новое расписание запускается существующим worker'ом (тот же объект)",
+                store.runs(second.id()).size() == 1
+                        && store.runs(second.id()).get(0).success());
+
+        // Внешнее включение первого обратно -> следующий тик запускает и его.
+        store.setEnabled(first.id(), true);
+        clock.advanceSeconds(30);
+        try (ClasspathOverride ignored = new ClasspathOverride()) {
+            worker.tick(store);
+        }
+        expect("T5 повторное включение извне подхватывается без перезапуска",
+                store.runs(first.id()).size() == 1);
+    }
+
+    /** T8: занятое/зависшее расписание не блокирует другое расписание того же worker'а. */
+    private static void checkWorkerScheduleIsolation() throws Exception {
+        MonitorStore store = workerStore("t8");
+        FakeClock clock = new FakeClock(Instant.parse("2026-01-01T00:00:00Z"));
+        MonitorWorker worker = new MonitorWorker(clock);
+        MonitorSchedule busy = workerSchedule(store, baseTempDir, "t8a");
+        MonitorSchedule healthy = workerSchedule(store, baseTempDir, "t8b");
+        store.setTiming(busy.id(), 0, clock.instant().toString());
+        store.setTiming(healthy.id(), 0, clock.instant().toString());
+        clock.advanceSeconds(30);
+
+        // «Зависший» запуск: один тик держит runtime-lock (как застрявший MCP),
+        // тик одного прохода должен немедленно пропустить busy и выполнить healthy.
+        long start = System.nanoTime();
+        try (MonitorStore.RuntimeLease stuck = store.tryRuntimeLock(busy.id())) {
+            try (ClasspathOverride ignored = new ClasspathOverride()) {
+                worker.tick(store);
+            }
+        }
+        long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+        expect("T8 застрявшее расписание даёт BUSY, не блокируя тик",
+                store.runs(busy.id()).size() == 1
+                        && "BUSY".equals(store.runs(busy.id()).get(0).errorCode()));
+        expect("T8 здоровое расписание того же тика выполняется успешно",
+                store.runs(healthy.id()).size() == 1
+                        && store.runs(healthy.id()).get(0).success());
+        expect("T8 общий тик не ждал таймаута зависшего (меньше 8 с)",
+                elapsedMillis < 8_000);
+    }
+
+    // ---------- T1–T3, T10: worker как отдельный процесс ----------
+
+    /** Запускает `com.example.Main --background` отдельной JVM с временным HOME. */
+    private static Process startWorkerProcess(Path homeDir, Path stdout, Path stderr,
+                                              Map<String, String> extraEnv) throws Exception {
+        String javaBin = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+        List<String> command = List.of(javaBin,
+                "-Duser.home=" + homeDir.toAbsolutePath(),
+                "-cp", withChildClasspath(),
+                "com.example.Main", "--background");
+        ProcessBuilder processBuilder = new ProcessBuilder(command);
+        Map<String, String> env = processBuilder.environment();
+        // Никаких ключей модели и прочих секретов родительского окружения.
+        env.keySet().removeIf(key -> key.startsWith("LLM_") || key.contains("TOKEN")
+                || key.contains("SECRET") || key.contains("API"));
+        env.put("HOME", homeDir.toAbsolutePath().toString());
+        for (Map.Entry<String, String> extra : extraEnv.entrySet()) {
+            env.put(extra.getKey(), extra.getValue());
+        }
+        processBuilder.redirectOutput(stdout.toFile());
+        processBuilder.redirectError(stderr.toFile());
+        return processBuilder.start();
+    }
+
+    private static Path workerHeartbeatFile(Path homeDir) {
+        return homeDir.resolve(".ai-advent-agent").resolve("monitor-worker.json");
+    }
+
+    /** Ждёт появления heartbeat с ожидаемым состоянием. */
+    private static String awaitWorkerHeartbeat(Path homeDir, String state, long seconds)
+            throws Exception {
+        Path file = workerHeartbeatFile(homeDir);
+        long deadline = System.nanoTime() + seconds * 1_000_000_000L;
+        String result = null;
+        while (System.nanoTime() < deadline) {
+            if (Files.exists(file)) {
+                try {
+                    String content = Files.readString(file, StandardCharsets.UTF_8);
+                    String actualState = MAPPER.readTree(content).path("state").asText(null);
+                    if (state.equals(actualState)) {
+                        return content;
+                    }
+                    result = content;
+                } catch (Exception readError) {
+                    // файл мог быть только что перезаписан — пробуем дальше
+                }
+            }
+            Thread.sleep(100);
+        }
+        throw new AssertionError("heartbeat \"" + state + "\" не появился за " + seconds
+                + " с; последний: " + result);
+    }
+
+    private static String workerIoLineCheck(Process process, Path stdout, Path stderr)
+            throws Exception {
+        String output = Files.readString(stdout, StandardCharsets.UTF_8);
+        String errors = Files.readString(stderr, StandardCharsets.UTF_8);
+        // Все содержательные строки stdout — служебные строки worker'а,
+        // без интерфейса терминала и обращений к модели.
+        for (String line : output.split("\\R")) {
+            if (!line.isBlank()) {
+                expect("T1 stdout worker'а содержит только служебные строки",
+                        line.contains("monitor-worker"));
+            }
+        }
+        expect("T1 stderr worker'а пуст", errors.isBlank());
+        return output;
+    }
+
+    /** T1: --background стартует без токена модели, без TerminalUi и LlmAgent. */
+    private static void checkWorkerProcessStarts() throws Exception {
+        Path home = Files.createTempDirectory(baseTempDir, "worker-t1-home-");
+        Path stdout = Files.createTempFile(baseTempDir, "t1-out-", ".txt");
+        Path stderr = Files.createTempFile(baseTempDir, "t1-err-", ".txt");
+        Process process = startWorkerProcess(home, stdout, stderr, Map.of());
+        try {
+            awaitWorkerHeartbeat(home, "running", 30);
+            expect("T1 worker-процесс жив без LLM_API_KEY", process.isAlive());
+            workerIoLineCheck(process, stdout, stderr);
+        } finally {
+            process.destroy();
+            if (!process.waitFor(20, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+            }
+        }
+        expect("T1 worker-процесс завершился штатно после destroy", process.exitValue() == 0);
+    }
+
+    /** T2: второй экземпляр отклоняется с ненулевым кодом, первый продолжает работать. */
+    private static void checkWorkerSecondInstanceRejected() throws Exception {
+        Path home = Files.createTempDirectory(baseTempDir, "worker-t2-home-");
+        Path stdoutA = Files.createTempFile(baseTempDir, "t2-out-", ".txt");
+        Path stderrA = Files.createTempFile(baseTempDir, "t2-err-", ".txt");
+        Process first = startWorkerProcess(home, stdoutA, stderrA, Map.of());
+        try {
+            awaitWorkerHeartbeat(home, "running", 30);
+            Path stdoutB = Files.createTempFile(baseTempDir, "t2b-out-", ".txt");
+            Path stderrB = Files.createTempFile(baseTempDir, "t2b-err-", ".txt");
+            Process second = startWorkerProcess(home, stdoutB, stderrB, Map.of());
+            expect("T2 второй worker завершается сам (<= 30 с)",
+                    second.waitFor(30, TimeUnit.SECONDS));
+            expect("T2 второй worker возвращает ненулевой код выхода",
+                    second.exitValue() != 0);
+            String errorText = Files.readString(stderrB, StandardCharsets.UTF_8);
+            expect("T2 ошибка второго worker'а понятна", errorText.contains("уже запущен"));
+            expect("T2 вывод второго worker'а не упоминает пути сборки",
+                    !errorText.contains("target/") && !errorText.contains("java -cp"));
+            expect("T2 первый worker продолжает работать после попытки второго",
+                    first.isAlive());
+        } finally {
+            first.destroy();
+            if (!first.waitFor(20, TimeUnit.SECONDS)) {
+                first.destroyForcibly();
+            }
+        }
+    }
+
+    /** T3: heartbeat создаётся и обновляется; SIGTERM -> код 0, "stopped", lock-и свободны. */
+    private static void checkWorkerHeartbeatAndShutdown() throws Exception {
+        Path home = Files.createTempDirectory(baseTempDir, "worker-t3-home-");
+        Path stdout = Files.createTempFile(baseTempDir, "t3-out-", ".txt");
+        Path stderr = Files.createTempFile(baseTempDir, "t3-err-", ".txt");
+        Process process = startWorkerProcess(home, stdout, stderr, Map.of());
+        awaitWorkerHeartbeat(home, "running", 30);
+        expect("T3 worker-процесс жив после первого heartbeat", process.isAlive());
+        String firstHeartbeat = Files.readString(workerHeartbeatFile(home), StandardCharsets.UTF_8);
+        int updates = 0;
+        String latest = firstHeartbeat;
+        for (int i = 0; i < 9; i++) {
+            Thread.sleep(1_000);
+            String next = Files.readString(workerHeartbeatFile(home), StandardCharsets.UTF_8);
+            if (!next.equals(latest)) {
+                updates++;
+            }
+            latest = next;
+        }
+        String secondHeartbeat = latest;
+        expect("T3 heartbeat обновляется (" + updates + " обновлений за 9 с; до: "
+                + firstHeartbeat.replace("\n", " ") + "; после: "
+                + secondHeartbeat.replace("\n", " ") + ")",
+                !firstHeartbeat.equals(secondHeartbeat)
+                        && secondHeartbeat.contains("running"));
+        long started = System.nanoTime();
+        process.destroy();
+        expect("T3 после SIGTERM выход не дольше 20 с", process.waitFor(20, TimeUnit.SECONDS));
+        long exitMillis = (System.nanoTime() - started) / 1_000_000;
+        expect("T3 после SIGTERM код выхода 0", process.exitValue() == 0);
+        String stopped = awaitWorkerHeartbeat(home, "stopped", 10);
+        expect("T3 heartbeat после завершения сообщает stopped",
+                MAPPER.readTree(stopped).path("pid").asLong(-1) == process.pid()
+                        && MAPPER.readTree(stopped).path("state").asText("").equals("stopped"));
+        // lock-файлы освобождены: tryLock из теста проходит по каждому *.lock.
+        Path dir = home.resolve(".ai-advent-agent");
+        try (var files = Files.list(dir)) {
+            for (Path file : files.filter(name -> name.toString().endsWith(".lock")).toList()) {
+                try (FileChannel channel = FileChannel.open(file,
+                        java.nio.file.StandardOpenOption.READ,
+                        java.nio.file.StandardOpenOption.WRITE)) {
+                    expect("T3 lock-файл освобождён: " + file.getFileName(),
+                            channel.tryLock() != null);
+                }
+            }
+        }
+        expect("T3 дочерних процессов у worker'а нет",
+                process.descendants().count() == 0);
+        expect("T3 завершение было быстрым (меньше 10 с)",
+                exitMillis < 10_000);
+        String errors = Files.readString(stderr, StandardCharsets.UTF_8);
+        expect("T3 stderr worker'а при штатном завершении пуст", errors.isBlank());
+    }
+
+    /** T10: фиктивный токен в окружении не попадает в вывод worker'а. */
+    private static final String T10_TOKEN = "fake-secret-XYZ";
+
+    private static void checkWorkerNoSecretLeak() throws Exception {
+        Path home = Files.createTempDirectory(baseTempDir, "worker-t10-home-");
+        Path stdout = Files.createTempFile(baseTempDir, "t10-out-", ".txt");
+        Path stderr = Files.createTempFile(baseTempDir, "t10-err-", ".txt");
+        Process process = startWorkerProcess(home, stdout, stderr,
+                Map.of("TRACKER_OAUTH_TOKEN", T10_TOKEN, "LLM_API_KEY", T10_TOKEN));
+        try {
+            awaitWorkerHeartbeat(home, "running", 30);
+        } finally {
+            process.destroy();
+            if (!process.waitFor(20, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+            }
+        }
+        String output = Files.readString(stdout, StandardCharsets.UTF_8)
+                + Files.readString(stderr, StandardCharsets.UTF_8);
+        expect("T10 фиктивный токен не попадает в stdout/stderr",
+                !output.contains(T10_TOKEN));
+        expect("T10 вывод не упоминает target/",
+                !output.contains("target/"));
+        expect("T10 вывод не упоминает java -cp",
+                !output.contains("java -cp") && !output.contains(" -cp "));
+        expect("T10 вывод не упоминает diff", !output.contains("diff"));
+        expect("T10 вывод не содержит remote URL",
+                !output.contains("https://") && !output.contains("http://"));
+    }
+
+    // ---------- T11–T13: отказоустойчивость store и retry runner'а ----------
+
+    /** T11: сбой сохранения до ATOMIC_MOVE оставляет исходный git-monitor.json целым. */
+    private static void checkStoreAtomicWriteFailure() throws Exception {
+        Path file = Files.createTempDirectory(baseTempDir, "t11-store-")
+                .resolve("git-monitor.json");
+        MonitorStore store = new MonitorStore(file);
+        MonitorSchedule schedule = workerSchedule(store, baseTempDir, "t11");
+        String original = Files.readString(file, StandardCharsets.UTF_8);
+        Path dir = file.getParent();
+
+        // Каталог становится недоступным для записи: createTempFile в save()
+        // падает до ATOMIC_MOVE и переименование невозможно по построению.
+        Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("r-x------"));
+        String afterFailure;
+        try {
+            try {
+                store.setEnabled(schedule.id(), false);
+                expect("T11 сбой записи без права на запись отклоняется", false);
+            } catch (MonitorException e) {
+                expect("T11 сбой записи без права на запись отклоняется", true);
+            }
+            afterFailure = Files.readString(file, StandardCharsets.UTF_8);
+        } finally {
+            Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwx------"));
+        }
+        expect("T11 исходный git-monitor.json не изменён после сбоя",
+                afterFailure.equals(original));
+        expect("T11 временный .tmp-файл не остался после сбоя",
+                !Files.exists(file.resolveSibling(file.getFileName() + ".tmp")));
+        MonitorStore reopened = new MonitorStore(file);
+        expect("T11 исходный git-monitor.json читается после сбоя",
+                reopened.schedule(schedule.id()) != null
+                        && reopened.schedule(schedule.id()).enabled()
+                        && reopened.schedules().size() == 1);
+    }
+
+    /** T12: два JVM-процесса одновременно пишут в store — нет потерянных обновлений. */
+    private static void checkStoreConcurrentWriters() throws Exception {
+        Path storeFile = Files.createTempDirectory(baseTempDir, "t12-store-")
+                .resolve("git-monitor.json");
+        Path logA = Files.createTempFile(baseTempDir, "t12-a-", ".log");
+        Path logB = Files.createTempFile(baseTempDir, "t12-b-", ".log");
+        String javaBin = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+        String classpath = withChildClasspath();
+        Process processA = new ProcessBuilder(javaBin, "-cp", classpath,
+                SelfTestStoreWriter.class.getName(), storeFile.toAbsolutePath().toString(), "15", "a")
+                .redirectOutput(logA.toFile()).redirectErrorStream(true).start();
+        Process processB = new ProcessBuilder(javaBin, "-cp", classpath,
+                SelfTestStoreWriter.class.getName(), storeFile.toAbsolutePath().toString(), "15", "b")
+                .redirectOutput(logB.toFile()).redirectErrorStream(true).start();
+        expect("T12 первый писатель завершился успешно",
+                processA.waitFor(120, TimeUnit.SECONDS) && processA.exitValue() == 0);
+        expect("T12 второй писатель завершился успешно",
+                processB.waitFor(120, TimeUnit.SECONDS) && processB.exitValue() == 0);
+
+        MonitorStore result = new MonitorStore(storeFile);
+        List<MonitorSchedule> schedules = result.schedules();
+        expect("T12 оба писателя записали все расписания (нет потерянных обновлений)",
+                schedules.size() == 30);
+        expect("T12 идентификаторы расписаний уникальны",
+                schedules.stream().map(MonitorSchedule::id).distinct().count() == 30);
+        long fromA = schedules.stream().filter(s -> s.repositoryRoot().startsWith("repo-a-")).count();
+        long fromB = schedules.stream().filter(s -> s.repositoryRoot().startsWith("repo-b-")).count();
+        expect("T12 по 15 расписаний от каждого процесса", fromA == 15 && fromB == 15);
+        JsonNode root = MAPPER.readTree(Files.readString(storeFile, StandardCharsets.UTF_8));
+        expect("T12 git-monitor.json после гонки валиден",
+                root.path("schemaVersion").asInt(-1) == MonitorStore.SCHEMA_VERSION
+                        && root.path("schedules").isArray()
+                        && root.path("schedules").size() == 30);
+    }
+
+    /**
+     * T13: MonitorRunner против живого, но молчащего stdio MCP: не больше двух
+     * повторов, безопасная ошибка, дочерний процесс погибает.
+     */
+    private static void checkRunnerRetrySilentMcp() throws Exception {
+        Path stubDir = Files.createTempDirectory(baseTempDir, "t13-stub-");
+        compileSilentStub(stubDir);
+        MonitorStore store = workerStore("t13");
+        MonitorSchedule schedule = workerSchedule(store, baseTempDir, "t13");
+        store.setTiming(schedule.id(), 0, Instant.now().toString());
+
+        String previousClasspath = System.getProperty("java.class.path");
+        try {
+            // Подставной GitMcpServer первым в classpath: ребёнок живёт, но
+            // никогда не отвечает на initialize -> TIMEOUT -> повторы.
+            System.setProperty("java.class.path", stubDir + File.pathSeparator
+                    + previousClasspath);
+            MonitorRunner.Result result = new MonitorRunner(store).run(schedule.id());
+            expect("T13 молчащий MCP приводит к неуспешному запуску",
+                    !result.run().success());
+            expect("T13 код ошибки повторяемый (TIMEOUT или MCP_START)",
+                    "TIMEOUT".equals(result.run().errorCode())
+                            || "MCP_START".equals(result.run().errorCode()));
+            expect("T13 не больше двух повторов (attempt <= 3)",
+                    result.run().attempt() <= 3);
+            expect("T13 финальная попытка — третья",
+                    result.run().attempt() == 3);
+            String message = result.run().errorMessage() == null ? ""
+                    : result.run().errorMessage();
+            expect("T13 сообщение ошибки безопасное",
+                    message.length() <= 240 && !message.contains(stubDir.toString())
+                            && !message.contains("target/") && !message.contains("Exception")
+                            && !message.contains("\n"));
+        } finally {
+            System.setProperty("java.class.path", previousClasspath);
+        }
+        // Дочерний процесс stub'а должен погибнуть сам после закрытия транспорта.
+        long stale = 0;
+        for (int i = 0; i < 30; i++) {
+            stale = ProcessHandle.allProcesses()
+                    .filter(p -> p.info().commandLine()
+                            .map(line -> line.contains(stubDir.toString()))
+                            .orElse(false))
+                    .count();
+            if (stale == 0) {
+                break;
+            }
+            Thread.sleep(500);
+        }
+        expect("T13 дочерний молчащий процесс убит после завершения", stale == 0);
+    }
+
+    /** Компилирует подставной GitMcpServer, который никогда не отвечает по stdio. */
+    private static void compileSilentStub(Path stubDir) throws Exception {
+        String source = String.join("\n",
+                "package com.example;",
+                "public final class GitMcpServer {",
+                "    public static void main(String[] args) throws Exception {",
+                "        Thread.currentThread().join();",
+                "    }",
+                "}");
+        Path javaFile = stubDir.resolve("com/example/GitMcpServer.java");
+        Files.createDirectories(javaFile.getParent());
+        Files.writeString(javaFile, source, StandardCharsets.UTF_8);
+        String javac = Path.of(System.getProperty("java.home"), "bin", "javac").toString();
+        Process compile = new ProcessBuilder(javac, "-d", stubDir.toString(),
+                javaFile.toString()).inheritIO().start();
+        if (compile.waitFor() != 0) {
+            throw new IllegalStateException("Не удалось скомпилировать silent-stub");
+        }
+    }
+
 
     private static void checkGitExplainPromptContract() {
         GitRepositoryStatus status = new GitRepositoryStatus(

@@ -131,8 +131,30 @@ detached HEAD, commit, clean и отсортированные списки `sta
 
 Текущее хранилище и runtime-lock используют права владельца, файловую блокировку,
 временный файл, `force(true)` и атомарную замену. Параллельный запуск одного
-расписания получает состояние `BUSY`. Scheduler, автоматические пропуски и
-background/systemd режим будут отдельным этапом.
+расписания получает состояние `BUSY`.
+### Этап 2: background worker
+
+Установленный CLI можно запустить как долгоживущий worker без модели и
+интерактивного интерфейса:
+
+```text
+ai-agent --background
+/monitor worker status
+```
+
+Worker использует singleton-lock, heartbeat и interval-расписания из
+`git-monitor.json`. Для user systemd unit:
+
+```text
+mkdir -p ~/.config/systemd/user
+cp deploy/ai-agent-monitor.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now ai-agent-monitor
+journalctl --user -u ai-agent-monitor -f
+```
+
+Для работы после logout может потребоваться `loginctl enable-linger` для
+пользователя. Worker не вызывает модель и не меняет состояние задач.
 
 Для явного MCP-доступа к хранилищу:
 
