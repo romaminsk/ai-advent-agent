@@ -172,7 +172,6 @@ public final class SelfTest {
             try {
                 group("MCP");
                 checkMcpClient();
-                checkTrackerMcpServer();
                 checkGitMcp();
                 checkMonitorStage();
                 printSummary();
@@ -328,7 +327,6 @@ public final class SelfTest {
             // --- MCP: локальный stdio-сервер, без сети и внешних секретов ---
             group("MCP");
             checkMcpClient();
-            checkTrackerMcpServer();
             checkGitMcp();
             checkMonitorStage();
             group("Worker планировщик");
@@ -517,67 +515,6 @@ public final class SelfTest {
         } catch (McpClientComponent.McpClientException e) {
             expect("живой MCP-процесс без ответа даёт timeout",
                     e.getMessage().contains("время ожидания"));
-        }
-    }
-
-    private static void checkTrackerMcpServer() throws Exception {
-        expect("Tracker MCP регистрирует get-issue", "get-issue".equals(
-                TrackerMcpServer.toolDefinition().name()));
-        expect("inputSchema требует только issueKey",
-                TrackerMcpServer.toolDefinition().inputSchema().get("required").toString()
-                        .contains("issueKey"));
-        HttpServer api = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-        api.createContext("/v2/issues/TEST-123", exchange -> respond(exchange, 200,
-                "{\"key\":\"TEST-123\",\"summary\":\"First MCP\","
-                        + "\"status\":{\"name\":\"Open\"},\"assignee\":{\"display\":\"Ada\"},"
-                        + "\"priority\":{\"name\":\"High\"}}"));
-        api.createContext("/v2/issues/MISSING-1", exchange -> respond(exchange, 404, "{}"));
-        api.createContext("/v2/issues/SECRET-1", exchange -> respond(exchange, 401, "{}"));
-        api.start();
-        try (TrackerMcpServer server = new TrackerMcpServer(HttpClient.newHttpClient(),
-                URI.create("http://127.0.0.1:" + api.getAddress().getPort() + "/v2/"),
-                "secret-token")) {
-            McpSchema.CallToolResult valid = server.handle(McpSchema.CallToolRequest.builder()
-                    .name("get-issue").arguments(Map.of("issueKey", "TEST-123")).build());
-            expect("get-issue возвращает структурированный результат",
-                    !Boolean.TRUE.equals(valid.isError()) && valid.structuredContent().toString().contains("First MCP"));
-            expect("секрет не попадает в успешный результат", !valid.toString().contains("secret-token"));
-            expect("404 превращается в понятную ошибку", server.handle(request("MISSING-1")).content()
-                    .toString().contains("не найдена"));
-            McpSchema.CallToolResult unauthorized = server.handle(request("SECRET-1"));
-            expect("401 превращается в безопасную ошибку", unauthorized.content().toString()
-                    .toLowerCase().contains("токен") && !unauthorized.toString().contains("secret-token"));
-            expect("пустой issueKey отклоняется", server.handle(request(" ")).content().toString().contains("Неверные аргументы"));
-        } finally {
-            api.stop(0);
-        }
-        try (TrackerMcpServer unavailable = new TrackerMcpServer(HttpClient.newHttpClient(),
-                URI.create("http://127.0.0.1:1/v2/"), "secret-token")) {
-            expect("недоступный Tracker API обрабатывается", unavailable.handle(request("TEST-123"))
-                    .content().toString().contains("недоступен"));
-        }
-        try (TrackerMcpServer noToken = new TrackerMcpServer(HttpClient.newHttpClient(),
-                URI.create("http://127.0.0.1:1/v2/"), null)) {
-            expect("отсутствующий токен обрабатывается без запроса", noToken.handle(request("TEST-123"))
-                    .content().toString().contains("не задан"));
-        }
-        HttpServer slow = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-        slow.createContext("/v2/issues/TEST-123", exchange -> {
-            try {
-                Thread.sleep(200);
-                respond(exchange, 200, "{}");
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        });
-        slow.start();
-        try (TrackerMcpServer timeout = new TrackerMcpServer(HttpClient.newHttpClient(),
-                URI.create("http://127.0.0.1:" + slow.getAddress().getPort() + "/v2/"),
-                "secret-token", Duration.ofMillis(50))) {
-            expect("таймаут Tracker API обрабатывается", timeout.handle(request("TEST-123"))
-                    .content().toString().contains("Таймаут"));
-        } finally {
-            slow.stop(0);
         }
     }
 
@@ -1401,7 +1338,7 @@ public final class SelfTest {
         Path stdout = Files.createTempFile(baseTempDir, "t10-out-", ".txt");
         Path stderr = Files.createTempFile(baseTempDir, "t10-err-", ".txt");
         Process process = startWorkerProcess(home, stdout, stderr,
-                Map.of("TRACKER_OAUTH_TOKEN", T10_TOKEN, "LLM_API_KEY", T10_TOKEN));
+                Map.of("LLM_API_KEY", T10_TOKEN));
         try {
             awaitWorkerHeartbeat(home, "running", 30);
         } finally {
@@ -1611,11 +1548,6 @@ public final class SelfTest {
         if (exitCode != 0) {
             throw new AssertionError("SelfTest git command failed: " + output);
         }
-    }
-
-    private static McpSchema.CallToolRequest request(String key) {
-        return McpSchema.CallToolRequest.builder().name("get-issue")
-                .arguments(Map.of("issueKey", key)).build();
     }
 
     private static void respond(com.sun.net.httpserver.HttpExchange exchange, int status, String body)

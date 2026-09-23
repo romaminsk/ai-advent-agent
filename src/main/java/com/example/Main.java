@@ -3700,7 +3700,6 @@ public final class Main {
         out.println("LLM_SUMMARY_BATCH_MESSAGES, LLM_SUMMARY_MAX_OUTPUT_TOKENS,");
         out.println("LLM_DIAGNOSTICS, LLM_HISTORY_FILE, LLM_MEMORY_FILE, LLM_PROFILE_FILE,");
         out.println("LLM_INVARIANT_FILE, MCP_AUTH_TOKEN,");
-        out.println("TRACKER_OAUTH_TOKEN или TRACKER_IAM_TOKEN (для TrackerMcpServer)");
         out.println("(при запуске через launcher загружаются из локального .env проекта).");
         out.println();
         out.println("История беседы хранится в JSON в ~/.ai-advent-agent/");

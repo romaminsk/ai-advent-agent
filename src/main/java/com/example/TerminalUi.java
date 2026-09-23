@@ -309,7 +309,6 @@ public interface TerminalUi extends AutoCloseable {
                     Примеры
                       /mcp tools https://example.invalid/mcp
                       /mcp tools npx -y @modelcontextprotocol/server-everything
-                      /mcp call ./tracker-mcp get-issue {"issueKey":"TEST-123"}
                       /mcp monitor call get-git-monitor-summary {"scheduleId":"..."}
                       /mcp git tools /absolute/path/to/repository
                       /mcp git status /absolute/path/to/repository
@@ -322,7 +321,7 @@ public interface TerminalUi extends AutoCloseable {
                        Автоматического выбора инструмента и управления задачей нет.
                       URL использует Streamable HTTP; команда — stdio.
 
-                     Связано: MCP_AUTH_TOKEN (HTTP MCP), TRACKER_OAUTH_TOKEN (сервер Трекера).
+                      Связано: MCP_AUTH_TOKEN (HTTP MCP).
                      Значения токенов не выводятся.""";
             case "/monitor" -> """
                     /monitor — явное управление Git-мониторингом
