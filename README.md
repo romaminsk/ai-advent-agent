@@ -103,6 +103,46 @@ detached HEAD, commit, clean и отсортированные списки `sta
 что тесты прошли по одному `git status`. После `/clear`, `/reset` или ошибки
 нового status снимок недоступен; при `BLOCKED` модель не вызывается.
 
+### Этап 1: явный Git-мониторинг
+
+Этап 1 хранит расписания и результаты в `~/.ai-advent-agent/git-monitor.json`.
+Фоновый scheduler и 24/7-режим в этот этап не входят: запуск выполняется только
+явной командой пользователя.
+
+```text
+/monitor add /absolute/path/to/repository 30m
+/monitor add /absolute/path/to/repository 30m summary 2h
+/monitor list
+/monitor run <scheduleId>
+/monitor status <scheduleId>
+/monitor summary <scheduleId>
+/monitor enable <scheduleId>
+/monitor disable <scheduleId>
+/monitor remove <scheduleId>
+```
+
+`interval` принимает `s`, `m` или `h`: от 30 секунд до 24 часов.
+`summaryInterval` необязателен и по умолчанию равен одному часу; диапазон —
+от одной минуты до 24 часов. Для одного канонического Git-корня допускается
+только одно расписание.
+
+Запуск создаёт отдельный Git MCP stdio-процесс, вызывает
+`get-repository-status`, закрывает процесс и сохраняет безопасную запись запуска.
+Хранятся не более 100 запусков и 50 сводок на расписание; полный snapshot есть
+только у последнего успешного запуска. Изменяющие Git-команды не выполняются.
+
+Текущее хранилище и runtime-lock используют права владельца, файловую блокировку,
+временный файл, `force(true)` и атомарную замену. Параллельный запуск одного
+расписания получает состояние `BUSY`. Scheduler, автоматические пропуски и
+background/systemd режим будут отдельным этапом.
+
+Для явного MCP-доступа к хранилищу:
+
+```text
+/mcp monitor tools
+/mcp call <команда GitMonitorMcpServer> get-git-monitor-summary {"scheduleId":"<id>"}
+```
+
 ## Интерфейс терминала
 
 Компактный старт — две строки до приглашения:

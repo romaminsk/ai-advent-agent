@@ -158,6 +158,7 @@ public final class SelfTest {
                 checkMcpClient();
                 checkTrackerMcpServer();
                 checkGitMcp();
+                checkMonitorStage();
                 System.out.println("OK: MCP checks passed (" + passed + ").");
             } finally {
                 deleteRecursively(baseTempDir);
@@ -308,6 +309,7 @@ public final class SelfTest {
             checkMcpClient();
             checkTrackerMcpServer();
             checkGitMcp();
+            checkMonitorStage();
 
             // --- Режим измерений /demo ---
             group("Измерения");
@@ -707,6 +709,116 @@ public final class SelfTest {
         Main.runLoop(nonGitUi, newAgentWithTempStore(config), "test-model");
         expect("CLI каталог без Git возвращает понятную ошибку",
                 nonGitUi.errors.stream().anyMatch(s -> s.contains("не является Git-репозиторием")));
+    }
+
+    private static void checkMonitorStage() throws Exception {
+        expect("interval принимает нижнюю и верхнюю границу",
+                MonitorSchedule.parseInterval("30s", "interval", 30, 86_400).toSeconds() == 30
+                        && MonitorSchedule.parseInterval("24h", "interval", 30, 86_400).toSeconds() == 86_400);
+        try {
+            MonitorSchedule.parseInterval("29s", "interval", 30, 86_400);
+            expect("interval ниже минимума отклоняется", false);
+        } catch (MonitorException e) {
+            expect("interval ниже минимума отклоняется", true);
+        }
+        try {
+            MonitorSchedule.parseInterval("5d", "interval", 30, 86_400);
+            expect("неверный формат interval отклоняется", false);
+        } catch (MonitorException e) {
+            expect("неверный формат interval отклоняется", true);
+        }
+
+        Path storeFile = Files.createTempDirectory(baseTempDir, "monitor-store-")
+                .resolve("git-monitor.json");
+        MonitorStore store = new MonitorStore(storeFile);
+        Path repo = Files.createTempDirectory(baseTempDir, "monitor-repo-");
+        git(repo, "init", "-q");
+        MonitorSchedule schedule = store.create(repo.toRealPath().toString(),
+                Duration.ofSeconds(30), Duration.ofMinutes(1));
+        expect("monitor schedule создаётся", store.schedules().size() == 1
+                && store.schedule(schedule.id()).enabled());
+        try {
+            store.create(repo.toRealPath().toString(), Duration.ofSeconds(30), Duration.ofMinutes(1));
+            expect("дубликат monitor schedule отклоняется", false);
+        } catch (MonitorException e) {
+            expect("дубликат monitor schedule отклоняется", true);
+        }
+        store.setEnabled(schedule.id(), false);
+        expect("monitor schedule отключается", !store.schedule(schedule.id()).enabled());
+        store.setEnabled(schedule.id(), true);
+
+        String previousClasspath = System.getProperty("java.class.path");
+        MonitorRunner.Result run;
+        try {
+            System.setProperty("java.class.path", buildClasspath());
+            run = new MonitorRunner(store).run(schedule.id());
+        } finally {
+            System.setProperty("java.class.path", previousClasspath);
+        }
+        expect("MonitorRunner получает настоящий Git snapshot через MCP",
+                run.run().success() && run.summary() != null && store.lastSnapshot(schedule.id()) != null);
+
+        try (MonitorStore.RuntimeLease ignored = store.tryRuntimeLock(schedule.id())) {
+            MonitorRunner.Result busy = new MonitorRunner(store).run(schedule.id());
+            expect("занятый runtime-lock возвращает BUSY", !busy.run().success()
+                    && "BUSY".equals(busy.run().errorCode()));
+        }
+
+        for (int i = 0; i < 105; i++) {
+            MonitorRun runRecord = new MonitorRun(schedule.id(), Instant.now().toString(),
+                    Instant.now().toString(), false, 1, null, false, null, false,
+                    0, 0, 0, 0, "TEST", "safe");
+            store.record(runRecord, null, null);
+        }
+        expect("retention запусков ограничен 100", store.runs(schedule.id()).size() == 100);
+        MonitorSummary summary = new MonitorSummary(schedule.id(), Instant.now().minusSeconds(60).toString(),
+                Instant.now().toString(), 1, 0, 0, Instant.now().toString(), null,
+                false, 2, 3, 4, 0, 1, 2, 3, 0, List.of("main -> feature"),
+                List.of("aaa -> bbb"), false);
+        for (int i = 0; i < 55; i++) store.recordSummary(summary);
+        expect("retention сводок ограничен 50", store.summaries(schedule.id()).size() == 50);
+
+        MonitorRun first = new MonitorRun("aggregate", Instant.now().minusSeconds(30).toString(),
+                Instant.now().minusSeconds(29).toString(), true, 1, "main", false, "a", true,
+                1, 2, 3, 0, null, null);
+        MonitorRun second = new MonitorRun("aggregate", Instant.now().toString(), Instant.now().toString(),
+                true, 1, "feature", true, "b", false, 3, 1, 5, 1, null, null);
+        MonitorSchedule aggregateSchedule = MonitorSchedule.create("/tmp/aggregate",
+                Duration.ofSeconds(30), Duration.ofMinutes(1));
+        MonitorSummary aggregate = MonitorAggregator.aggregate(aggregateSchedule,
+                List.of(first, second), Instant.now());
+        expect("aggregator считает дельты и branch/head changes",
+                aggregate.stagedDelta() == 2 && aggregate.unstagedDelta() == -1
+                        && aggregate.untrackedDelta() == 2 && aggregate.conflictsDelta() == 1
+                        && aggregate.branchChanges().contains("main -> feature")
+                        && aggregate.headChanges().contains("a -> b") && aggregate.detachedHead());
+
+        previousClasspath = System.getProperty("java.class.path");
+        try {
+            System.setProperty("java.class.path", buildClasspath());
+            String monitorCommand = GitMonitorMcpServer.command();
+            McpClientComponent.ToolListResult monitorTools = new McpClientComponent()
+                    .listTools(monitorCommand);
+            expect("Git monitor MCP регистрирует четыре инструмента",
+                    monitorTools.tools().size() == 4
+                            && monitorTools.tools().stream().anyMatch(t -> t.name().equals("schedule-git-monitor"))
+                            && monitorTools.tools().stream().anyMatch(t -> t.name().equals("list-git-monitors"))
+                            && monitorTools.tools().stream().anyMatch(t -> t.name().equals("get-git-monitor-summary"))
+                            && monitorTools.tools().stream().anyMatch(t -> t.name().equals("disable-git-monitor")));
+            McpClientComponent.ToolCallResult invalidMonitorCall = new McpClientComponent()
+                    .callTool(monitorCommand, "schedule-git-monitor", Map.of("extra", true));
+            expect("Git monitor MCP отклоняет неверные аргументы",
+                    invalidMonitorCall.error());
+        } finally {
+            System.setProperty("java.class.path", previousClasspath);
+        }
+
+        try {
+            store.remove(schedule.id());
+            expect("monitor schedule удаляется", store.schedules().isEmpty());
+        } catch (MonitorException e) {
+            expect("monitor schedule удаляется", false);
+        }
     }
 
     private static void checkGitExplainPromptContract() {

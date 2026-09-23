@@ -1,6 +1,7 @@
 package com.example;
 
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -164,6 +165,9 @@ public final class Main {
                         } else if (normalized.equals("/mcp")
                                  || normalized.startsWith("/mcp ")) {
                             handleMcpCommand(ui, input.text(), activeAgent(demoRef, agent), mcpSnapshot);
+                        } else if (normalized.equals("/monitor")
+                                || normalized.startsWith("/monitor ")) {
+                            handleMonitorCommand(ui, input.text());
                         } else if (normalized.equals("/profile")
                                 || normalized.startsWith("/profile ")
                                 || normalized.equals("/skill")
@@ -3218,6 +3222,15 @@ public final class Main {
             handleGitStatus(ui, repoPath, mcpSnapshot);
             return;
         }
+        if (argument.equalsIgnoreCase("monitor tools")) {
+            try {
+                ui.showSystem(McpClientComponent.format(
+                        new McpClientComponent().listTools(GitMonitorMcpServer.command())));
+            } catch (McpClientComponent.McpClientException | IllegalStateException e) {
+                ui.showError(e.getMessage());
+            }
+            return;
+        }
         if (argument.regionMatches(true, 0, "call ", 0, "call ".length())) {
             handleMcpCallCommand(ui, argument.substring("call ".length()).trim(), mcpSnapshot);
             return;
@@ -3234,6 +3247,101 @@ public final class Main {
         } catch (McpClientComponent.McpClientException e) {
             ui.showError(e.getMessage());
         }
+    }
+
+    private static void handleMonitorCommand(TerminalUi ui, String raw) {
+        String rest = raw.length() > "/monitor".length()
+                ? raw.substring("/monitor".length()).trim() : "";
+        try {
+            if (rest.equals("list")) {
+                List<MonitorSchedule> schedules = MonitorStore.openDefault().schedules();
+                if (schedules.isEmpty()) {
+                    ui.showSystem("Расписаний Git-мониторинга нет.");
+                } else {
+                    StringBuilder out = new StringBuilder("Git-мониторинг (" + schedules.size() + "):");
+                    for (MonitorSchedule schedule : schedules) {
+                        out.append("\n  ").append(schedule.id()).append(" · ")
+                                .append(schedule.enabled() ? "enabled" : "disabled")
+                                .append(" · ").append(schedule.repositoryRoot())
+                                .append(" · interval ").append(schedule.intervalSeconds()).append("s");
+                    }
+                    ui.showSystem(out.toString());
+                }
+                return;
+            }
+            if (rest.startsWith("add ")) {
+                java.util.regex.Matcher matcher = java.util.regex.Pattern.compile(
+                        "^(.+?)\\s+(\\d+[smh])(?:\\s+summary\\s+(\\d+[smh]))?$").matcher(rest.substring(4).trim());
+                if (!matcher.matches()) {
+                    ui.showSystem("Использование: /monitor add <абсолютный путь> <interval> "
+                            + "[summary <interval>].");
+                    return;
+                }
+                GitRepositoryReader.RepositoryLocation location = GitRepositoryReader.resolveLocation(
+                        absoluteRepoPath(matcher.group(1)));
+                Duration interval = MonitorSchedule.parseInterval(matcher.group(2), "interval", 30, 86_400);
+                Duration summary = matcher.group(3) == null ? Duration.ofHours(1)
+                        : MonitorSchedule.parseInterval(matcher.group(3), "summaryInterval", 60, 86_400);
+                MonitorSchedule schedule = MonitorStore.openDefault().create(
+                        location.repositoryRoot().toString(), interval, summary);
+                ui.showSystem("✓ Расписание создано: " + schedule.id() + ".");
+                return;
+            }
+            String[] parts = rest.split("\\s+", 2);
+            if (parts.length == 2 && (parts[0].equals("enable") || parts[0].equals("disable"))) {
+                MonitorSchedule schedule = MonitorStore.openDefault().setEnabled(parts[1], parts[0].equals("enable"));
+                ui.showSystem("✓ Расписание " + schedule.id() + ": "
+                        + (schedule.enabled() ? "включено." : "отключено."));
+                return;
+            }
+            if (parts.length == 2 && parts[0].equals("remove")) {
+                MonitorStore.openDefault().remove(parts[1]);
+                ui.showSystem("✓ Расписание удалено: " + parts[1] + ".");
+                return;
+            }
+            if (parts.length == 2 && (parts[0].equals("run") || parts[0].equals("status")
+                    || parts[0].equals("summary"))) {
+                MonitorStore store = MonitorStore.openDefault();
+                if (parts[0].equals("run")) {
+                    MonitorRunner.Result result = new MonitorRunner(store).run(parts[1]);
+                    ui.showSystem(formatMonitorRun(result));
+                } else if (parts[0].equals("summary")) {
+                    List<MonitorSummary> values = store.summaries(parts[1]);
+                    ui.showSystem(values.isEmpty() ? "Сводок пока нет." : formatMonitorSummary(values.get(values.size() - 1)));
+                } else {
+                    MonitorSchedule schedule = store.schedule(parts[1]);
+                    if (schedule == null) throw new MonitorException("Расписание не найдено: " + parts[1]);
+                    List<MonitorRun> runs = store.runs(parts[1]);
+                    ui.showSystem("Расписание " + schedule.id() + ": "
+                            + (schedule.enabled() ? "enabled" : "disabled")
+                            + ", запусков: " + runs.size()
+                            + (runs.isEmpty() ? "" : "\n" + formatMonitorRun(runs.get(runs.size() - 1))));
+                }
+                return;
+            }
+            ui.showSystem("Использование: /monitor add|list|enable|disable|remove|run|status|summary ...");
+        } catch (MonitorException | GitRepositoryReader.GitRepositoryException | IllegalArgumentException e) {
+            ui.showError(e.getMessage());
+        }
+    }
+
+    private static String formatMonitorRun(MonitorRunner.Result result) {
+        return formatMonitorRun(result.run());
+    }
+
+    private static String formatMonitorRun(MonitorRun run) {
+        return (run.success() ? "✓" : "!") + " Monitor run " + run.scheduleId()
+                + ": " + (run.success() ? "success" : run.errorCode() + " — " + run.errorMessage())
+                + " (attempt " + run.attempt() + ")";
+    }
+
+    private static String formatMonitorSummary(MonitorSummary summary) {
+        return "Сводка " + summary.scheduleId() + ": success=" + summary.successCount()
+                + ", failure=" + summary.failureCount() + ", missed=" + summary.missedCount()
+                + ", clean=" + summary.clean() + ", staged=" + summary.stagedCount()
+                + ", unstaged=" + summary.unstagedCount() + ", untracked=" + summary.untrackedCount()
+                + ", conflicts=" + summary.conflictsCount()
+                + ". Snapshot относится к окну " + summary.windowStart() + " — " + summary.windowEnd() + ".";
     }
 
     private static void handleGitTools(TerminalUi ui, String repoPath) {
@@ -3580,6 +3688,7 @@ public final class Main {
         out.println("/mcp call <сервер> <инструмент> <JSON-аргументы> (tools/call),");
         out.println("/mcp git tools <абсолютный путь>, /mcp git status <абсолютный путь>,");
         out.println("/mcp explain (объяснить последний Git-снимок моделью),");
+        out.println("/monitor add|list|enable|disable|remove|run|status|summary,");
         out.println("/context [full|summary], /context compare <вопрос>, /summary [refresh],");
         out.println("/multiline, /exit (также exit, quit).");
     }

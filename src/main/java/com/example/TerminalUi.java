@@ -198,7 +198,7 @@ public interface TerminalUi extends AutoCloseable {
                         "формат ответа, длинный ввод, измерения"),
                 new Row("Статистика", "/tokens /stats /limit /status",
                         "расход и обзор состояния"),
-                new Row("Прочее", "/mcp /help /exit (также exit, quit)", ""),
+                new Row("Прочее", "/mcp /monitor /help /exit (также exit, quit)", ""),
         };
         StringBuilder out = new StringBuilder();
         for (Row row : rows) {
@@ -227,7 +227,7 @@ public interface TerminalUi extends AutoCloseable {
                 "/profile", "/skill", "/pipeline", "/invariant", "/clear", "/reset",
                 "/mode", "/multiline", "/paste", "/demo",
                 "/context", "/summary", "/strategy", "/facts", "/branch",
-                "/tokens", "/stats", "/limit", "/status", "/mcp", "/exit",
+                "/tokens", "/stats", "/limit", "/status", "/mcp", "/monitor", "/exit",
         };
     }
 
@@ -323,6 +323,22 @@ public interface TerminalUi extends AutoCloseable {
 
                      Связано: MCP_AUTH_TOKEN (HTTP MCP), TRACKER_OAUTH_TOKEN (сервер Трекера).
                      Значения токенов не выводятся.""";
+            case "/monitor" -> """
+                    /monitor — явное управление Git-мониторингом
+
+                    Использование
+                      /monitor add <абсолютный путь> <число>s|m|h [summary <число>s|m|h]
+                      /monitor list
+                      /monitor enable|disable|remove <id>
+                      /monitor run|status|summary <id>
+
+                    Эффекты
+                      add/list/enable/disable/remove изменяют только JSON-хранилище
+                      мониторинга. run выполняет один Git MCP tools/call, status и
+                      summary читают сохранённые данные. Модель не вызывается,
+                      TaskState и BLOCKED не изменяются.
+
+                    Связано: /mcp monitor tools.""";
             case "/status" -> """
                     /status — обзор состояния одним экраном (без API)
 

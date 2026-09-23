@@ -73,7 +73,11 @@ final class InteractiveTerminalUi implements TerminalUi {
                         "/task invariant remove ", "/task invariant clear",
                          "/mcp tools ",
                          "/mcp call ",
+                         "/mcp monitor tools",
                          "/mcp git tools ", "/mcp git status ", "/mcp explain",
+                         "/monitor", "/monitor add ", "/monitor list", "/monitor run ",
+                         "/monitor status ", "/monitor summary ", "/monitor enable ",
+                         "/monitor disable ", "/monitor remove ",
                         "/exit", "exit", "quit"))
                 .build();
         // История ввода хранится только в памяти: файл истории не подключается.
