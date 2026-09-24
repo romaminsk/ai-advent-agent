@@ -75,6 +75,7 @@ final class InteractiveTerminalUi implements TerminalUi {
                          "/mcp call ",
                          "/mcp monitor tools",
                          "/mcp git tools ", "/mcp git status ", "/mcp explain",
+                         "/mcp pipeline tools", "/mcp pipeline run ", "/mcp pipeline call ",
                          "/monitor", "/monitor add ", "/monitor list", "/monitor run ",
                          "/monitor status ", "/monitor summary ", "/monitor enable ",
                          "/monitor disable ", "/monitor remove ",

@@ -6,6 +6,8 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.nio.file.Path;
 
 /**
  * Консольное приложение агента. Координирует работу: создаёт конфигурацию,
@@ -24,6 +26,7 @@ public final class Main {
             int exitCode = switch (args[1]) {
                 case "git-monitor" -> GitMonitorMcpServer.run();
                 case "git" -> GitMcpServer.run(java.util.Arrays.copyOfRange(args, 2, args.length));
+                case "pipeline" -> PipelineMcpServer.run(java.util.Arrays.copyOfRange(args, 2, args.length));
                 default -> {
                     System.err.println("Неизвестный MCP-сервер: " + args[1]);
                     yield 2;
@@ -3253,6 +3256,29 @@ public final class Main {
                     + argument.substring("monitor call ".length()).trim(), mcpSnapshot);
             return;
         }
+        if (argument.equalsIgnoreCase("pipeline tools")) {
+            handlePipelineTools(ui);
+            return;
+        }
+        if (argument.equalsIgnoreCase("pipeline run")) {
+            ui.showError("Использование: /mcp pipeline run <путь> <запрос>. Запрос — весь"
+                    + " остаток строки после пути.");
+            return;
+        }
+        if (argument.equalsIgnoreCase("pipeline call")) {
+            ui.showError("Использование: /mcp pipeline call <search|summarize|saveToFile>"
+                    + " <JSON-аргументы>.");
+            return;
+        }
+        if (argument.regionMatches(true, 0, "pipeline run ", 0, "pipeline run ".length())) {
+            handlePipelineRun(ui, argument.substring("pipeline run ".length()).trim(),
+                    agent != null && agent.currentSettings().diagnostics());
+            return;
+        }
+        if (argument.regionMatches(true, 0, "pipeline call ", 0, "pipeline call ".length())) {
+            handlePipelineCall(ui, argument.substring("pipeline call ".length()).trim(), mcpSnapshot);
+            return;
+        }
         if (argument.regionMatches(true, 0, "call ", 0, "call ".length())) {
             handleMcpCallCommand(ui, argument.substring("call ".length()).trim(), mcpSnapshot);
             return;
@@ -3266,6 +3292,141 @@ public final class Main {
         try {
             McpClientComponent.ToolListResult result = new McpClientComponent().listTools(server);
             ui.showSystem(McpClientComponent.format(result));
+        } catch (McpClientComponent.McpClientException e) {
+            ui.showError(e.getMessage());
+        }
+    }
+
+    /** Каталог результатов pipeline: тестовый хук (system property) или домашний по умолчанию. */
+    static Path pipelineResultsDir() {
+        String override = System.getProperty("ai-agent.pipeline.results-dir");
+        if (override != null && !override.isBlank()) {
+            return Path.of(override.trim());
+        }
+        return PipelineMcpServer.defaultResultsDir();
+    }
+
+    /** Команда запуска Pipeline MCP-сервера (переопределяемая в тестах через system property). */
+    private static String pipelineServerCommand() {
+        String override = System.getProperty("ai-agent.pipeline.server-command");
+        if (override != null && !override.isBlank()) {
+            return override.trim();
+        }
+        return PipelineMcpServer.command(pipelineResultsDir());
+    }
+
+    /** Список трёх инструментов Pipeline MCP-сервера (tools/list, без модели). */
+    private static void handlePipelineTools(TerminalUi ui) {
+        try {
+            ui.showSystem(McpClientComponent.format(new McpClientComponent()
+                    .listTools(pipelineServerCommand())));
+        } catch (McpClientComponent.McpClientException | IllegalStateException e) {
+            ui.showError(e.getMessage());
+        }
+    }
+
+    private static void handlePipelineRun(TerminalUi ui, String rest, boolean diagnostics) {
+        int pathEnd = rest.indexOf(' ');
+        if (pathEnd <= 0) {
+            ui.showError("Использование: /mcp pipeline run <путь> <запрос>. Запрос — весь"
+                    + " остаток строки после пути.");
+            return;
+        }
+        String path = rest.substring(0, pathEnd).trim();
+        String query = rest.substring(pathEnd + 1).trim();
+        if (path.isEmpty() || query.isEmpty()) {
+            ui.showError("Использование: /mcp pipeline run <путь> <запрос>. Запрос — весь"
+                    + " остаток строки после пути.");
+            return;
+        }
+        runPipeline(ui, path, query, diagnostics);
+    }
+
+    /** Автоматическая цепочка search → summarize → saveToFile, модель не вызывается. */
+    private static void runPipeline(TerminalUi ui, String path, String query, boolean diagnostics) {
+        try {
+            PipelineRunner.ChainResult result = new PipelineRunner(pipelineResultsDir(),
+                    pipelineServerCommand(), McpClientComponent.TIMEOUT).run(path, query);
+            for (PipelineRunner.StepResult step : result.steps()) {
+                String marker = step.ok() ? "✓" : "×";
+                ui.showSystem(step.number() + "/3 " + step.tool() + " " + marker
+                        + ("search".equals(step.tool()) && step.ok() ? "      " : "  ")
+                        + (step.ok() ? stepSummary(step) : step.error()));
+            }
+            if (diagnostics) {
+                for (PipelineRunner.StepResult step : result.steps()) {
+                    if (step.ok()) {
+                        ui.showSystem("  " + step.tool() + " " + step.durationMillis()
+                                + " мс: " + PipelineCanonicalJson.canonical(step.data()));
+                    }
+                }
+            }
+            if (result.file() != null) {
+                ui.showSystem("Цепочка выполнена, данные переданы без искажений"
+                        + " (sha256 совпали).");
+            } else {
+                ui.showError("Шаг " + result.steps().size() + " (" + result.failedTool()
+                        + ") прервал цепочку, файл не создан: " + result.error());
+            }
+        } catch (RuntimeException e) {
+            ui.showError(e instanceof IllegalStateException || e.getMessage() == null
+                    ? "Ошибка пайплайна: " + e : e.getMessage());
+        }
+    }
+
+    /** Краткий смысл успешного шага для вывода run. */
+    private static String stepSummary(PipelineRunner.StepResult step) {
+        Map<String, Object> data = step.data();
+        return switch (step.tool()) {
+            case "search" -> matchesOf(data) + " совпадений в "
+                    + filesOf(matchesList(data)) + " файлах";
+            case "summarize" -> "целостность входа подтверждена";
+            case "saveToFile" -> String.valueOf(data.get("path"));
+            default -> "";
+        };
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<Map<String, Object>> matchesList(Map<String, Object> data) {
+        if (data == null || !(data.get("matches") instanceof List<?> list)) return List.of();
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (Object item : list) out.add((Map<String, Object>) item);
+        return out;
+    }
+
+    private static int matchesOf(Map<String, Object> data) {
+        return data == null ? 0 : (data.get("totalMatches") instanceof Integer count ? count : 0);
+    }
+
+    private static int filesOf(List<Map<String, Object>> matches) {
+        Set<String> files = new java.util.LinkedHashSet<>();
+        for (Map<String, Object> match : matches) files.add(String.valueOf(match.get("file")));
+        return files.size();
+    }
+
+    /** Ручной вызов одного инструмента pipeline: как /mcp call, но с известным сервером. */
+    private static void handlePipelineCall(TerminalUi ui, String rest, McpSnapshotRef snapshot) {
+        int jsonStart = rest.indexOf('{');
+        String tool = jsonStart <= 0 ? "" : rest.substring(0, jsonStart).trim();
+        String json = jsonStart <= 0 ? "" : rest.substring(jsonStart).trim();
+        if (tool.isEmpty() || !PipelineMcpServer.TOOL_NAMES.contains(tool) || json.isEmpty()) {
+            ui.showError("Использование: /mcp pipeline call <search|summarize|saveToFile>"
+                    + " <JSON-аргументы>.");
+            return;
+        }
+        try {
+            Map<String, Object> arguments = new com.fasterxml.jackson.databind.ObjectMapper()
+                    .readValue(json, new com.fasterxml.jackson.core.type.TypeReference<>() {
+                    });
+            McpClientComponent.ToolCallResult result = new McpClientComponent()
+                    .callTool(pipelineServerCommand(), tool, arguments);
+            if (result.error()) {
+                ui.showError(result.text());
+            } else {
+                ui.showSystem("✓ tools/call " + tool + ".\n" + result.text());
+            }
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            ui.showError("Неверный JSON аргументов инструмента.");
         } catch (McpClientComponent.McpClientException e) {
             ui.showError(e.getMessage());
         }
@@ -3716,6 +3877,7 @@ public final class Main {
         out.println("/mcp git tools <абсолютный путь>, /mcp git status <абсолютный путь>,");
         out.println("/mcp explain (объяснить последний Git-снимок моделью),");
         out.println("/mcp monitor tools, /mcp monitor call <tool> <JSON-аргументы>,");
+        out.println("/mcp pipeline tools|run <путь> <запрос>|call <tool> <JSON-аргументы> (цепочка search → summarize → saveToFile, sha256, без модели),");
         out.println("/monitor add|list|enable|disable|remove|run|status|summary,");
         out.println("/monitor worker status, ai-agent --background,");
         out.println("/context [full|summary], /context compare <вопрос>, /summary [refresh],");

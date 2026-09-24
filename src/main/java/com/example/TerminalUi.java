@@ -310,16 +310,23 @@ public interface TerminalUi extends AutoCloseable {
                       /mcp tools https://example.invalid/mcp
                       /mcp tools npx -y @modelcontextprotocol/server-everything
                       /mcp monitor call get-git-monitor-summary {"scheduleId":"..."}
+                      /mcp pipeline tools
+                      /mcp pipeline run <путь> <запрос>
+                      /mcp pipeline call search|summarize|saveToFile <JSON-аргументы>
                       /mcp git tools /absolute/path/to/repository
                       /mcp git status /absolute/path/to/repository
                       /mcp explain
 
                     Эффекты
                        tools выполняет tools/list, call выполняет tools/call и закрывает
-                       соединение. git status получает снимок локального Git через MCP;
-                       explain явно передаёт последний успешный снимок модели.
-                       Автоматического выбора инструмента и управления задачей нет.
-                      URL использует Streamable HTTP; команда — stdio.
+                        соединение. git status получает снимок локального Git через MCP;
+                        explain явно передаёт последний успешный снимок модели.
+                        Автоматического выбора инструмента и управления задачей нет.
+                       pipeline tools/run/call работают с собственным stdio-сервером:
+                        цепочка search → summarize → saveToFile с проверкой SHA-256
+                        между шагами; модель не вызывается. Файлы результатов
+                        сохраняются в ~/.ai-advent-agent/pipeline-results/.
+                       URL использует Streamable HTTP; команда — stdio.
 
                       Связано: MCP_AUTH_TOKEN (HTTP MCP).
                      Значения токенов не выводятся.""";
