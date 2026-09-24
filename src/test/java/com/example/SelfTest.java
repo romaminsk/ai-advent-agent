@@ -26,6 +26,7 @@ import java.net.InetSocketAddress;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -935,6 +936,47 @@ public final class SelfTest {
             MonitorStore.setFileKeyReaderForTests(null);
             Files.deleteIfExists(runtime);
         }
+
+        java.util.concurrent.atomic.AtomicReference<FileChannel> contenderChannel =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.atomic.AtomicReference<FileLock> contenderLockRef =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        MonitorStore.setRuntimeLockDeleteBarrierForTests(() -> {
+            try {
+                FileChannel channel = FileChannel.open(runtime, java.nio.file.StandardOpenOption.READ,
+                        java.nio.file.StandardOpenOption.WRITE);
+                contenderChannel.set(channel);
+                try {
+                    contenderLockRef.set(channel.tryLock());
+                } catch (java.nio.channels.OverlappingFileLockException ignored) {
+                    contenderLockRef.set(null);
+                }
+            } catch (IOException e) {
+                throw new AssertionError(e);
+            }
+        });
+        MonitorStore.RuntimeLease owner = store.tryRuntimeLock(schedule.id());
+        owner.close();
+        MonitorStore.setRuntimeLockDeleteBarrierForTests(null);
+        FileChannel contender = contenderChannel.get();
+        boolean pathMissingAfterOwnerDelete;
+        try {
+            Files.readAttributes(runtime, java.nio.file.attribute.BasicFileAttributes.class,
+                    java.nio.file.LinkOption.NOFOLLOW_LINKS);
+            pathMissingAfterOwnerDelete = false;
+        } catch (IOException e) {
+            pathMissingAfterOwnerDelete = true;
+        }
+        expect("runtime-lock R1 старый открытый канал видит удалённый путь",
+                contenderLockRef.get() == null && pathMissingAfterOwnerDelete);
+        if (contenderLockRef.get() != null) contenderLockRef.get().release();
+        contender.close();
+        MonitorStore.RuntimeLease replacement = store.tryRuntimeLock(schedule.id());
+        MonitorStore.RuntimeLease blocked = store.tryRuntimeLock(schedule.id());
+        expect("runtime-lock R1 новый владелец перезахвачен, C получает BUSY",
+                replacement != null && blocked == null);
+        replacement.close();
+        expect("runtime-lock R1 после владельца B файл удалён", !Files.exists(runtime));
 
         MonitorStore badStore = workerStore("runtime-lock-error");
         MonitorSchedule bad = badStore.create(baseTempDir.resolve("does-not-exist-runtime-repo")

@@ -34,6 +34,7 @@ public final class MonitorStore {
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final int RUNTIME_LOCK_ATTEMPTS = 3;
     private static FileKeyReader fileKeyReader = MonitorStore::readFileKey;
+    private static Runnable runtimeLockDeleteBarrierForTests;
 
     private final Path file;
     private final Path lockFile;
@@ -206,6 +207,10 @@ public final class MonitorStore {
         fileKeyReader = reader == null ? MonitorStore::readFileKey : reader;
     }
 
+    static void setRuntimeLockDeleteBarrierForTests(Runnable barrier) {
+        runtimeLockDeleteBarrierForTests = barrier;
+    }
+
     private static Object fileKey(Path path) throws IOException {
         return fileKeyReader.read(path);
     }
@@ -374,6 +379,8 @@ public final class MonitorStore {
                 try {
                     Object currentKey = fileKey(runtimeFile);
                     if (currentKey != null && Objects.equals(currentKey, ownerKey)) {
+                        Runnable barrier = runtimeLockDeleteBarrierForTests;
+                        if (barrier != null) barrier.run();
                         Files.deleteIfExists(runtimeFile);
                     }
                 } catch (IOException | RuntimeException e) {
