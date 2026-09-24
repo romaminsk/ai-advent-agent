@@ -26,6 +26,7 @@ import java.net.InetSocketAddress;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -175,6 +176,7 @@ public final class SelfTest {
                 checkMcpClient();
                 checkGitMcp();
                 checkMonitorStage();
+                checkMonitorRuntimeLockCleanup();
                 group("MCP Pipeline");
                 checkPipelineStage();
                 checkPipelineChildProcess();
@@ -336,6 +338,7 @@ public final class SelfTest {
             checkMcpClient();
             checkGitMcp();
             checkMonitorStage();
+            checkMonitorRuntimeLockCleanup();
             group("MCP Pipeline");
             checkPipelineStage();
             checkPipelineChildProcess();
@@ -876,6 +879,141 @@ public final class SelfTest {
         } catch (MonitorException e) {
             expect("monitor schedule удаляется", false);
         }
+    }
+
+    /** Runtime-lock cleanup and file-key protocol checks (temporary store only). */
+    private static void checkMonitorRuntimeLockCleanup() throws Exception {
+        MonitorStore store = workerStore("runtime-lock-cleanup");
+        MonitorSchedule schedule = workerSchedule(store, baseTempDir, "runtime-lock-cleanup");
+        Path runtime = store.file().resolveSibling(store.file().getFileName() + "."
+                + schedule.id() + ".run.lock");
+
+        MonitorStore.RuntimeLease first = store.tryRuntimeLock(schedule.id());
+        expect("runtime-lock T1 захватывается и создаётся", first != null && Files.exists(runtime));
+        first.close();
+        first.close();
+        expect("runtime-lock T1 удалён после успешного close", !Files.exists(runtime));
+
+        MonitorStore.RuntimeLease second = store.tryRuntimeLock(schedule.id());
+        expect("runtime-lock T3 повторный запуск захватывается", second != null);
+        second.close();
+        expect("runtime-lock T3 после повторного запуска удалён", !Files.exists(runtime));
+
+        Files.createFile(runtime);
+        MonitorStore.RuntimeLease stale = store.tryRuntimeLock(schedule.id());
+        expect("runtime-lock T4 мёртвый lock-файл не мешает запуску", stale != null);
+        stale.close();
+        expect("runtime-lock T4 мёртвый lock-файл удалён", !Files.exists(runtime));
+
+        Path storeLock = store.file().resolveSibling(store.file().getFileName() + ".lock");
+        store.schedules();
+        expect("runtime-lock T8 основной monitor-store lock существует", Files.exists(storeLock));
+
+        MonitorStore.setFileKeyReaderForTests(path -> null);
+        try {
+            MonitorStore.RuntimeLease noKey = store.tryRuntimeLock(schedule.id());
+            expect("runtime-lock T7 при fileKey == null захват проходит", noKey != null);
+            noKey.close();
+            expect("runtime-lock T7 при fileKey == null файл сохраняется", Files.exists(runtime));
+            Files.deleteIfExists(runtime);
+        } finally {
+            MonitorStore.setFileKeyReaderForTests(null);
+        }
+
+        java.util.concurrent.atomic.AtomicInteger keys = new java.util.concurrent.atomic.AtomicInteger();
+        MonitorStore.setFileKeyReaderForTests(path -> switch (keys.getAndIncrement()) {
+            case 0 -> "old-owner";
+            case 1 -> "replaced-path";
+            default -> "new-owner";
+        });
+        try {
+            MonitorStore.RuntimeLease replaced = store.tryRuntimeLock(schedule.id());
+            expect("runtime-lock T6 подмена файла вызывает повторный захват", replaced != null
+                    && keys.get() >= 4);
+            replaced.close();
+            expect("runtime-lock T6 после повторного захвата файл удалён", !Files.exists(runtime));
+        } finally {
+            MonitorStore.setFileKeyReaderForTests(null);
+            Files.deleteIfExists(runtime);
+        }
+
+        java.util.concurrent.atomic.AtomicReference<FileChannel> contenderChannel =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.atomic.AtomicReference<FileLock> contenderLockRef =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        MonitorStore.setRuntimeLockDeleteBarrierForTests(() -> {
+            try {
+                FileChannel channel = FileChannel.open(runtime, java.nio.file.StandardOpenOption.READ,
+                        java.nio.file.StandardOpenOption.WRITE);
+                contenderChannel.set(channel);
+                try {
+                    contenderLockRef.set(channel.tryLock());
+                } catch (java.nio.channels.OverlappingFileLockException ignored) {
+                    contenderLockRef.set(null);
+                }
+            } catch (IOException e) {
+                throw new AssertionError(e);
+            }
+        });
+        MonitorStore.RuntimeLease owner = store.tryRuntimeLock(schedule.id());
+        owner.close();
+        MonitorStore.setRuntimeLockDeleteBarrierForTests(null);
+        FileChannel contender = contenderChannel.get();
+        boolean pathMissingAfterOwnerDelete;
+        try {
+            Files.readAttributes(runtime, java.nio.file.attribute.BasicFileAttributes.class,
+                    java.nio.file.LinkOption.NOFOLLOW_LINKS);
+            pathMissingAfterOwnerDelete = false;
+        } catch (IOException e) {
+            pathMissingAfterOwnerDelete = true;
+        }
+        expect("runtime-lock R1 старый открытый канал видит удалённый путь",
+                contenderLockRef.get() == null && pathMissingAfterOwnerDelete);
+        if (contenderLockRef.get() != null) contenderLockRef.get().release();
+        contender.close();
+        MonitorStore.RuntimeLease replacement = store.tryRuntimeLock(schedule.id());
+        MonitorStore.RuntimeLease blocked = store.tryRuntimeLock(schedule.id());
+        expect("runtime-lock R1 новый владелец перезахвачен, C получает BUSY",
+                replacement != null && blocked == null);
+        replacement.close();
+        expect("runtime-lock R1 после владельца B файл удалён", !Files.exists(runtime));
+
+        MonitorStore badStore = workerStore("runtime-lock-error");
+        MonitorSchedule bad = badStore.create(baseTempDir.resolve("does-not-exist-runtime-repo")
+                .toString(), Duration.ofSeconds(30), Duration.ofMinutes(1));
+        Path badRuntime = badStore.file().resolveSibling(badStore.file().getFileName() + "."
+                + bad.id() + ".run.lock");
+        MonitorRunner.Result failed;
+        try (ClasspathOverride ignored = new ClasspathOverride()) {
+            failed = new MonitorRunner(badStore).run(bad.id());
+        }
+        expect("runtime-lock T2 ошибка запуска сохраняет неуспешный результат",
+                !failed.run().success());
+        expect("runtime-lock T2 после исключения удалён", !Files.exists(badRuntime));
+
+        Path holderReady = Files.createTempFile(baseTempDir, "runtime-holder-", ".ready");
+        Files.deleteIfExists(holderReady);
+        String java = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+        Process holder = new ProcessBuilder(java, "-cp", withChildClasspath(),
+                RuntimeLockHolder.class.getName(), store.file().toString(), schedule.id(),
+                holderReady.toString()).start();
+        activeProcesses.add(holder);
+        try {
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (!Files.exists(holderReady) && System.nanoTime() < deadline) {
+                Thread.sleep(50);
+            }
+            MonitorRunner.Result busy = new MonitorRunner(store).run(schedule.id());
+            expect("runtime-lock R2 дочерний владелец возвращает BUSY",
+                    !busy.run().success() && "BUSY".equals(busy.run().errorCode())
+                            && "Расписание уже выполняется.".equals(busy.run().errorMessage()));
+        } finally {
+            try { holder.getOutputStream().close(); } catch (IOException ignored) { }
+            if (!holder.waitFor(10, TimeUnit.SECONDS)) holder.destroyForcibly();
+            activeProcesses.remove(holder);
+        }
+        expect("runtime-lock R2 после освобождения дочернего владельца удалён",
+                !Files.exists(runtime));
     }
 
     private static String selfTestMcpCommand(String server) throws Exception {
@@ -6956,6 +7094,22 @@ public final class SelfTest {
                 partialStats.snapshot().contextSavingsRequests() == 0);
     }
 
+
+    /** Holds one runtime lock in a separate JVM until stdin reaches EOF. */
+    public static final class RuntimeLockHolder {
+        public static void main(String[] args) throws Exception {
+            Path storeFile = Path.of(args[0]);
+            String scheduleId = args[1];
+            Path ready = Path.of(args[2]);
+            MonitorStore store = new MonitorStore(storeFile);
+            try (MonitorStore.RuntimeLease ignored = store.tryRuntimeLock(scheduleId)) {
+                Files.writeString(ready, "ready", StandardCharsets.UTF_8);
+                while (System.in.read() != -1) {
+                    // Keep the lease until the parent closes stdin.
+                }
+            }
+        }
+    }
 
     private SelfTest() {
     }
