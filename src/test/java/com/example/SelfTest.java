@@ -1532,6 +1532,9 @@ public final class SelfTest {
         Files.writeString(root.resolve(".git/config"), "MonitorStore в .git\n", StandardCharsets.UTF_8);
         Files.writeString(root.resolve(".env"), "TOKEN=MonitorStore-env-secret\n", StandardCharsets.UTF_8);
         Files.writeString(root.resolve(".env.local"), "KEY=MonitorStore-env-local\n", StandardCharsets.UTF_8);
+        Files.writeString(root.resolve(".envrc"), "back=MonitorStore-envrc\n", StandardCharsets.UTF_8);
+        Files.writeString(root.resolve(".envproduction"), "HOST=MonitorStore-envproduction\n",
+                StandardCharsets.UTF_8);
         Files.createDirectories(root.resolve("target"));
         Files.writeString(root.resolve("target/skip.txt"), "MonitorStore в target\n", StandardCharsets.UTF_8);
         Files.createDirectories(root.resolve("node_modules"));
@@ -1600,8 +1603,8 @@ public final class SelfTest {
         expect("pipeline search: кириллица, регистронезависимо",
                 FileSearcher.search(root, "кириллица", null).totalMatches() == 1
                         && FileSearcher.search(root, "ПРИВЕТ", null).totalMatches() == 1);
-        expect("pipeline search пропускает .git/.env/.env.local/target/node_modules/бинарный/большой/симлинк",
-                search.filesSkipped() == 8
+        expect("pipeline search пропускает .git/.env*/target/node_modules/бинарный/большой/симлинк",
+                search.filesSkipped() == 10
                         && !searcherJson(search).contains("target/")
                         && !searcherJson(search).contains("node_modules")
                         && !searcherJson(search).contains("binary")
@@ -1610,6 +1613,13 @@ public final class SelfTest {
         expect(".env содержимое не попадает в вывод search",
                 !searcherJson(search).contains("MonitorStore-env-secret")
                         && !searcherJson(search).contains("MonitorStore-env-local"));
+        expect("все варианты .env* пропускаются, содержимого нет в matches",
+                FileSearcher.search(root, "MonitorStore-envrc", null).totalMatches() == 0
+                        && FileSearcher.search(root, "MonitorStore-envproduction", null).totalMatches() == 0
+                        && PipelineCanonicalJson.canonical(search.toMap())
+                        .contains("MonitorStore-envrc") == false
+                        && PipelineCanonicalJson.canonical(search.toMap())
+                        .contains("MonitorStore-envproduction") == false);
         expect("симлинк наружу не следуется",
                 FileSearcher.search(root, "за пределами корня", null).totalMatches() == 0);
         FileSearcher.SearchResult truncatedSearch = FileSearcher.search(root, "MonitorStore", 1);

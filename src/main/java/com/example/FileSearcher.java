@@ -94,7 +94,7 @@ public final class FileSearcher {
                     }
                     if (!file.normalize().startsWith(root)) return FileVisitResult.CONTINUE;
                     String name = file.getFileName().toString();
-                    if (name.equals(".env") || name.startsWith(".env.")) {
+                    if (name.startsWith(".env")) {
                         skipped[0]++;
                         return FileVisitResult.CONTINUE;
                     }
