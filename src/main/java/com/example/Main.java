@@ -67,6 +67,12 @@ public final class Main {
         // --help обработан выше: он не создаёт и не блокирует историю
         // и не требует API-ключа.
         try (JsonConversationStore store = JsonConversationStore.openDefault()) {
+            // Shutdown hook: при SIGTERM/Ctrl+C история закрывается тем же
+            // close(): lock снимается, lock-файл per-run истории удаляется
+            // (для явно заданной LLM_HISTORY_FILE — сохраняется). Обычный
+            // выход (/exit, EOF) тоже вызывает close() — метод идемпотентен.
+            Thread cleanupHook = new Thread(store::close, "agent-history-cleanup");
+            Runtime.getRuntime().addShutdownHook(cleanupHook);
             // Боевая точка создания агента: долговременная память, профиль и
             // инварианты подключаются к реальным файлам (~/.ai-advent-agent/
             // memory.json, profile.json и invariants.json, переменные
@@ -3378,12 +3384,26 @@ public final class Main {
     private static String stepSummary(PipelineRunner.StepResult step) {
         Map<String, Object> data = step.data();
         return switch (step.tool()) {
-            case "search" -> matchesOf(data) + " совпадений в "
-                    + filesOf(matchesList(data)) + " файлах";
+            case "search" -> matchesOf(data)
+                    + SearchSummarizer.ruPlural(matchesOf(data),
+                    " совпадение", " совпадения", " совпадений")
+                    + " в " + filesOf(matchesList(data))
+                    + SearchSummarizer.ruPlural(filesOf(matchesList(data)),
+                    " файле", " файлах", " файлах")
+                    + truncatedSuffix(data);
             case "summarize" -> "целостность входа подтверждена";
             case "saveToFile" -> String.valueOf(data.get("path"));
             default -> "";
         };
+    }
+
+    /** При обрезке лимитом maxResults — честный признак в строке шага search. */
+    private static String truncatedSuffix(Map<String, Object> data) {
+        if (!Boolean.TRUE.equals(data != null ? data.get("truncated") : null)) {
+            return "";
+        }
+        int shown = matchesList(data).size();
+        return " (показано " + shown + ", остальное обрезано лимитом)";
     }
 
     @SuppressWarnings("unchecked")

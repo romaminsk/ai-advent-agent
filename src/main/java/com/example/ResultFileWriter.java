@@ -69,7 +69,11 @@ public final class ResultFileWriter {
                 PipelineCanonicalJson.canonical(input)))) {
             throw new PipelineToolException("input integrity check failed, файл не создаётся.");
         }
-        String name = fileName == null || fileName.isBlank() ? null : fileName.trim();
+        if (fileName != null && fileName.isBlank()) {
+            throw new PipelineToolException("fileName не должен быть пустым;"
+                    + " не указывайте поле, чтобы использовать имя по умолчанию.");
+        }
+        String name = fileName == null ? null : fileName.trim();
         if (name != null && !validName(name)) {
             throw new PipelineToolException("fileName должен быть 1..100 символов из [A-Za-z0-9._-],"
                     + " без «..», и обязательно с расширением .md — файл не создаётся.");

@@ -73,6 +73,8 @@ public final class JsonConversationStore implements ConversationStore {
 
     private final Path file;
     private final Path lockFile;
+    /** true, если файл истории сгенерирован per-run (LLM_HISTORY_FILE не задан). */
+    private final boolean generatedHistoryFile;
     private FileChannel lockChannel;
     private FileLock lock;
 
@@ -83,6 +85,12 @@ public final class JsonConversationStore implements ConversationStore {
      * приложения с той же историей не запустится.
      */
     public JsonConversationStore(Path historyFile) {
+        this(historyFile, false);
+    }
+
+    /** Перегрузка для тестов: явный флаг per-run генерации имени истории. */
+    public JsonConversationStore(Path historyFile, boolean generatedHistoryFile) {
+        this.generatedHistoryFile = generatedHistoryFile;
         this.file = historyFile.toAbsolutePath().normalize();
         Path dir = file.getParent();
         try {
@@ -106,7 +114,19 @@ public final class JsonConversationStore implements ConversationStore {
      * историю разной в зависимости от каталога запуска).
      */
     public static JsonConversationStore openDefault() {
-        return new JsonConversationStore(defaultHistoryFile(System.getenv()));
+        java.util.Map.Entry<Path, Boolean> resolved = defaultHistoryFileWithFlag(System.getenv());
+        return new JsonConversationStore(resolved.getKey(), resolved.getValue());
+    }
+
+    /**
+     * Возвращает путь файла истории по умолчанию и флаг, был ли файл
+     * сгенерирован per-run (LLM_HISTORY_FILE отсутствует), а не задан явно.
+     */
+    static java.util.Map.Entry<Path, Boolean> defaultHistoryFileWithFlag(
+            java.util.Map<String, String> env) {
+        String configured = env.get("LLM_HISTORY_FILE");
+        boolean generated = configured == null || configured.isBlank();
+        return java.util.Map.entry(defaultHistoryFile(env), generated);
     }
 
     /**
@@ -504,6 +524,26 @@ public final class JsonConversationStore implements ConversationStore {
         }
         lock = null;
         lockChannel = null;
+        removeLockFileQuietly();
+    }
+
+    /**
+     * Идемпотентная уборка lock-файла per-run истории: выполняется после
+     * release и закрытия канала. Удаляется только lock сгенерированного
+     * per-run файла; при явно заданном LLM_HISTORY_FILE lock-файл не
+     * удаляется, чтобы не создать гонку между процессами. Повторный вызов
+     * и отсутствие файла — без ошибок; ошибка удаления не роняет выход
+     * (тихая строка в stderr без путей и секретов).
+     */
+    void removeLockFileQuietly() {
+        if (!generatedHistoryFile || lockFile == null) {
+            return;
+        }
+        try {
+            Files.deleteIfExists(lockFile);
+        } catch (IOException | RuntimeException e) {
+            System.err.println("Не удалось удалить lock-файл истории — он останется на диске.");
+        }
     }
 
     /**

@@ -1535,6 +1535,30 @@ public final class SelfTest {
         Files.writeString(root.resolve(".envrc"), "back=MonitorStore-envrc\n", StandardCharsets.UTF_8);
         Files.writeString(root.resolve(".envproduction"), "HOST=MonitorStore-envproduction\n",
                 StandardCharsets.UTF_8);
+        // Каталоги и файлы секретов P4 (регистронезависимо по именам).
+        Files.createDirectories(root.resolve(".ssh"));
+        Files.writeString(root.resolve(".ssh/config"), "KEYS=MonitorStore в .ssh\n",
+                StandardCharsets.UTF_8);
+        Files.writeString(root.resolve(".ssh/id_ed25519"), "KEY=MonitorStore в id_ed25519\n",
+                StandardCharsets.UTF_8);
+        Files.createDirectories(root.resolve(".gnupg"));
+        Files.writeString(root.resolve(".gnupg/x"), "GNUPG=MonitorStore в .gnupg\n",
+                StandardCharsets.UTF_8);
+        Files.createDirectories(root.resolve(".aws"));
+        Files.writeString(root.resolve(".aws/credentials"), "AWS=MonitorStore в .aws\n",
+                StandardCharsets.UTF_8);
+        Files.createDirectories(root.resolve(".kube"));
+        Files.writeString(root.resolve(".kube/config"), "KUBE=MonitorStore в .kube\n",
+                StandardCharsets.UTF_8);
+        Files.createDirectories(root.resolve(".docker"));
+        Files.writeString(root.resolve(".docker/config.json"), "DOCKER=MonitorStore в .docker\n",
+                StandardCharsets.UTF_8);
+        Files.writeString(root.resolve("server.PEM"), "PEM=MonitorStore в pem\n", StandardCharsets.UTF_8);
+        Files.writeString(root.resolve("tls.key"), "KEY=MonitorStore в key\n", StandardCharsets.UTF_8);
+        Files.writeString(root.resolve("cert.p12"), "P12=MonitorStore в p12\n", StandardCharsets.UTF_8);
+        Files.writeString(root.resolve("id_rsa_bkp"), "RSA=MonitorStore в id_rsa\n", StandardCharsets.UTF_8);
+        Files.writeString(root.resolve(".netrc"), "NETRC=MonitorStore в netrc\n", StandardCharsets.UTF_8);
+        Files.writeString(root.resolve(".pgpass"), "PGPASS=MonitorStore в pgpass\n", StandardCharsets.UTF_8);
         Files.createDirectories(root.resolve("target"));
         Files.writeString(root.resolve("target/skip.txt"), "MonitorStore в target\n", StandardCharsets.UTF_8);
         Files.createDirectories(root.resolve("node_modules"));
@@ -1603,13 +1627,19 @@ public final class SelfTest {
         expect("pipeline search: кириллица, регистронезависимо",
                 FileSearcher.search(root, "кириллица", null).totalMatches() == 1
                         && FileSearcher.search(root, "ПРИВЕТ", null).totalMatches() == 1);
-        expect("pipeline search пропускает .git/.env*/target/node_modules/бинарный/большой/симлинк",
-                search.filesSkipped() == 10
+        expect("pipeline search пропускает .git/.env*/target/node_modules/секрет-каталоги/ключи/бинарный/большой/симлинк",
+                search.filesSkipped() == 21
                         && !searcherJson(search).contains("target/")
                         && !searcherJson(search).contains("node_modules")
                         && !searcherJson(search).contains("binary")
                         && !searcherJson(search).contains("big.txt")
                         && !searcherJson(search).contains("link.txt"));
+        expect("секрет-файлы P4 не читаются и не попадают в вывод",
+                !searcherJson(search).contains("в .ssh") && !searcherJson(search).contains("pem")
+                        && !searcherJson(search).contains("netrc") && !searcherJson(search).contains("pgpass")
+                        && FileSearcher.search(root, "MonitorStore в .aws", null).totalMatches() == 0
+                        && FileSearcher.search(root, "MonitorStore в id_rsa", null).totalMatches() == 0
+                        && FileSearcher.search(root, "MonitorStore в pgpass", null).totalMatches() == 0);
         expect(".env содержимое не попадает в вывод search",
                 !searcherJson(search).contains("MonitorStore-env-secret")
                         && !searcherJson(search).contains("MonitorStore-env-local"));
@@ -1724,6 +1754,18 @@ public final class SelfTest {
 
         int filesBefore = resultsFileCount(results);
         Map<String, Object> corrupted = new LinkedHashMap<>(summary.toMap());
+        // Пустой/пробельный fileName — ошибка инструмента, файл не создаётся.
+        for (String blank : List.of("", " ", "\t")) {
+            try {
+                writer.save(summary.toMap(), blank);
+                expect("бессодержательное fileName отклоняется", false);
+            } catch (PipelineToolException e) {
+                expect("бессодержательное fileName отклоняется",
+                        e.getMessage().contains("не должен быть пустым"));
+            }
+        }
+        expect("после пустых fileName файлы не созданы",
+                resultsFileCount(results) == filesBefore);
         corrupted.put("summaryText", "испорченная сводка");
         try {
             writer.save(corrupted, "corrupt.md");
@@ -1783,9 +1825,69 @@ public final class SelfTest {
                 new PipelineMcpServer(results).save(McpSchema.CallToolRequest.builder()
                         .name(PipelineMcpServer.SAVE_TOOL)
                         .arguments(Map.of("other", 1)).build()).isError());
+
+        // --- формат строки шага (P1/P2): склонение и признак обрезки ---
+        checkPipelineStepSummaryPlural();
     }
 
-    /** Вспомогательный запускатель: runner с java-командой ребёнка и лимитом 10 с. */
+    /** P1/P2: склонение чисел в строке шага search и суффикс обрезки. */
+    private static void checkPipelineStepSummaryPlural() throws Exception {
+        java.lang.reflect.Method summary = Main.class.getDeclaredMethod("stepSummary",
+                PipelineRunner.StepResult.class);
+        summary.setAccessible(true);
+        for (int[] counts : List.of(new int[]{0, 0}, new int[]{1, 1}, new int[]{2, 2},
+                new int[]{5, 5}, new int[]{11, 11}, new int[]{21, 21}, new int[]{22, 22},
+                new int[]{25, 25}, new int[]{111, 111})) {
+            String text = stepSummaryForCounts(counts[0], counts[1], false, summary);
+            expect("склонение строки поиска: " + counts[0] + " совпадений/" + counts[1] + " файлов",
+                    text.equals(counts[0] + expectedPlural(counts[0], " совпадение",
+                            " совпадения", " совпадений")
+                            + " в " + counts[1] + expectedPlural(counts[1],
+                            " файле", " файлах", " файлах")));
+        }
+        String threeTwo = stepSummaryForCounts(3, 2, false, summary);
+        expect("строка поиска на корпусе 3/2: «3 совпадения в 2 файлах»",
+                threeTwo.equals("3 совпадения в 2 файлах"));
+        String one = stepSummaryForCounts(1, 1, false, summary);
+        expect("строка поиска 1/1: «1 совпадение в 1 файле»",
+                one.equals("1 совпадение в 1 файле"));
+        String zero = stepSummaryForCounts(0, 0, false, summary);
+        expect("строка поиска 0/0: «0 совпадений в 0 файлах»",
+                zero.equals("0 совпадений в 0 файлах"));
+        String truncatedFalse = stepSummaryForCounts(6, 3, false, summary);
+        expect("без обрезки суффикс «показано» отсутствует",
+                !truncatedFalse.contains("показано"));
+        String truncatedTrue = stepSummaryForCounts(65, 1, true, summary);
+        expect("с обрезкой строка содержит «показано 50»",
+                truncatedTrue.equals("65 совпадений в 1 файле (показано 50, остальное обрезано лимитом)"));
+    }
+
+    private static String expectedPlural(int count, String one, String few, String many) {
+        return SearchSummarizer.ruPlural(count, one, few, many);
+    }
+
+    /** Сборка данных шага search и вызов частного stepSummary. */
+    private static String stepSummaryForCounts(int matchesTotal, int files, boolean truncated,
+                                               java.lang.reflect.Method stepSummary)
+            throws Exception {
+        int shown = truncated ? Math.min(matchesTotal, 50) : matchesTotal;
+        List<Map<String, Object>> matches = new java.util.ArrayList<>();
+        for (int i = 0; i < shown; i++) {
+            Map<String, Object> match = new LinkedHashMap<>();
+            match.put("file", "f" + (files <= 0 ? 0 : i % files) + ".txt");
+            match.put("line", i + 1);
+            match.put("text", "строка " + i);
+            matches.add(match);
+        }
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("totalMatches", matchesTotal);
+        data.put("truncated", truncated);
+        data.put("matches", matches);
+        PipelineRunner.StepResult step = new PipelineRunner.StepResult(1, "search", true, null,
+                data, 0);
+        return (String) stepSummary.invoke(null, step);
+    }
+
     /** Команда дочернего PipelineMcpServer из текущей сборки (classpath как у Git MCP тестов). */
     private static String pipelineChildCommand(Path results) {
         try (ClasspathOverride ignored = new ClasspathOverride()) {
@@ -3144,10 +3246,34 @@ public final class SelfTest {
             first.close();
         }
         // Lock-файл остаётся, но блокировки больше нет — запуск возможен.
+        // (файл явно задан, per-run — lock удаляется по правилу P5)
         try (JsonConversationStore after = new JsonConversationStore(file)) {
             expect("после освобождения блокировки новый запуск возможен",
                     after.load().messages().isEmpty());
         }
+        // P5: тоже самое с явным флагом per-run генерации — lock удаляется.
+        Path dir = Files.createTempDirectory(baseTempDir, "lock-cleanup-");
+        Path generated = dir.resolve("chat-20260901-000000-000-1abc.json");
+        JsonConversationStore own = new JsonConversationStore(generated, true);
+        Path ownLock = dir.resolve(generated.getFileName().toString() + ".lock");
+        expect("per-run история: lock-файл существует при открытой истории",
+                Files.exists(ownLock));
+        own.close();
+        expect("per-run история: lock-файл удалён при закрытии",
+                !Files.exists(ownLock));
+        own.removeLockFileQuietly();
+        expect("повторный вызов удаления lock не даёт ошибок",
+                !Files.exists(ownLock));
+        Path shared = dir.resolve("explicit-history.json");
+        JsonConversationStore explicit = new JsonConversationStore(shared, false);
+        Path explicitLock = dir.resolve(shared.getFileName().toString() + ".lock");
+        expect("явная история: lock-файл при открытой истории", Files.exists(explicitLock));
+        explicit.close();
+        expect("явная история: lock-файл НЕ удалён при закрытии",
+                Files.exists(explicitLock));
+        explicit.removeLockFileQuietly();
+        expect("явная история: прямой вызов удаления не удаляет lock",
+                Files.exists(explicitLock));
     }
 
     // ---------- /reset и /clear с сохранением между запусками ----------

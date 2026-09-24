@@ -22,9 +22,12 @@ import java.util.Set;
 /**
  * Шаг 1 цепочки: литеральный регистронезависимый поиск по текстовым файлам
  * каталога. Детерминированный порядок, симлинки не следуются, за пределы
- * root не выходит; .git, target, node_modules, .env*, большие и бинарные
- * файлы пропускаются. Результат содержит SHA-256 канонического JSON полей
- * (payloadSha256), по которому следующий шаг проверяет целостность входа.
+ * root не выходит; .git, target, node_modules, .ssh, .gnupg, .aws, .kube,
+ * .docker, .env*, личные ключи (id_rsa, id_dsa, id_ecdsa, id_ed25519
+ * с любым суффиксом), *.pem, *.key, *.p12, *.pfx, .netrc, .pgpass, большие
+ * и бинарные файлы пропускаются (имена без учёта регистра). Результат
+ * содержит SHA-256 канонического JSON полей (payloadSha256), по которому
+ * следующий шаг проверяет целостность входа.
  */
 public final class FileSearcher {
 
@@ -36,7 +39,30 @@ public final class FileSearcher {
     static final int MAX_MATCH_TEXT = 300;
     static final long MAX_FILE_BYTES = 1024L * 1024L;
     static final int BINARY_SNIFF_BYTES = 8 * 1024;
-    private static final Set<String> SKIPPED_DIRECTORIES = Set.of(".git", "target", "node_modules");
+    private static final Set<String> SKIPPED_DIRECTORIES = Set.of(".git", "target", "node_modules",
+            ".ssh", ".gnupg", ".aws", ".kube", ".docker");
+    /** Имена (в нижнем регистре), безусловно пропускаемые по соображениям секретов. */
+    private static final Set<String> SKIPPED_FILE_NAMES = Set.of(".netrc", ".pgpass");
+    /** Расширения (в нижнем регистре) файлов с ключами и сертификатами. */
+    private static final List<String> SKIPPED_SUFFIXES =
+            List.of(".pem", ".key", ".p12", ".pfx");
+    private static final List<String> SKIPPED_NAME_PREFIXES =
+            List.of("id_rsa", "id_dsa", "id_ecdsa", "id_ed25519");
+
+    /** Имя пропускается: личные ключи, сертификаты и известные secret-файлы (без регистра). */
+    static boolean isSkippedFileName(String rawName) {
+        String name = rawName.toLowerCase(Locale.ROOT);
+        if (SKIPPED_FILE_NAMES.contains(name)) {
+            return true;
+        }
+        for (String suffix : SKIPPED_SUFFIXES) {
+            if (name.endsWith(suffix)) return true;
+        }
+        for (String prefix : SKIPPED_NAME_PREFIXES) {
+            if (name.startsWith(prefix)) return true;
+        }
+        return false;
+    }
 
     /** Одно совпадение: файл с разделителями «/», номер строки с 1, обрезанный текст. */
     public record Match(String file, int line, String text) {
@@ -79,7 +105,8 @@ public final class FileSearcher {
                 @Override
                 public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
                     if (!dir.normalize().startsWith(root)) return FileVisitResult.SKIP_SUBTREE;
-                    if (!dir.equals(root) && SKIPPED_DIRECTORIES.contains(dir.getFileName().toString())) {
+                    String dirName = dir.getFileName().toString().toLowerCase(Locale.ROOT);
+                    if (!dir.equals(root) && SKIPPED_DIRECTORIES.contains(dirName)) {
                         skipped[0]++;
                         return FileVisitResult.SKIP_SUBTREE;
                     }
@@ -94,7 +121,7 @@ public final class FileSearcher {
                     }
                     if (!file.normalize().startsWith(root)) return FileVisitResult.CONTINUE;
                     String name = file.getFileName().toString();
-                    if (name.startsWith(".env")) {
+                    if (name.startsWith(".env") || isSkippedFileName(name)) {
                         skipped[0]++;
                         return FileVisitResult.CONTINUE;
                     }
