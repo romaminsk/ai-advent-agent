@@ -175,6 +175,7 @@ public final class SelfTest {
                 checkMcpClient();
                 checkGitMcp();
                 checkMonitorStage();
+                checkMonitorRuntimeLockCleanup();
                 group("MCP Pipeline");
                 checkPipelineStage();
                 checkPipelineChildProcess();
@@ -336,6 +337,7 @@ public final class SelfTest {
             checkMcpClient();
             checkGitMcp();
             checkMonitorStage();
+            checkMonitorRuntimeLockCleanup();
             group("MCP Pipeline");
             checkPipelineStage();
             checkPipelineChildProcess();
@@ -876,6 +878,76 @@ public final class SelfTest {
         } catch (MonitorException e) {
             expect("monitor schedule удаляется", false);
         }
+    }
+
+    /** Runtime-lock cleanup and file-key protocol checks (temporary store only). */
+    private static void checkMonitorRuntimeLockCleanup() throws Exception {
+        MonitorStore store = workerStore("runtime-lock-cleanup");
+        MonitorSchedule schedule = workerSchedule(store, baseTempDir, "runtime-lock-cleanup");
+        Path runtime = store.file().resolveSibling(store.file().getFileName() + "."
+                + schedule.id() + ".run.lock");
+
+        MonitorStore.RuntimeLease first = store.tryRuntimeLock(schedule.id());
+        expect("runtime-lock T1 захватывается и создаётся", first != null && Files.exists(runtime));
+        first.close();
+        first.close();
+        expect("runtime-lock T1 удалён после успешного close", !Files.exists(runtime));
+
+        MonitorStore.RuntimeLease second = store.tryRuntimeLock(schedule.id());
+        expect("runtime-lock T3 повторный запуск захватывается", second != null);
+        second.close();
+        expect("runtime-lock T3 после повторного запуска удалён", !Files.exists(runtime));
+
+        Files.createFile(runtime);
+        MonitorStore.RuntimeLease stale = store.tryRuntimeLock(schedule.id());
+        expect("runtime-lock T4 мёртвый lock-файл не мешает запуску", stale != null);
+        stale.close();
+        expect("runtime-lock T4 мёртвый lock-файл удалён", !Files.exists(runtime));
+
+        Path storeLock = store.file().resolveSibling(store.file().getFileName() + ".lock");
+        store.schedules();
+        expect("runtime-lock T8 основной monitor-store lock существует", Files.exists(storeLock));
+
+        MonitorStore.setFileKeyReaderForTests(path -> null);
+        try {
+            MonitorStore.RuntimeLease noKey = store.tryRuntimeLock(schedule.id());
+            expect("runtime-lock T7 при fileKey == null захват проходит", noKey != null);
+            noKey.close();
+            expect("runtime-lock T7 при fileKey == null файл сохраняется", Files.exists(runtime));
+            Files.deleteIfExists(runtime);
+        } finally {
+            MonitorStore.setFileKeyReaderForTests(null);
+        }
+
+        java.util.concurrent.atomic.AtomicInteger keys = new java.util.concurrent.atomic.AtomicInteger();
+        MonitorStore.setFileKeyReaderForTests(path -> switch (keys.getAndIncrement()) {
+            case 0 -> "old-owner";
+            case 1 -> "replaced-path";
+            default -> "new-owner";
+        });
+        try {
+            MonitorStore.RuntimeLease replaced = store.tryRuntimeLock(schedule.id());
+            expect("runtime-lock T6 подмена файла вызывает повторный захват", replaced != null
+                    && keys.get() >= 4);
+            replaced.close();
+            expect("runtime-lock T6 после повторного захвата файл удалён", !Files.exists(runtime));
+        } finally {
+            MonitorStore.setFileKeyReaderForTests(null);
+            Files.deleteIfExists(runtime);
+        }
+
+        MonitorStore badStore = workerStore("runtime-lock-error");
+        MonitorSchedule bad = badStore.create(baseTempDir.resolve("does-not-exist-runtime-repo")
+                .toString(), Duration.ofSeconds(30), Duration.ofMinutes(1));
+        Path badRuntime = badStore.file().resolveSibling(badStore.file().getFileName() + "."
+                + bad.id() + ".run.lock");
+        MonitorRunner.Result failed;
+        try (ClasspathOverride ignored = new ClasspathOverride()) {
+            failed = new MonitorRunner(badStore).run(bad.id());
+        }
+        expect("runtime-lock T2 ошибка запуска сохраняет неуспешный результат",
+                !failed.run().success());
+        expect("runtime-lock T2 после исключения удалён", !Files.exists(badRuntime));
     }
 
     private static String selfTestMcpCommand(String server) throws Exception {

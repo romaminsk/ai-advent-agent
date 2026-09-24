@@ -16,12 +16,15 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.LinkOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 /** JSON persistence for explicit monitor schedules and bounded results. */
 public final class MonitorStore {
@@ -29,6 +32,8 @@ public final class MonitorStore {
     static final int MAX_RUNS = 100;
     static final int MAX_SUMMARIES = 50;
     private static final ObjectMapper JSON = new ObjectMapper();
+    private static final int RUNTIME_LOCK_ATTEMPTS = 3;
+    private static FileKeyReader fileKeyReader = MonitorStore::readFileKey;
 
     private final Path file;
     private final Path lockFile;
@@ -161,24 +166,65 @@ public final class MonitorStore {
     /** Acquires a per-schedule runtime lock for the duration of one MCP run. */
     public RuntimeLease tryRuntimeLock(String scheduleId) {
         Path runtimeFile = file.resolveSibling(file.getFileName() + "." + scheduleId + ".run.lock");
-        try {
-            FileChannel channel = FileChannel.open(runtimeFile, StandardOpenOption.CREATE,
-                    StandardOpenOption.READ, StandardOpenOption.WRITE);
-            FileLock lock;
+        for (int attempt = 0; attempt < RUNTIME_LOCK_ATTEMPTS; attempt++) {
+            FileChannel channel = null;
+            FileLock lock = null;
             try {
-                lock = channel.tryLock();
-            } catch (OverlappingFileLockException e) {
-                lock = null;
+                channel = FileChannel.open(runtimeFile, StandardOpenOption.CREATE,
+                        StandardOpenOption.READ, StandardOpenOption.WRITE);
+                try {
+                    lock = channel.tryLock();
+                } catch (OverlappingFileLockException e) {
+                    lock = null;
+                }
+                if (lock == null) {
+                    close(channel);
+                    return null;
+                }
+                Object ownerKey = fileKey(runtimeFile);
+                Object pathKey = fileKey(runtimeFile);
+                if (ownerKey != null && !Objects.equals(ownerKey, pathKey)) {
+                    release(lock, channel);
+                    continue;
+                }
+                ownerPermissions(runtimeFile, false);
+                return new RuntimeLease(runtimeFile, channel, lock, ownerKey, ownerKey != null);
+            } catch (IOException e) {
+                release(lock, channel);
+                throw new MonitorException("Не удалось открыть runtime-lock расписания.");
             }
-            if (lock == null) {
-                channel.close();
-                return null;
-            }
-            ownerPermissions(runtimeFile, false);
-            return new RuntimeLease(channel, lock);
-        } catch (IOException e) {
-            throw new MonitorException("Не удалось открыть runtime-lock расписания.");
         }
+        throw new MonitorException("Не удалось подтвердить runtime-lock расписания.");
+    }
+
+    @FunctionalInterface
+    interface FileKeyReader {
+        Object read(Path path) throws IOException;
+    }
+
+    static void setFileKeyReaderForTests(FileKeyReader reader) {
+        fileKeyReader = reader == null ? MonitorStore::readFileKey : reader;
+    }
+
+    private static Object fileKey(Path path) throws IOException {
+        return fileKeyReader.read(path);
+    }
+
+    private static Object readFileKey(Path path) throws IOException {
+        return Files.readAttributes(path, BasicFileAttributes.class,
+                LinkOption.NOFOLLOW_LINKS).fileKey();
+    }
+
+    private static void close(FileChannel channel) {
+        if (channel == null) return;
+        try { channel.close(); } catch (IOException ignored) { }
+    }
+
+    private static void release(FileLock lock, FileChannel channel) {
+        if (lock != null) {
+            try { lock.release(); } catch (IOException ignored) { }
+        }
+        close(channel);
     }
 
     private MonitorSchedule requireSchedule(State state, String id) {
@@ -307,16 +353,33 @@ public final class MonitorStore {
     }
 
     public static final class RuntimeLease implements AutoCloseable {
+        private final Path runtimeFile;
         private final FileChannel channel;
         private final FileLock lock;
+        private final Object ownerKey;
+        private final boolean deleteFile;
 
-        private RuntimeLease(FileChannel channel, FileLock lock) {
+        private RuntimeLease(Path runtimeFile, FileChannel channel, FileLock lock,
+                             Object ownerKey, boolean deleteFile) {
+            this.runtimeFile = runtimeFile;
             this.channel = channel;
             this.lock = lock;
+            this.ownerKey = ownerKey;
+            this.deleteFile = deleteFile;
         }
 
         @Override
         public void close() {
+            if (deleteFile) {
+                try {
+                    Object currentKey = fileKey(runtimeFile);
+                    if (currentKey != null && Objects.equals(currentKey, ownerKey)) {
+                        Files.deleteIfExists(runtimeFile);
+                    }
+                } catch (IOException | RuntimeException e) {
+                    System.err.println("Не удалось удалить monitor runtime-lock; запуск продолжен.");
+                }
+            }
             try { lock.release(); } catch (IOException ignored) { }
             try { channel.close(); } catch (IOException ignored) { }
         }
