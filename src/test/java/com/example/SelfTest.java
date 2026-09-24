@@ -990,6 +990,30 @@ public final class SelfTest {
         expect("runtime-lock T2 ошибка запуска сохраняет неуспешный результат",
                 !failed.run().success());
         expect("runtime-lock T2 после исключения удалён", !Files.exists(badRuntime));
+
+        Path holderReady = Files.createTempFile(baseTempDir, "runtime-holder-", ".ready");
+        Files.deleteIfExists(holderReady);
+        String java = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+        Process holder = new ProcessBuilder(java, "-cp", withChildClasspath(),
+                RuntimeLockHolder.class.getName(), store.file().toString(), schedule.id(),
+                holderReady.toString()).start();
+        activeProcesses.add(holder);
+        try {
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (!Files.exists(holderReady) && System.nanoTime() < deadline) {
+                Thread.sleep(50);
+            }
+            MonitorRunner.Result busy = new MonitorRunner(store).run(schedule.id());
+            expect("runtime-lock R2 дочерний владелец возвращает BUSY",
+                    !busy.run().success() && "BUSY".equals(busy.run().errorCode())
+                            && "Расписание уже выполняется.".equals(busy.run().errorMessage()));
+        } finally {
+            try { holder.getOutputStream().close(); } catch (IOException ignored) { }
+            if (!holder.waitFor(10, TimeUnit.SECONDS)) holder.destroyForcibly();
+            activeProcesses.remove(holder);
+        }
+        expect("runtime-lock R2 после освобождения дочернего владельца удалён",
+                !Files.exists(runtime));
     }
 
     private static String selfTestMcpCommand(String server) throws Exception {
@@ -7070,6 +7094,22 @@ public final class SelfTest {
                 partialStats.snapshot().contextSavingsRequests() == 0);
     }
 
+
+    /** Holds one runtime lock in a separate JVM until stdin reaches EOF. */
+    public static final class RuntimeLockHolder {
+        public static void main(String[] args) throws Exception {
+            Path storeFile = Path.of(args[0]);
+            String scheduleId = args[1];
+            Path ready = Path.of(args[2]);
+            MonitorStore store = new MonitorStore(storeFile);
+            try (MonitorStore.RuntimeLease ignored = store.tryRuntimeLock(scheduleId)) {
+                Files.writeString(ready, "ready", StandardCharsets.UTF_8);
+                while (System.in.read() != -1) {
+                    // Keep the lease until the parent closes stdin.
+                }
+            }
+        }
+    }
 
     private SelfTest() {
     }
