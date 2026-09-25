@@ -648,6 +648,24 @@ public final class SelfTest {
                     && retryCalls.get() == retryFlow.size() + 2
                     && retryOutcome.answer().contains("retry.md")
                     && Files.exists(results.resolve("retry.md")));
+
+            // O30: медленный провайдер — таймаут запроса, повтор не выполняется.
+            java.util.concurrent.atomic.AtomicInteger slowCalls = new java.util.concurrent.atomic.AtomicInteger();
+            McpOrchestrator slowOrchestrator = new McpOrchestrator(registry,
+                    new McpOrchestrator.Model() {
+                        @Override public String complete(String system, String prompt) {
+                            slowCalls.incrementAndGet();
+                            try { Thread.sleep(500); } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                            }
+                            return replies.get(0);
+                        }}, 250);
+            McpOrchestrator.Outcome slowOutcome = slowOrchestrator.run("найди TODO");
+            expect("O30 медленный провайдер: таймаут запроса без повторов и с типом лимита",
+                    slowOutcome.stopped()
+                    && slowOutcome.answer().contains("таймаут запроса к модели (шаг 1")
+                    && slowOutcome.answer().contains("Общая длительность флоу:")
+                    && slowCalls.get() == 1);
         }
     }
 

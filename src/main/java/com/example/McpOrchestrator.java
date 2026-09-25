@@ -22,11 +22,18 @@ public final class McpOrchestrator {
         }
     }
     private static final int MAX_STEPS = 8;
+    /** Общий лимит флоу: 300 с. */
+    private static final long FLOW_DEADLINE_NANOS = 300_000_000_000L;
+    /** Таймаут одного запроса к модели по умолчанию: 60 с. */
+    private static final long DEFAULT_REQUEST_TIMEOUT_MILLIS = 60_000;
+    private static final String FLOW_LIMIT_TEXT = "Остановлено: общий лимит флоу (300с)";
     private final McpRegistry registry;
     private final ToolRouter router;
     private final Model model;
+    private final long requestTimeoutMillis;
     private final ObjectMapper mapper = new ObjectMapper();
     private int modelRequestChars;
+    private long flowStartNanos;
     private String requestText = "";
     private final java.util.concurrent.ExecutorService modelExecutor = Executors.newCachedThreadPool(r -> {
         Thread thread = new Thread(r, "mcp-orchestration-model");
@@ -36,7 +43,13 @@ public final class McpOrchestrator {
     private static final String TRUNCATION = " [обрезано, полные данные доступны через inputRef step:%d]";
 
     public McpOrchestrator(McpRegistry registry, Model model) {
+        this(registry, model, DEFAULT_REQUEST_TIMEOUT_MILLIS);
+    }
+
+    /** Тестовый конструктор: переопределяет таймаут одного запроса к модели. */
+    McpOrchestrator(McpRegistry registry, Model model, long requestTimeoutMillis) {
         this.registry = registry; this.router = new ToolRouter(registry); this.model = model;
+        this.requestTimeoutMillis = requestTimeoutMillis;
     }
     public ToolRouter router() { return router; }
 
@@ -45,20 +58,27 @@ public final class McpOrchestrator {
         String prompt = request;
         requestText = request;
         router.setRequestText(request);
-        long deadline = System.nanoTime() + 180_000_000_000L;
+        flowStartNanos = System.nanoTime();
+        long deadline = flowStartNanos + FLOW_DEADLINE_NANOS;
         int invalidResponses = 0;
         for (int i = 0; i < MAX_STEPS; i++) {
-            if (System.nanoTime() >= deadline) return stopped("Остановлено: таймаут");
+            if (System.nanoTime() >= deadline) return stopped(FLOW_LIMIT_TEXT);
             String raw;
             long remainingMillis = Math.max(1, (deadline - System.nanoTime()) / 1_000_000);
+            long attemptTimeoutMillis = Math.min(requestTimeoutMillis, remainingMillis);
             try {
-                raw = completeWithRetry(system, prompt, remainingMillis);
+                raw = completeWithRetry(system, prompt, attemptTimeoutMillis, deadline);
             } catch (TimeoutException e) {
-                return stopped("Остановлено: таймаут");
+                return stopped(requestTimeoutText(attemptTimeoutMillis));
+            } catch (FlowLimitException e) {
+                return stopped(FLOW_LIMIT_TEXT);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                return stopped("Остановлено: таймаут");
+                return stopped("Остановлено: запрос прерван.");
             } catch (ApiFailure e) {
+                if ("таймаут запроса".equals(e.reason())) {
+                    return stopped(requestTimeoutText(attemptTimeoutMillis), e.diagnostic(modelRequestChars));
+                }
                 return stopped("Остановлено: ошибка API модели: " + e.reason(), e.diagnostic(modelRequestChars));
             }
             Map<String, Object> command;
@@ -104,9 +124,20 @@ public final class McpOrchestrator {
         return stopped("Остановлено: превышен лимит шагов (8)");
     }
 
-    private Outcome stopped(String reason) { return new Outcome(reason, true, reason, router.steps()); }
+    private Outcome stopped(String reason) { return new Outcome(reason + durationSuffix(), true, reason, router.steps()); }
     private Outcome stopped(String reason, String diagnostic) {
-        return new Outcome(reason, true, reason, router.steps(), diagnostic);
+        return new Outcome(reason + durationSuffix(), true, reason, router.steps(), diagnostic);
+    }
+    /** Общая длительность флоу в секундах — добавляется к тексту остановки. */
+    private String durationSuffix() {
+        return " Общая длительность флоу: " + ((System.nanoTime() - flowStartNanos) / 1_000_000_000L) + " с.";
+    }
+    private String requestTimeoutText(long attemptTimeoutMillis) {
+        return "Остановлено: таймаут запроса к модели (шаг " + (router.steps().size() + 1) + ", "
+                + formatTimeout(attemptTimeoutMillis) + ").";
+    }
+    private static String formatTimeout(long millis) {
+        return millis % 1000 == 0 ? (millis / 1000) + "с" : millis + "мс";
     }
     private boolean requiredFlowComplete() {
         boolean git = false, search = false, summarize = false, save = false;
@@ -215,16 +246,23 @@ public final class McpOrchestrator {
     }
     private static String safe(String value) { return value == null ? "ошибка" : value.replaceAll("[\\r\\n]+", " "); }
 
-    private String completeWithRetry(String system, String prompt, long timeoutMillis)
-            throws TimeoutException, InterruptedException, ApiFailure {
+    private String completeWithRetry(String system, String prompt, long attemptTimeoutMillis, long deadlineNanos)
+            throws TimeoutException, InterruptedException, FlowLimitException, ApiFailure {
         Throwable failure = null;
         for (int attempt = 0; attempt < 1 + RETRY_PAUSES_MILLIS.length; attempt++) {
-            if (attempt > 0) Thread.sleep(RETRY_PAUSES_MILLIS[attempt - 1]);
+            if (attempt > 0) {
+                long pause = RETRY_PAUSES_MILLIS[attempt - 1];
+                // Повтор не выполняется, если не остаётся общего бюджета флоу.
+                if (System.nanoTime() + (pause + 1000L) * 1_000_000 >= deadlineNanos) {
+                    throw new FlowLimitException();
+                }
+                Thread.sleep(pause);
+            }
             try {
                 String modelPrompt = prompt;
                 modelRequestChars = system.length() + modelPrompt.length();
                 Future<String> call = modelExecutor.submit(() -> model.complete(system, modelPrompt));
-                return call.get(timeoutMillis, TimeUnit.MILLISECONDS);
+                return call.get(attemptTimeoutMillis, TimeUnit.MILLISECONDS);
             } catch (ExecutionException e) {
                 failure = e.getCause() == null ? e : e.getCause();
                 if (attempt < RETRY_PAUSES_MILLIS.length && transientApiFailure(failure)) continue;
@@ -237,11 +275,14 @@ public final class McpOrchestrator {
     /** Паузы между повторами при временных сбоях API: 2 с и 5 с. */
     private static final long[] RETRY_PAUSES_MILLIS = {2000, 5000};
 
+    /** Исчерпан общий лимит флоу — повтор бессмыслен. */
+    private static final class FlowLimitException extends Exception {}
+
     private static boolean transientApiFailure(Throwable error) {
         String text = error == null ? "" : String.valueOf(error.getMessage()).toLowerCase();
+        // Таймаут запроса не повторяется; повторяются 429, 5xx, обрыв сети и пустой ответ.
         return text.contains("http-статус 429") || text.matches(".*http-статус 5\\d\\d.*")
-                || text.contains("сетевая ошибка") || text.contains("таймаут") || text.contains("timeout")
-                || text.contains("пустой итоговый ответ");
+                || text.contains("сетевая ошибка") || text.contains("пустой итоговый ответ");
     }
 
     private static String apiReason(Throwable error) {
@@ -249,6 +290,8 @@ public final class McpOrchestrator {
         java.util.regex.Matcher code = java.util.regex.Pattern.compile("HTTP-статус \\d+").matcher(text);
         if (code.find()) return code.group();
         if (text.toLowerCase().contains("сетевая ошибка")) return "сетевая ошибка";
+        String lower = text.toLowerCase();
+        if (lower.contains("таймаут") || lower.contains("timed out")) return "таймаут запроса";
         return error == null ? "неизвестный тип" : error.getClass().getSimpleName();
     }
 
