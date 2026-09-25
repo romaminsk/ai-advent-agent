@@ -15,12 +15,18 @@ import java.util.concurrent.TimeoutException;
 /** Цикл строгого JSON-протокола выбора MCP-инструментов. */
 public final class McpOrchestrator {
     public interface Model { String complete(String system, String prompt); }
-    public record Outcome(String answer, boolean stopped, String stopReason, List<ToolRouter.Step> steps) {}
+    public record Outcome(String answer, boolean stopped, String stopReason, List<ToolRouter.Step> steps,
+                          String diagnostic) {
+        public Outcome(String answer, boolean stopped, String stopReason, List<ToolRouter.Step> steps) {
+            this(answer, stopped, stopReason, steps, null);
+        }
+    }
     private static final int MAX_STEPS = 8;
     private final McpRegistry registry;
     private final ToolRouter router;
     private final Model model;
     private final ObjectMapper mapper = new ObjectMapper();
+    private int modelRequestChars;
     private final java.util.concurrent.ExecutorService modelExecutor = Executors.newCachedThreadPool(r -> {
         Thread thread = new Thread(r, "mcp-orchestration-model");
         thread.setDaemon(true);
@@ -50,7 +56,7 @@ public final class McpOrchestrator {
                 Thread.currentThread().interrupt();
                 return stopped("Остановлено: таймаут");
             } catch (ApiFailure e) {
-                return stopped("Остановлено: ошибка API модели: " + e.reason());
+                return stopped("Остановлено: ошибка API модели: " + e.reason(), e.diagnostic(modelRequestChars));
             }
             Map<String, Object> command;
             try {
@@ -92,6 +98,9 @@ public final class McpOrchestrator {
     }
 
     private Outcome stopped(String reason) { return new Outcome(reason, true, reason, router.steps()); }
+    private Outcome stopped(String reason, String diagnostic) {
+        return new Outcome(reason, true, reason, router.steps(), diagnostic);
+    }
     private boolean requiredFlowComplete() {
         boolean git = false, search = false, summarize = false, save = false;
         for (ToolRouter.Step step : router.steps()) {
@@ -164,6 +173,7 @@ public final class McpOrchestrator {
                 + " только потом pipeline.summarize и pipeline.saveToFile. Сначала собери данные."
                 + " Не отвечай final до завершения нужных инструментальных шагов."
                 + " Передавай данные между шагами только через inputRef=step:N, не выдумывай результаты."
+                + " query — точное искомое слово из запроса пользователя, без кавычек и лишних слов."
                 + " Примеры: {\"tool\":\"git.get-repository-status\",\"args\":{\"repoPath\":\"/repo\"}};"
                 + " {\"tool\":\"pipeline.search\",\"args\":{\"root\":\"/repo\",\"query\":\"TODO\"}};"
                 + " {\"tool\":\"pipeline.summarize\",\"args\":{\"inputRef\":\"step:2\"}};"
@@ -178,15 +188,16 @@ public final class McpOrchestrator {
         for (int attempt = 0; attempt < 2; attempt++) {
             try {
                 String modelPrompt = prompt;
+                modelRequestChars = system.length() + modelPrompt.length();
                 Future<String> call = modelExecutor.submit(() -> model.complete(system, modelPrompt));
                 return call.get(timeoutMillis, TimeUnit.MILLISECONDS);
             } catch (ExecutionException e) {
                 failure = e.getCause() == null ? e : e.getCause();
                 if (attempt == 0 && transientApiFailure(failure)) continue;
-                throw new ApiFailure(apiReason(failure));
+                throw new ApiFailure(apiReason(failure), failure, attempt + 1);
             }
         }
-        throw new ApiFailure(apiReason(failure));
+        throw new ApiFailure(apiReason(failure), failure, 2);
     }
 
     private static boolean transientApiFailure(Throwable error) {
@@ -205,7 +216,22 @@ public final class McpOrchestrator {
 
     private static final class ApiFailure extends Exception {
         private final String reason;
-        private ApiFailure(String reason) { this.reason = reason; }
+        private final Throwable cause;
+        private final int attempts;
+        private ApiFailure(String reason, Throwable cause, int attempts) {
+            this.reason = reason; this.cause = cause; this.attempts = attempts;
+        }
         private String reason() { return reason; }
+        private String diagnostic(int requestChars) {
+            List<String> causes = new ArrayList<>();
+            Throwable current = cause;
+            while (current != null) {
+                causes.add(current.getClass().getSimpleName());
+                current = current.getCause();
+            }
+            return "класс=" + (cause == null ? "unknown" : cause.getClass().getSimpleName())
+                    + "; cause=" + String.join("->", causes)
+                    + "; повтор=" + (attempts - 1) + "; requestChars=" + requestChars;
+        }
     }
 }

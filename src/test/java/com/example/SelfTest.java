@@ -384,6 +384,8 @@ public final class SelfTest {
             checkPipelineStage();
             checkPipelineChildProcess();
             checkPipelineCommandsViaMain();
+            group("Orchestration");
+            checkOrchestration();
             group("Worker планировщик");
             checkWorkerSchedulerInterval();
             checkWorkerCoalesce();
@@ -508,6 +510,26 @@ public final class SelfTest {
                 expect("O16 Git-репозиторий читается из non-Git cwd", validFromOutside.ok());
             }
 
+            Path homeDemo = Files.createTempDirectory(Path.of(System.getProperty("user.home")), "selftest-fix-demo-");
+            Files.createDirectories(homeDemo.resolve("sub"));
+            Files.createDirectories(homeDemo.resolve(".ssh"));
+            Files.writeString(homeDemo.resolve("a.txt"), "FixWord one\nfixword two\n");
+            Files.writeString(homeDemo.resolve("sub/b.txt"), "FIXWORD sub\n");
+            Files.writeString(homeDemo.resolve(".ssh/id_ed25519"), "fixword secret\n");
+            Files.writeString(homeDemo.resolve("server.PEM"), "fixword cert\n");
+            Path homeResults = Files.createDirectory(baseTempDir.resolve("home-demo-results"));
+            try (McpRegistry homeRegistry = McpRegistry.open(homeDemo, homeResults)) {
+                ToolRouter.Result homeSearch = new ToolRouter(homeRegistry).call("pipeline.search",
+                        Map.of("root", "~/" + homeDemo.getFileName(), "query", "fixword"));
+                expect("O21 tilde search находит 3 совпадения в 2 файлах", homeSearch.ok()
+                        && Integer.valueOf(3).equals(homeSearch.data().get("totalMatches"))
+                        && ((List<?>) homeSearch.data().get("matches")).size() == 3
+                        && ((List<?>) homeSearch.data().get("matches")).stream()
+                        .noneMatch(item -> String.valueOf(item).contains(".ssh") || String.valueOf(item).contains("PEM")));
+            } finally {
+                deleteRecursively(homeDemo);
+            }
+
             List<String> correction = List.of(
                     "{\"tool\":\"server.pipeline.summarize\",\"args\":{\"inputRef\":\"step:2\"}}",
                     "{\"tool\":\"git.get-repository-status\",\"args\":{\"repoPath\":\"" + repo + "\"}}",
@@ -560,18 +582,20 @@ public final class SelfTest {
         git(repo, "add", "todo.txt", ".ssh", "server.PEM");
         git(repo, "commit", "-m", "live fixture");
         Files.writeString(repo.resolve("todo.txt"), "TODO changed\n");
-        Path results = Files.createDirectory(baseTempDir.resolve("pipeline-results"));
-        boolean passedAttempt = false;
-        for (int attempt = 1; attempt <= 2 && !passedAttempt; attempt++) {
+        int passedRuns = 0;
+        for (int liveRun = 1; liveRun <= 3; liveRun++) {
+            Path results = Files.createDirectory(baseTempDir.resolve("pipeline-results-" + liveRun));
+            boolean passedAttempt = false;
+            for (int attempt = 1; attempt <= 2 && !passedAttempt; attempt++) {
             List<ToolRouter.Step> journal;
             try (JsonConversationStore store = new JsonConversationStore(
-                    baseTempDir.resolve("live-history-" + attempt + ".json"));
+                    baseTempDir.resolve("live-history-" + liveRun + "-" + attempt + ".json"));
                  McpRegistry registry = McpRegistry.open(repo, results)) {
                 LlmAgent llm = new LlmAgent(new Config(env.get("LLM_API_KEY"), url, model),
                         ModelSettings.fromEnv(), store,
-                        new MemoryStore(baseTempDir.resolve("live-memory-" + attempt + ".json")),
-                        new ProfileStore(baseTempDir.resolve("live-profile-" + attempt + ".json")),
-                        new InvariantStore(baseTempDir.resolve("live-invariants-" + attempt + ".json")));
+                        new MemoryStore(baseTempDir.resolve("live-memory-" + liveRun + "-" + attempt + ".json")),
+                        new ProfileStore(baseTempDir.resolve("live-profile-" + liveRun + "-" + attempt + ".json")),
+                        new InvariantStore(baseTempDir.resolve("live-invariants-" + liveRun + "-" + attempt + ".json")));
                 McpOrchestrator.Outcome outcome = new McpOrchestrator(registry,
                         (system, prompt) -> llm.askWithoutHistory(system, prompt))
                         .run("Проверь состояние репозитория по точному абсолютному пути " + repo + "\n"
@@ -580,20 +604,33 @@ public final class SelfTest {
                                 + "Не отвечай final, пока файл не сохранён.");
                 journal = outcome.steps();
                 for (ToolRouter.Step step : journal) {
-                    System.out.println("live attempt " + attempt + ": " + step.number() + " | "
+                    System.out.println("live attempt " + liveRun + "/" + attempt + ": " + step.number() + " | "
                             + step.server() + " | " + step.tool() + " | " + step.inputRef()
                             + " | " + (step.ok() ? "ok" : "error: " + step.error()));
                 }
                 passedAttempt = liveChecks(journal, results, env.get("LLM_API_KEY"));
             }
+            }
+            if (passedAttempt) passedRuns++;
         }
-        expect("live orchestration соответствует контракту", passedAttempt);
+        expect("live orchestration: 3 прогона без API-ошибок", passedRuns == 3);
 
         Path nonGit = Files.createDirectory(baseTempDir.resolve("live-non-git"));
-        Files.writeString(nonGit.resolve("fix.txt"), "fixword one\nfixword two\n");
+        Files.createDirectories(nonGit.resolve("sub"));
+        Files.createDirectories(nonGit.resolve(".ssh"));
+        Files.writeString(nonGit.resolve("a.txt"), "FixWord one\nfixword two\n");
+        Files.writeString(nonGit.resolve("sub/b.txt"), "FIXWORD sub\n");
+        Files.writeString(nonGit.resolve(".ssh/id_ed25519"), "fixword secret\n");
+        Files.writeString(nonGit.resolve("server.PEM"), "fixword cert\n");
         Path nonGitResults = Files.createDirectory(baseTempDir.resolve("live-non-git-results"));
         try (JsonConversationStore store = new JsonConversationStore(baseTempDir.resolve("live-non-git-history.json"));
              McpRegistry registry = McpRegistry.open(nonGit, nonGitResults)) {
+            ToolRouter.Result fixtureSearch = new ToolRouter(registry).call("pipeline.search",
+                    Map.of("root", nonGit.toString(), "query", "fixword"));
+            expect("live non-Git fixture содержит 3 совпадения в 2 файлах", fixtureSearch.ok()
+                    && Integer.valueOf(3).equals(fixtureSearch.data().get("totalMatches"))
+                    && ((List<?>) fixtureSearch.data().get("matches")).stream()
+                    .map(item -> String.valueOf(((Map<?, ?>) item).get("file"))).distinct().count() == 2);
             LlmAgent llm = new LlmAgent(new Config(env.get("LLM_API_KEY"), url, model),
                     ModelSettings.fromEnv(), store,
                     new MemoryStore(baseTempDir.resolve("live-non-git-memory.json")),
@@ -603,7 +640,9 @@ public final class SelfTest {
                     (system, prompt) -> llm.askWithoutHistory(system, prompt)).run(
                     "Проверь состояние репозитория " + nonGit
                             + ". Git-шаг может завершиться ошибкой, но продолжи pipeline:"
-                            + " найди fixword, сделай сводку и сохрани файл; финальный ответ упомяни ошибку Git.");
+                            + " найди точное слово fixword, сделай сводку и ОБЯЗАТЕЛЬНО вызови "
+                            + "pipeline.saveToFile с inputRef от summarize; только после сохранения "
+                            + "верни final и упомяни ошибку Git.");
             for (ToolRouter.Step step : outcome.steps()) {
                 System.out.println("live b: " + step.number() + " | " + step.server() + " | "
                         + step.tool() + " | " + step.inputRef() + " | "
@@ -613,7 +652,8 @@ public final class SelfTest {
                     outcome.steps().size() <= 8 && outcome.steps().stream().anyMatch(step -> !step.ok()
                             && "git".equals(step.server()))
                             && outcome.steps().stream().anyMatch(step -> step.ok() && "saveToFile".equals(step.tool()))
-                            && outcome.answer().toLowerCase(Locale.ROOT).contains("git"));
+                            && outcome.steps().stream().anyMatch(step -> !step.ok()
+                            && "Путь не является Git-репозиторием.".equals(step.error())));
         }
     }
 
@@ -641,6 +681,15 @@ public final class SelfTest {
     private static int indexOf(List<ToolRouter.Step> steps, String server, String tool) {
         for (int i = 0; i < steps.size(); i++) if (server.equals(steps.get(i).server()) && tool.equals(steps.get(i).tool()) && steps.get(i).ok()) return i;
         return -1;
+    }
+
+    private static boolean resultFilesContain(Path directory, String text) {
+        try (var files = Files.list(directory)) {
+            return files.anyMatch(path -> {
+                try { return Files.readString(path).contains(text); }
+                catch (IOException e) { return false; }
+            });
+        } catch (IOException e) { return false; }
     }
 
     private static Map<String, String> readDotEnv() throws IOException {

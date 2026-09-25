@@ -3376,7 +3376,14 @@ public final class Main {
                         + (step.ok() ? "✓" : "✗") + " " + orchestrationStepSummary(step,
                         orchestrator.router().data("step:" + step.number())));
             }
+            List<String> failed = new ArrayList<>();
+            for (ToolRouter.Step step : outcome.steps()) {
+                if (!step.ok()) failed.add(step.number() + " (" + step.server() + " → "
+                        + step.tool() + ": " + step.error() + ")");
+            }
             ui.showSystem("Итог: " + outcome.answer());
+            if (!failed.isEmpty()) ui.showSystem("Шаги с ошибкой: " + String.join(", ", failed));
+            if (outcome.diagnostic() != null) ui.showSystem("Диагностика API: " + outcome.diagnostic());
         } catch (Exception e) {
             ui.showError("Ошибка оркестрации: " + (e.getMessage() == null ? "неизвестная ошибка" : e.getMessage()));
         }
@@ -3386,10 +3393,12 @@ public final class Main {
         if (!step.ok()) return step.error() == null ? "ошибка" : step.error();
         if ("search".equals(step.tool())) {
             Object count = data == null ? null : data.get("totalMatches");
-            return String.valueOf(count == null ? 0 : count) + " совпадений";
+            return String.valueOf(count == null ? 0 : count) + " совпадений"
+                    + " (root=" + step.args().get("root") + ", query=" + step.args().get("query") + ")";
         }
         if ("summarize".equals(step.tool())) return "целостность подтверждена";
         if ("saveToFile".equals(step.tool())) return String.valueOf(data == null ? "результат сохранён" : data.get("path"));
+        if ("get-repository-status".equals(step.tool())) return "(repoPath=" + step.args().get("repoPath") + ")";
         return "выполнено";
     }
 

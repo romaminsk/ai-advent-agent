@@ -31,7 +31,7 @@ public final class ToolRouter {
         String tool = name.length == 2 ? name[1] : String.valueOf(qualifiedName);
         Map<String, Object> args = supplied == null ? Map.of() : new LinkedHashMap<>(supplied);
         if ("pipeline".equals(server) && "search".equals(tool) && args.get("root") instanceof String root) {
-            String normalizedRoot = root.trim().replaceAll("[.,;:!?\\)\\]]+$", "");
+            String normalizedRoot = expandUser(root.trim().replaceAll("[.,;:!?\\)\\]]+$", ""));
             if (!normalizedRoot.equals(root)) args.put("root", normalizedRoot);
         }
         String inputRef = args.get("inputRef") instanceof String ref ? ref : null;
@@ -104,6 +104,12 @@ public final class ToolRouter {
             }
         }
         return row[right.length()];
+    }
+
+    private static String expandUser(String value) {
+        if ("~".equals(value)) return System.getProperty("user.home");
+        if (value.startsWith("~/")) return System.getProperty("user.home") + value.substring(1);
+        return value;
     }
 
     private Step step(int n, String server, String tool, Map<String, Object> args, String ref,
