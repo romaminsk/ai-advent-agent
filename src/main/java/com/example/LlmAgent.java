@@ -1037,6 +1037,20 @@ public final class LlmAgent {
         return answer;
     }
 
+    /** Выполняет служебный запрос без добавления сообщений в историю чата. */
+    public String askWithoutHistory(String systemPrompt, String userMessage) {
+        if (systemPrompt == null || systemPrompt.isBlank() || userMessage == null || userMessage.isBlank()) {
+            throw new AgentException("Пустой запрос оркестрации.");
+        }
+        ParsedAnswer parsed = executeCall(List.of(new ChatMessage("system", systemPrompt),
+                new ChatMessage("user", userMessage)), settings.maxOutputTokens(),
+                UUID.randomUUID().toString(), false, SessionTokenStats.Purpose.REGULAR);
+        if (parsed.content() == null) {
+            throw emptyAnswerError(parsed.finishReason());
+        }
+        return AnsiSanitizer.sanitize(parsed.content());
+    }
+
     /** Прогноз контекстного бюджета: оценка входа плюс резерв выхода (max_tokens). */
     private int projectedContextTokens(int estimatedRequestTokens) {
         return estimatedRequestTokens + settings.maxOutputTokens();

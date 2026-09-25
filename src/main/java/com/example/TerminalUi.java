@@ -313,6 +313,9 @@ public interface TerminalUi extends AutoCloseable {
                       /mcp pipeline tools
                       /mcp pipeline run <путь> <запрос>
                       /mcp pipeline call search|summarize|saveToFile <JSON-аргументы>
+                       /mcp agent <запрос>
+                       /mcp servers
+                       /mcp tools
                       /mcp git tools /absolute/path/to/repository
                       /mcp git status /absolute/path/to/repository
                       /mcp explain

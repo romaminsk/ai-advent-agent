@@ -169,6 +169,47 @@ public final class SelfTest {
         }
         Runtime.getRuntime().addShutdownHook(new Thread(SelfTest::cleanupProcesses,
                 "self-test-process-cleanup"));
+        if (args.length > 0 && "orchestration".equals(args[0])) {
+            baseTempDir = Files.createTempDirectory("selftest-orchestration");
+            try {
+                group("Orchestration");
+                checkOrchestration();
+                printSummary();
+                if (!failures.isEmpty()) System.exit(1);
+            } catch (Throwable error) {
+                failures.add("группа: Orchestration; непредвиденная ошибка: "
+                        + error + "\n" + stackTrace(error));
+                System.out.println("CATCH-INFO: непредвиденная ошибка: " + error);
+                error.printStackTrace();
+            } finally {
+                cleanupProcesses();
+                deleteRecursively(baseTempDir);
+            }
+            return;
+        }
+        if (args.length > 0 && "orchestration-live".equals(args[0])) {
+            group("Orchestration live");
+            Map<String, String> env = readDotEnv();
+            if (env.get("LLM_API_KEY") == null || env.get("LLM_API_KEY").isBlank()) {
+                failures.add("orchestration-live: нет ключа в .env");
+                System.out.println("FAIL: orchestration-live: нет ключа в .env");
+                printSummary();
+                System.exit(1);
+            }
+            baseTempDir = Files.createTempDirectory("selftest-orchestration-live");
+            try {
+                checkOrchestrationLive(env);
+            } catch (Throwable error) {
+                failures.add("orchestration-live: " + error + "\n" + stackTrace(error));
+                System.out.println("FAIL: orchestration-live: " + error.getMessage());
+            } finally {
+                cleanupProcesses();
+                deleteRecursively(baseTempDir);
+            }
+            printSummary();
+            if (!failures.isEmpty()) System.exit(1);
+            return;
+        }
         if (args.length > 0 && "mcp".equals(args[0])) {
             baseTempDir = Files.createTempDirectory("selftest-mcp");
             try {
@@ -400,6 +441,146 @@ public final class SelfTest {
             System.out.println("OK: все проверки пройдены (" + passed + ").");
         } else {
             System.exit(1);
+        }
+    }
+
+    private static void checkOrchestration() throws Exception {
+        Path repo = Files.createDirectory(baseTempDir.resolve("orchestration-repo"));
+        git(repo, "init");
+        Files.writeString(repo.resolve("todo.txt"), "TODO one\nTODO two\n");
+        git(repo, "add", "todo.txt");
+        git(repo, "commit", "-m", "initial");
+        Path results = Files.createDirectory(baseTempDir.resolve("pipeline-results"));
+        List<String> replies = List.of(
+                "{\"tool\":\"git.get-repository-status\",\"args\":{\"repoPath\":\"" + repo + "\"}}",
+                "{\"tool\":\"pipeline.search\",\"args\":{\"root\":\"" + repo + "\",\"query\":\"TODO\"}}",
+                "{\"tool\":\"pipeline.summarize\",\"args\":{\"inputRef\":\"step:2\"}}",
+                "{\"tool\":\"pipeline.saveToFile\",\"args\":{\"inputRef\":\"step:3\",\"fileName\":\"orchestration.md\"}}",
+                "{\"final\":\"Проверка выполнена.\"}");
+        try (McpRegistry registry = McpRegistry.open(repo, results)) {
+            expect("каталог содержит только git и pipeline", registry.statuses().size() == 2
+                    && registry.tools().size() == 4);
+            McpOrchestrator orchestrator = new McpOrchestrator(registry, new McpOrchestrator.Model() {
+                private int index;
+                @Override public String complete(String system, String prompt) { return replies.get(index++); }
+            });
+            McpOrchestrator.Outcome outcome = orchestrator.run("Проверь TODO и сохрани сводку");
+            List<ToolRouter.Step> steps = outcome.steps();
+            expect("длинный флоу завершён", !outcome.stopped() && "Проверка выполнена.".equals(outcome.answer()));
+            expect("маршрутизация git и pipeline", steps.size() == 4
+                    && "git".equals(steps.get(0).server()) && "pipeline".equals(steps.get(1).server()));
+            expect("порядок search summarize saveToFile", "search".equals(steps.get(1).tool())
+                    && "summarize".equals(steps.get(2).tool()) && "saveToFile".equals(steps.get(3).tool()));
+            expect("inputRef передан ссылкой", "step:2".equals(steps.get(2).inputRef())
+                    && "step:3".equals(steps.get(3).inputRef()));
+            expect("файл результата создан", Files.exists(results.resolve("orchestration.md")));
+            expect("monitor отсутствует в каталоге", registry.tools().stream()
+                    .noneMatch(tool -> tool.qualifiedName().startsWith("monitor.")));
+
+            McpOrchestrator invalid = new McpOrchestrator(registry,
+                    new SequenceModel("{\"tool\":\"pipeline.summarize\",\"args\":{\"searchResult\":{}}}",
+                            "{\"tool\":\"foo.bar\",\"args\":{}}", "{\"final\":\"исправлено\"}"));
+            McpOrchestrator.Outcome invalidOutcome = invalid.run("исправь");
+            expect("ошибочные шаги возвращаются модели", invalidOutcome.steps().size() >= 2
+                    && !invalidOutcome.steps().get(0).ok() && !invalidOutcome.steps().get(1).ok());
+        }
+    }
+
+    private static void checkOrchestrationLive(Map<String, String> env) throws Exception {
+        String url = env.get("LLM_API_URL");
+        String model = env.getOrDefault("LLM_MODEL", "glm-5.3-flash");
+        if (url == null || url.isBlank()) throw new AssertionError("LLM_API_URL отсутствует в .env");
+        Path repo = Files.createDirectory(baseTempDir.resolve("live-repo"));
+        git(repo, "init");
+        Files.writeString(repo.resolve("todo.txt"), "TODO one\nTODO two\nTODO three\n");
+        Files.createDirectories(repo.resolve(".ssh"));
+        Files.writeString(repo.resolve(".ssh/id_ed25519"), "TODO private marker\n");
+        Files.writeString(repo.resolve("server.PEM"), "TODO certificate marker\n");
+        git(repo, "add", "todo.txt", ".ssh", "server.PEM");
+        git(repo, "commit", "-m", "live fixture");
+        Files.writeString(repo.resolve("todo.txt"), "TODO changed\n");
+        Path results = Files.createDirectory(baseTempDir.resolve("pipeline-results"));
+        boolean passedAttempt = false;
+        for (int attempt = 1; attempt <= 2 && !passedAttempt; attempt++) {
+            List<ToolRouter.Step> journal;
+            try (JsonConversationStore store = new JsonConversationStore(
+                    baseTempDir.resolve("live-history-" + attempt + ".json"));
+                 McpRegistry registry = McpRegistry.open(repo, results)) {
+                LlmAgent llm = new LlmAgent(new Config(env.get("LLM_API_KEY"), url, model),
+                        ModelSettings.fromEnv(), store,
+                        new MemoryStore(baseTempDir.resolve("live-memory-" + attempt + ".json")),
+                        new ProfileStore(baseTempDir.resolve("live-profile-" + attempt + ".json")),
+                        new InvariantStore(baseTempDir.resolve("live-invariants-" + attempt + ".json")));
+                McpOrchestrator.Outcome outcome = new McpOrchestrator(registry,
+                        (system, prompt) -> llm.askWithoutHistory(system, prompt))
+                        .run("Проверь состояние репозитория по точному абсолютному пути " + repo + "\n"
+                                + "Сначала вызови git.get-repository-status, затем найди все TODO "
+                                + "через pipeline.search, затем сделай сводку и сохрани её в файл. "
+                                + "Не отвечай final, пока файл не сохранён.");
+                journal = outcome.steps();
+                for (ToolRouter.Step step : journal) {
+                    System.out.println("live attempt " + attempt + ": " + step.number() + " | "
+                            + step.server() + " | " + step.tool() + " | " + step.inputRef()
+                            + " | " + (step.ok() ? "ok" : "error: " + step.error()));
+                }
+                passedAttempt = liveChecks(journal, results, env.get("LLM_API_KEY"));
+            }
+        }
+        expect("live orchestration соответствует контракту", passedAttempt);
+    }
+
+    private static boolean liveChecks(List<ToolRouter.Step> steps, Path results, String secret) {
+        if (steps.size() > 8) return false;
+        int git = indexOf(steps, "git", "get-repository-status");
+        int search = indexOf(steps, "pipeline", "search");
+        int summarize = indexOf(steps, "pipeline", "summarize");
+        int save = indexOf(steps, "pipeline", "saveToFile");
+        if (git < 0 || search < 0 || summarize < 0 || save < 0 || !(git < save && search < summarize && summarize < save)) return false;
+        if (!("step:" + (search + 1)).equals(steps.get(summarize).inputRef())
+                || !("step:" + (summarize + 1)).equals(steps.get(save).inputRef())) return false;
+        try {
+            String contents;
+            try (var files = Files.list(results)) {
+                contents = files.filter(Files::isRegularFile)
+                        .map(path -> { try { return Files.readString(path); } catch (IOException e) { return ""; } })
+                        .reduce("", String::concat);
+            }
+            return !contents.contains(".ssh") && !contents.contains("server.PEM")
+                    && (secret == null || !contents.contains(secret));
+        } catch (IOException e) { return false; }
+    }
+
+    private static int indexOf(List<ToolRouter.Step> steps, String server, String tool) {
+        for (int i = 0; i < steps.size(); i++) if (server.equals(steps.get(i).server()) && tool.equals(steps.get(i).tool()) && steps.get(i).ok()) return i;
+        return -1;
+    }
+
+    private static Map<String, String> readDotEnv() throws IOException {
+        Map<String, String> values = new LinkedHashMap<>();
+        Path file = Path.of(".env");
+        if (!Files.isRegularFile(file)) return values;
+        for (String line : Files.readAllLines(file, StandardCharsets.UTF_8)) {
+            String value = line.trim();
+            if (value.isEmpty() || value.startsWith("#")) continue;
+            if (value.startsWith("export ")) value = value.substring(7).trim();
+            int equals = value.indexOf('=');
+            if (equals <= 0) continue;
+            String key = value.substring(0, equals).trim();
+            String parsed = value.substring(equals + 1).trim();
+            if ((parsed.startsWith("\"") && parsed.endsWith("\"")) || (parsed.startsWith("'") && parsed.endsWith("'"))) {
+                parsed = parsed.substring(1, parsed.length() - 1);
+            }
+            values.put(key, parsed);
+        }
+        return values;
+    }
+
+    private static final class SequenceModel implements McpOrchestrator.Model {
+        private final List<String> replies;
+        private int index;
+        private SequenceModel(String... replies) { this.replies = List.of(replies); }
+        @Override public String complete(String system, String prompt) {
+            return replies.get(Math.min(index++, replies.size() - 1));
         }
     }
 

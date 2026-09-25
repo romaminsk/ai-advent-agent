@@ -112,6 +112,14 @@ public final class GitMcpServer implements AutoCloseable {
         }
     }
 
+    /** Команда для оркестрации: использует установленный shaded CLI, если он доступен. */
+    static String orchestrationCommand(Path allowedRoot) {
+        if (commandExists("ai-agent")) {
+            return "ai-agent --mcp-server git --repo-root " + quote(allowedRoot.toString());
+        }
+        return command(allowedRoot);
+    }
+
     private static String quote(String value) {
         return "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
     }

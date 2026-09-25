@@ -3231,11 +3231,42 @@ public final class Main {
     }
 
     private static void handleMcpCommand(TerminalUi ui, String raw, LlmAgent agent,
-                                         McpSnapshotRef mcpSnapshot) {
+                                          McpSnapshotRef mcpSnapshot) {
         String argument = raw.length() > "/mcp".length()
                 ? raw.substring("/mcp".length()).trim() : "";
         if (argument.equalsIgnoreCase("explain")) {
             handleMcpExplain(ui, agent, mcpSnapshot);
+            return;
+        }
+        if (argument.equalsIgnoreCase("servers")) {
+            try (McpRegistry registry = McpRegistry.open(defaultRepoRoot(), pipelineResultsDir())) {
+                StringBuilder out = new StringBuilder("MCP-серверы:\n");
+                for (McpRegistry.ServerStatus status : registry.statuses()) {
+                    out.append("- ").append(status.name()).append(": ")
+                            .append(status.available() ? "доступен" : "недоступен: " + status.reason()).append('\n');
+                }
+                ui.showSystem(out.toString().stripTrailing());
+            }
+            return;
+        }
+        if (argument.equalsIgnoreCase("tools")) {
+            try (McpRegistry registry = McpRegistry.open(defaultRepoRoot(), pipelineResultsDir())) {
+                StringBuilder out = new StringBuilder("MCP-инструменты:\n");
+                for (McpRegistry.ToolDescriptor tool : registry.tools()) {
+                    out.append("- ").append(tool.qualifiedName()).append(" — ")
+                            .append(tool.description()).append(" ").append(tool.schema()).append('\n');
+                }
+                ui.showSystem(out.toString().stripTrailing());
+            }
+            return;
+        }
+        if (argument.equalsIgnoreCase("agent") || argument.regionMatches(true, 0, "agent ", 0, 6)) {
+            String request = argument.length() > 5 ? argument.substring(5).trim() : "";
+            if (request.isBlank()) {
+                ui.showSystem("Использование: /mcp agent <запрос>");
+            } else {
+                runMcpAgent(ui, agent, request);
+            }
             return;
         }
         if (argument.regionMatches(true, 0, "git tools ", 0, "git tools ".length())) {
@@ -3301,6 +3332,54 @@ public final class Main {
         } catch (McpClientComponent.McpClientException e) {
             ui.showError(e.getMessage());
         }
+    }
+
+    private static Path defaultRepoRoot() {
+        try {
+            return GitRepositoryReader.resolveLocation(Path.of(".").toAbsolutePath()).repositoryRoot();
+        } catch (Exception e) {
+            return Path.of(".").toAbsolutePath().normalize();
+        }
+    }
+
+    private static Path repoRootFromRequest(String request) {
+        java.util.regex.Matcher matcher = java.util.regex.Pattern
+                .compile("(?:/|~[/\\\\])[^\\s,;]+")
+                .matcher(request);
+        while (matcher.find()) {
+            String candidate = matcher.group().replaceAll("[.。)]+$", "");
+            try {
+                return GitRepositoryReader.resolveLocation(Path.of(candidate)).repositoryRoot();
+            } catch (Exception ignored) { }
+        }
+        return defaultRepoRoot();
+    }
+
+    private static void runMcpAgent(TerminalUi ui, LlmAgent agent, String request) {
+        try (McpRegistry registry = McpRegistry.open(repoRootFromRequest(request), pipelineResultsDir())) {
+            McpOrchestrator orchestrator = new McpOrchestrator(registry,
+                    (system, prompt) -> agent.askWithoutHistory(system, prompt));
+            McpOrchestrator.Outcome outcome = orchestrator.run(request);
+            for (ToolRouter.Step step : outcome.steps()) {
+                ui.showSystem(step.number() + ". " + step.server() + " → " + step.tool() + " "
+                        + (step.ok() ? "✓" : "✗") + " " + orchestrationStepSummary(step,
+                        orchestrator.router().data("step:" + step.number())));
+            }
+            ui.showSystem("Итог: " + outcome.answer());
+        } catch (Exception e) {
+            ui.showError("Ошибка оркестрации: " + (e.getMessage() == null ? "неизвестная ошибка" : e.getMessage()));
+        }
+    }
+
+    private static String orchestrationStepSummary(ToolRouter.Step step, Map<String, Object> data) {
+        if (!step.ok()) return step.error() == null ? "ошибка" : step.error();
+        if ("search".equals(step.tool())) {
+            Object count = data == null ? null : data.get("totalMatches");
+            return String.valueOf(count == null ? 0 : count) + " совпадений";
+        }
+        if ("summarize".equals(step.tool())) return "целостность подтверждена";
+        if ("saveToFile".equals(step.tool())) return String.valueOf(data == null ? "результат сохранён" : data.get("path"));
+        return "выполнено";
     }
 
     /** Каталог результатов pipeline: тестовый хук (system property) или домашний по умолчанию. */
@@ -3898,6 +3977,8 @@ public final class Main {
         out.println("/mcp explain (объяснить последний Git-снимок моделью),");
         out.println("/mcp monitor tools, /mcp monitor call <tool> <JSON-аргументы>,");
         out.println("/mcp pipeline tools|run <путь> <запрос>|call <tool> <JSON-аргументы> (цепочка search → summarize → saveToFile, sha256, без модели),");
+        out.println("/mcp agent <запрос> (модель выбирает инструменты git и pipeline),");
+        out.println("/mcp servers (статус серверов), /mcp tools (единый каталог оркестрации),");
         out.println("/monitor add|list|enable|disable|remove|run|status|summary,");
         out.println("/monitor worker status, ai-agent --background,");
         out.println("/context [full|summary], /context compare <вопрос>, /summary [refresh],");
