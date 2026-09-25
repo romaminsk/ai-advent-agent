@@ -25,6 +25,23 @@ public final class ToolRouter {
     public Map<String, Object> data(String ref) { return results.get(ref); }
     public void setRequestText(String requestText) { this.requestText = requestText == null ? "" : requestText; }
 
+    /** Шаг журнала для нераспознанного ответа модели: это не вызов инструмента. */
+    public Step recordUnrecognized(String raw) {
+        long start = System.nanoTime();
+        String snippet = safeSnippet(raw);
+        Step step = new Step(steps.size() + 1, "модель", "ответ не распознан", Map.of(), null, false,
+                (System.nanoTime() - start) / 1_000_000, snippet);
+        steps.add(step);
+        return step;
+    }
+
+    /** Первые 200 символов ответа в одну строку; похожие на ключи последовательности скрыты. */
+    private static String safeSnippet(String raw) {
+        String text = raw == null ? "" : String.valueOf(raw).replaceAll("[\\r\\n\\t]+", " ").trim();
+        if (text.length() > 200) text = text.substring(0, 200);
+        return text.replaceAll("(?i)(sk-[A-Za-z0-9_\\-]{8,}|Bearer\\s+\\S+|[A-Fa-f0-9]{32,})", "[скрыто]");
+    }
+
     public Result call(String qualifiedName, Map<String, Object> supplied) {
         long start = System.nanoTime();
         int number = steps.size() + 1;

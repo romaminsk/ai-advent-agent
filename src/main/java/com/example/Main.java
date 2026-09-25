@@ -3372,9 +3372,12 @@ public final class Main {
                     (system, prompt) -> agent.askWithoutHistory(system, prompt));
             McpOrchestrator.Outcome outcome = orchestrator.run(request);
             for (ToolRouter.Step step : outcome.steps()) {
-                ui.showSystem(step.number() + ". " + step.server() + " → " + step.tool() + " "
-                        + (step.ok() ? "✓" : "✗") + " " + orchestrationStepSummary(step,
-                        orchestrator.router().data("step:" + step.number())));
+                ui.showSystem("модель".equals(step.server())
+                        ? step.number() + ". ответ модели не распознан ✗ "
+                                + (step.error() == null ? "" : step.error())
+                        : step.number() + ". " + step.server() + " → " + step.tool() + " "
+                                + (step.ok() ? "✓" : "✗") + " " + orchestrationStepSummary(step,
+                                orchestrator.router().data("step:" + step.number())));
             }
             List<String> failed = new ArrayList<>();
             for (ToolRouter.Step step : outcome.steps()) {

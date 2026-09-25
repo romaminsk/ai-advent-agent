@@ -666,6 +666,33 @@ public final class SelfTest {
                     && slowOutcome.answer().contains("таймаут запроса к модели (шаг 1")
                     && slowOutcome.answer().contains("Общая длительность флоу:")
                     && slowCalls.get() == 1);
+
+            // O31: ответ в ```json-обёртке и с текстом вокруг разбирается.
+            List<String> fencedFlow = List.of(
+                    "```json\n{\"tool\":\"git.get-repository-status\",\"args\":{\"repoPath\":\"" + repo + "\"}}\n```",
+                    "Вот результат анализа:\n{\"tool\":\"pipeline.search\",\"args\":{\"root\":\"" + repo
+                            + "\",\"query\":\"TODO\"}}",
+                    "{\"tool\":\"pipeline.summarize\",\"args\":{\"inputRef\":\"step:2\"}}",
+                    "Итог вызова: {\"tool\":\"pipeline.saveToFile\",\"args\":{\"inputRef\":\"step:3\","
+                            + "\"fileName\":\"fenced.md\"}}");
+            McpOrchestrator.Outcome fencedOutcome = new McpOrchestrator(registry,
+                    new SequenceModel(fencedFlow.toArray(String[]::new))).run("найди TODO");
+            expect("O31 ответ в ```json-обёртке и с текстом вокруг разбирается", !fencedOutcome.stopped()
+                    && fencedOutcome.steps().size() == 4
+                    && fencedOutcome.steps().stream().noneMatch(step -> "invalid".equals(step.server()))
+                    && Files.exists(results.resolve("fenced.md")));
+
+            // O32: мусорный ответ — не invalid, строка «не распознан», стоп после 2 подряд.
+            McpOrchestrator.Outcome garbageOutcome = new McpOrchestrator(registry,
+                    new SequenceModel("К сожалению, не могу выполнить запрос без уточнений.",
+                            "Ответ: конечно, сделаю всё в лучшем виде.")).run("найди TODO");
+            expect("O32 мусорный ответ распознаётся как нераспознанный, стоп после 2 подряд",
+                    garbageOutcome.stopped()
+                    && garbageOutcome.answer().contains("модель не вернула корректный вызов")
+                    && garbageOutcome.steps().size() == 2
+                    && garbageOutcome.steps().stream().allMatch(step -> "модель".equals(step.server()))
+                    && garbageOutcome.steps().stream().noneMatch(step -> "invalid".equals(step.server()))
+                    && garbageOutcome.steps().get(0).error().contains("не могу выполнить"));
         }
     }
 

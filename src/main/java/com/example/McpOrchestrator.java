@@ -84,17 +84,14 @@ public final class McpOrchestrator {
             Map<String, Object> command;
             try {
                 if (raw == null || raw.isBlank()) throw new IllegalArgumentException("пустой ответ");
-                command = mapper.readValue(raw.trim(), new TypeReference<>() {});
-                boolean finalShape = command.size() == 1 && command.containsKey("final");
-                boolean toolShape = command.size() == 2 && command.containsKey("tool") && command.containsKey("args");
-                if (!finalShape && !toolShape) throw new IllegalArgumentException("нужны final или tool+args");
+                command = parseModelAnswer(raw);
             } catch (Exception e) {
                 invalidResponses++;
-                router.call("invalid.invalid", Map.of());
-                if (invalidResponses >= 3) {
-                    return stopped("Остановлено: модель вернула невалидный ответ 3 раза подряд");
+                router.recordUnrecognized(raw);
+                if (invalidResponses >= 2) {
+                    return stopped("Остановлено: модель не вернула корректный вызов");
                 }
-                prompt = "Ошибка шага: невалидный JSON (" + safe(e.getMessage()) + "). Верни строгий JSON.";
+                prompt = "Ответ не распознан. Верни только JSON вызова в формате: " + CALL_EXAMPLE;
                 continue;
             }
             invalidResponses = 0;
@@ -107,10 +104,16 @@ public final class McpOrchestrator {
                 }
                 return new Outcome(String.valueOf(command.get("final")), false, null, router.steps());
             }
-            Object toolValue = command.get("tool");
-            if (!(toolValue instanceof String qualified) || !(command.get("args") instanceof Map<?, ?> rawArgs)) {
-                router.call("invalid.invalid", Map.of());
-                prompt = "Ошибка шага: ожидается {\"tool\":\"server.name\",\"args\":{}}.";
+            String toolValue = command.get("tool") instanceof String toolName ? toolName : null;
+            String qualified = toolValue == null ? null
+                    : command.get("server") instanceof String serverName ? serverName + "." + toolValue : toolValue;
+            if (qualified == null || !(command.get("args") instanceof Map<?, ?> rawArgs)) {
+                invalidResponses++;
+                router.recordUnrecognized(raw);
+                if (invalidResponses >= 2) {
+                    return stopped("Остановлено: модель не вернула корректный вызов");
+                }
+                prompt = "Ответ не распознан. Верни только JSON вызова в формате: " + CALL_EXAMPLE;
                 continue;
             }
             @SuppressWarnings("unchecked") Map<String, Object> args = (Map<String, Object>) rawArgs;
@@ -238,13 +241,55 @@ public final class McpOrchestrator {
                 + " Не отвечай final до завершения нужных инструментальных шагов."
                 + " Передавай данные между шагами только через inputRef=step:N, не выдумывай результаты."
                 + " query — точное искомое слово из запроса пользователя, без кавычек и лишних слов."
-                + " Примеры: {\"tool\":\"git.get-repository-status\",\"args\":{\"repoPath\":\"каталог из запроса\"}};"
-                + " {\"tool\":\"pipeline.search\",\"args\":{\"root\":\"каталог из запроса\",\"query\":\"слово из запроса\"}};"
-                + " {\"tool\":\"pipeline.summarize\",\"args\":{\"inputRef\":\"step:2\"}};"
-                + " {\"tool\":\"pipeline.saveToFile\",\"args\":{\"inputRef\":\"step:3\"}}."
-                + " Отвечай строго одним JSON: {\"tool\":\"server.tool\",\"args\":{...}} или {\"final\":\"ответ\"}. Финальный ответ на русском.";
+                + " Примеры: {\"server\":\"git\",\"tool\":\"get-repository-status\",\"args\":{\"repoPath\":\"каталог из запроса\"}};"
+                + " {\"server\":\"pipeline\",\"tool\":\"search\",\"args\":{\"root\":\"каталог из запроса\",\"query\":\"слово из запроса\"}};"
+                + " {\"server\":\"pipeline\",\"tool\":\"summarize\",\"args\":{\"inputRef\":\"step:2\"}};"
+                + " {\"server\":\"pipeline\",\"tool\":\"saveToFile\",\"args\":{\"inputRef\":\"step:3\"}}."
+                + " Отвечай только одним JSON-объектом без пояснений и без markdown."
+                + " Формат вызова: " + CALL_EXAMPLE + ". Формат итога: {\"final\":\"ответ\"}. Финальный ответ на русском.";
     }
     private static String safe(String value) { return value == null ? "ошибка" : value.replaceAll("[\\r\\n]+", " "); }
+
+    /** Конкретный образец формата вызова (без угловых скобок и плейсхолдеров). */
+    private static final String CALL_EXAMPLE =
+            "{\"server\":\"pipeline\",\"tool\":\"search\",\"args\":{\"root\":\"/Users/me/project\",\"query\":\"version\"}}";
+
+    /** Разбор ответа модели: чистый JSON, ```json-обёртка или JSON внутри текста. */
+    private Map<String, Object> parseModelAnswer(String raw) throws Exception {
+        String text = raw.trim();
+        try {
+            return mapper.readValue(text, new TypeReference<>() {});
+        } catch (Exception direct) {
+            String candidate = firstJsonObject(text.replace("```json", " ").replace("```", " "));
+            if (candidate == null) throw direct;
+            return mapper.readValue(candidate, new TypeReference<>() {});
+        }
+    }
+
+    /** Первый сбалансированный JSON-объект в тексте (строки и экранирование учитываются). */
+    private static String firstJsonObject(String text) {
+        int start = text.indexOf('{');
+        while (start >= 0) {
+            int depth = 0;
+            boolean inString = false;
+            boolean escaped = false;
+            for (int i = start; i < text.length(); i++) {
+                char c = text.charAt(i);
+                if (inString) {
+                    if (escaped) escaped = false;
+                    else if (c == '\\') escaped = true;
+                    else if (c == '"') inString = false;
+                } else if (c == '"') inString = true;
+                else if (c == '{') depth++;
+                else if (c == '}') {
+                    depth--;
+                    if (depth == 0) return text.substring(start, i + 1);
+                }
+            }
+            start = text.indexOf('{', start + 1);
+        }
+        return null;
+    }
 
     private String completeWithRetry(String system, String prompt, long attemptTimeoutMillis, long deadlineNanos)
             throws TimeoutException, InterruptedException, FlowLimitException, ApiFailure {
