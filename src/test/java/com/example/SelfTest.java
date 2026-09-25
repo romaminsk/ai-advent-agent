@@ -505,6 +505,7 @@ public final class SelfTest {
                         && !badOutcome.steps().get(0).ok() && badOutcome.steps().get(1).ok()
                         && Files.exists(nonGitResults.resolve("non-git.md"))
                         && badOutcome.answer().contains("Git-шаг"));
+                expect("O27 ошибка Git-шаг содержит repoPath", badOutcome.steps().get(0).args().containsKey("repoPath"));
                 ToolRouter.Result validFromOutside = new ToolRouter(outsideRegistry).call(
                         "git.get-repository-status", Map.of("repoPath", repo.toString()));
                 expect("O16 Git-репозиторий читается из non-Git cwd", validFromOutside.ok());
@@ -526,6 +527,47 @@ public final class SelfTest {
                         && ((List<?>) homeSearch.data().get("matches")).size() == 3
                         && ((List<?>) homeSearch.data().get("matches")).stream()
                         .noneMatch(item -> String.valueOf(item).contains(".ssh") || String.valueOf(item).contains("PEM")));
+
+                java.util.concurrent.atomic.AtomicReference<String> secondContext = new java.util.concurrent.atomic.AtomicReference<>();
+                String firstRoot = homeDemo.toString();
+                List<String> firstFlow = List.of(
+                        "{\"tool\":\"git.get-repository-status\",\"args\":{\"repoPath\":\"" + firstRoot + "\"}}",
+                        "{\"tool\":\"pipeline.search\",\"args\":{\"root\":\"" + firstRoot + "\",\"query\":\"TODO\"}}",
+                        "{\"tool\":\"pipeline.summarize\",\"args\":{\"inputRef\":\"step:2\"}}",
+                        "{\"tool\":\"pipeline.saveToFile\",\"args\":{\"inputRef\":\"step:3\",\"fileName\":\"first.md\"}}",
+                        "{\"final\":\"first\"}");
+                new McpOrchestrator(homeRegistry, new SequenceModel(firstFlow.toArray(String[]::new)))
+                        .run("найди TODO");
+                List<String> secondFlow = List.of(
+                        "{\"tool\":\"git.get-repository-status\",\"args\":{\"repoPath\":\"" + firstRoot + "\"}}",
+                        "{\"tool\":\"pipeline.search\",\"args\":{\"root\":\"" + firstRoot + "\",\"query\":\"fixword\"}}",
+                        "{\"tool\":\"pipeline.summarize\",\"args\":{\"inputRef\":\"step:2\"}}",
+                        "{\"tool\":\"pipeline.saveToFile\",\"args\":{\"inputRef\":\"step:3\",\"fileName\":\"second.md\"}}",
+                        "{\"final\":\"second\"}");
+                McpOrchestrator second = new McpOrchestrator(homeRegistry, new McpOrchestrator.Model() {
+                    int index;
+                    public String complete(String system, String prompt) {
+                        if (index++ == 0) secondContext.set(system + "\n" + prompt);
+                        return secondFlow.get(Math.min(index - 1, secondFlow.size() - 1));
+                    }
+                });
+                McpOrchestrator.Outcome secondOutcome = second.run("найди все fixword");
+                expect("O25 второй flow изолирован и ищет fixword", secondOutcome.answer().equals("second")
+                        && secondOutcome.steps().stream().anyMatch(step -> "search".equals(step.tool()) && step.ok())
+                        && secondContext.get() != null && !secondContext.get().contains("TODO")
+                        && secondContext.get().contains("fixword"));
+
+                List<String> badQueryFlow = List.of(
+                        "{\"tool\":\"git.get-repository-status\",\"args\":{\"repoPath\":\"" + firstRoot + "\"}}",
+                        "{\"tool\":\"pipeline.search\",\"args\":{\"root\":\"" + firstRoot + "\",\"query\":\"TODO\"}}",
+                        "{\"tool\":\"pipeline.search\",\"args\":{\"root\":\"" + firstRoot + "\",\"query\":\"fixword\"}}",
+                        "{\"tool\":\"pipeline.summarize\",\"args\":{\"inputRef\":\"step:3\"}}",
+                        "{\"tool\":\"pipeline.saveToFile\",\"args\":{\"inputRef\":\"step:4\",\"fileName\":\"query.md\"}}",
+                        "{\"final\":\"query fixed\"}");
+                McpOrchestrator.Outcome badQuery = new McpOrchestrator(homeRegistry,
+                        new SequenceModel(badQueryFlow.toArray(String[]::new))).run("найди fixword");
+                expect("O26 query вне запроса отклоняется и flow продолжается", badQuery.steps().get(1).error()
+                        .contains("query должен быть словом из запроса пользователя") && !badQuery.stopped());
             } finally {
                 deleteRecursively(homeDemo);
             }
@@ -538,7 +580,7 @@ public final class SelfTest {
                     "{\"tool\":\"pipeline.saveToFile\",\"args\":{\"inputRef\":\"step:4\",\"fileName\":\"corrected.md\"}}",
                     "{\"final\":\"исправлено\"}");
             McpOrchestrator.Outcome corrected = new McpOrchestrator(registry,
-                    new SequenceModel(correction.toArray(String[]::new))).run("исправь имя");
+                    new SequenceModel(correction.toArray(String[]::new))).run("исправь имя и найди TODO");
             expect("O17 неверное имя исправляется", corrected.steps().get(0).error().contains("Ближайшее точное имя")
                     && !corrected.stopped() && corrected.answer().equals("исправлено"));
 
@@ -555,7 +597,7 @@ public final class SelfTest {
             McpOrchestrator.Outcome largeOutcome = new McpOrchestrator(registry,
                     new McpOrchestrator.Model() { int i; public String complete(String s, String p) {
                         if (i++ == 2) captured.set(p); return largeFlow.get(Math.min(i - 1, largeFlow.size() - 1));
-                    }}).run("large");
+                    }}).run("large fixword");
             expect("O18 результат ограничен только в prompt", captured.get() != null
                     && captured.get().contains("обрезано") && largeOutcome.steps().size() == 4);
 
@@ -583,77 +625,85 @@ public final class SelfTest {
         git(repo, "commit", "-m", "live fixture");
         Files.writeString(repo.resolve("todo.txt"), "TODO changed\n");
         int passedRuns = 0;
-        for (int liveRun = 1; liveRun <= 3; liveRun++) {
-            Path results = Files.createDirectory(baseTempDir.resolve("pipeline-results-" + liveRun));
-            boolean passedAttempt = false;
-            for (int attempt = 1; attempt <= 2 && !passedAttempt; attempt++) {
-            List<ToolRouter.Step> journal;
-            try (JsonConversationStore store = new JsonConversationStore(
-                    baseTempDir.resolve("live-history-" + liveRun + "-" + attempt + ".json"));
-                 McpRegistry registry = McpRegistry.open(repo, results)) {
-                LlmAgent llm = new LlmAgent(new Config(env.get("LLM_API_KEY"), url, model),
-                        ModelSettings.fromEnv(), store,
-                        new MemoryStore(baseTempDir.resolve("live-memory-" + liveRun + "-" + attempt + ".json")),
-                        new ProfileStore(baseTempDir.resolve("live-profile-" + liveRun + "-" + attempt + ".json")),
-                        new InvariantStore(baseTempDir.resolve("live-invariants-" + liveRun + "-" + attempt + ".json")));
-                McpOrchestrator.Outcome outcome = new McpOrchestrator(registry,
-                        (system, prompt) -> llm.askWithoutHistory(system, prompt))
-                        .run("Проверь состояние репозитория по точному абсолютному пути " + repo + "\n"
-                                + "Сначала вызови git.get-repository-status, затем найди все TODO "
-                                + "через pipeline.search, затем сделай сводку и сохрани её в файл. "
-                                + "Не отвечай final, пока файл не сохранён.");
-                journal = outcome.steps();
-                for (ToolRouter.Step step : journal) {
-                    System.out.println("live attempt " + liveRun + "/" + attempt + ": " + step.number() + " | "
-                            + step.server() + " | " + step.tool() + " | " + step.inputRef()
-                            + " | " + (step.ok() ? "ok" : "error: " + step.error()));
-                }
-                passedAttempt = liveChecks(journal, results, env.get("LLM_API_KEY"));
-            }
-            }
-            if (passedAttempt) passedRuns++;
-        }
-        expect("live orchestration: 3 прогона без API-ошибок", passedRuns == 3);
-
-        Path nonGit = Files.createDirectory(baseTempDir.resolve("live-non-git"));
-        Files.createDirectories(nonGit.resolve("sub"));
-        Files.createDirectories(nonGit.resolve(".ssh"));
-        Files.writeString(nonGit.resolve("a.txt"), "FixWord one\nfixword two\n");
-        Files.writeString(nonGit.resolve("sub/b.txt"), "FIXWORD sub\n");
-        Files.writeString(nonGit.resolve(".ssh/id_ed25519"), "fixword secret\n");
-        Files.writeString(nonGit.resolve("server.PEM"), "fixword cert\n");
-        Path nonGitResults = Files.createDirectory(baseTempDir.resolve("live-non-git-results"));
-        try (JsonConversationStore store = new JsonConversationStore(baseTempDir.resolve("live-non-git-history.json"));
-             McpRegistry registry = McpRegistry.open(nonGit, nonGitResults)) {
-            ToolRouter.Result fixtureSearch = new ToolRouter(registry).call("pipeline.search",
-                    Map.of("root", nonGit.toString(), "query", "fixword"));
-            expect("live non-Git fixture содержит 3 совпадения в 2 файлах", fixtureSearch.ok()
-                    && Integer.valueOf(3).equals(fixtureSearch.data().get("totalMatches"))
-                    && ((List<?>) fixtureSearch.data().get("matches")).stream()
-                    .map(item -> String.valueOf(((Map<?, ?>) item).get("file"))).distinct().count() == 2);
+        // Одна сессия: один LlmAgent и одна история на все сценарии (a) и (b),
+        // как при двух /mcp agent в одном запуске CLI.
+        try (JsonConversationStore store = new JsonConversationStore(
+                baseTempDir.resolve("live-history-one.json"))) {
             LlmAgent llm = new LlmAgent(new Config(env.get("LLM_API_KEY"), url, model),
                     ModelSettings.fromEnv(), store,
-                    new MemoryStore(baseTempDir.resolve("live-non-git-memory.json")),
-                    new ProfileStore(baseTempDir.resolve("live-non-git-profile.json")),
-                    new InvariantStore(baseTempDir.resolve("live-non-git-invariants.json")));
-            McpOrchestrator.Outcome outcome = new McpOrchestrator(registry,
-                    (system, prompt) -> llm.askWithoutHistory(system, prompt)).run(
-                    "Проверь состояние репозитория " + nonGit
-                            + ". Git-шаг может завершиться ошибкой, но продолжи pipeline:"
-                            + " найди точное слово fixword, сделай сводку и ОБЯЗАТЕЛЬНО вызови "
-                            + "pipeline.saveToFile с inputRef от summarize; только после сохранения "
-                            + "верни final и упомяни ошибку Git.");
-            for (ToolRouter.Step step : outcome.steps()) {
-                System.out.println("live b: " + step.number() + " | " + step.server() + " | "
-                        + step.tool() + " | " + step.inputRef() + " | "
-                        + (step.ok() ? "ok" : "error: " + step.error()));
+                    new MemoryStore(baseTempDir.resolve("live-memory.json")),
+                    new ProfileStore(baseTempDir.resolve("live-profile.json")),
+                    new InvariantStore(baseTempDir.resolve("live-invariants.json")));
+            for (int liveRun = 1; liveRun <= 3; liveRun++) {
+                Path results = Files.createDirectory(baseTempDir.resolve("pipeline-results-" + liveRun));
+                boolean passedAttempt = false;
+                for (int attempt = 1; attempt <= 2 && !passedAttempt; attempt++) {
+                List<ToolRouter.Step> journal;
+                try (McpRegistry registry = McpRegistry.open(repo, results)) {
+                    McpOrchestrator.Outcome outcome = new McpOrchestrator(registry,
+                            (system, prompt) -> llm.askWithoutHistory(system, prompt))
+                            .run("Проверь состояние репозитория по точному абсолютному пути " + repo + "\n"
+                                    + "Сначала вызови git.get-repository-status, затем найди все TODO "
+                                    + "через pipeline.search, затем сделай сводку и сохрани её в файл. "
+                                    + "Не отвечай final, пока файл не сохранён.");
+                    journal = outcome.steps();
+                    for (ToolRouter.Step step : journal) {
+                        System.out.println("live attempt " + liveRun + "/" + attempt + ": " + step.number() + " | "
+                                + step.server() + " | " + step.tool() + " | " + step.inputRef()
+                                + " | " + (step.ok() ? "ok" : "error: " + step.error())
+                                + " | args=" + step.args());
+                    }
+                    passedAttempt = liveChecks(journal, results, env.get("LLM_API_KEY"));
+                }
+                }
+                if (passedAttempt) passedRuns++;
             }
-            expect("live non-Git: Git ошибка, pipeline выполнен",
-                    outcome.steps().size() <= 8 && outcome.steps().stream().anyMatch(step -> !step.ok()
-                            && "git".equals(step.server()))
-                            && outcome.steps().stream().anyMatch(step -> step.ok() && "saveToFile".equals(step.tool()))
-                            && outcome.steps().stream().anyMatch(step -> !step.ok()
-                            && "Путь не является Git-репозиторием.".equals(step.error())));
+            expect("live orchestration: 3 прогона без API-ошибок", passedRuns == 3);
+
+            Path nonGit = Files.createDirectory(baseTempDir.resolve("live-non-git"));
+            Files.createDirectories(nonGit.resolve("sub"));
+            Files.createDirectories(nonGit.resolve(".ssh"));
+            Files.writeString(nonGit.resolve("a.txt"), "FixWord one\nfixword two\n");
+            Files.writeString(nonGit.resolve("sub/b.txt"), "FIXWORD sub\n");
+            Files.writeString(nonGit.resolve(".ssh/id_ed25519"), "fixword secret\n");
+            Files.writeString(nonGit.resolve("server.PEM"), "fixword cert\n");
+            Path nonGitResults = Files.createDirectory(baseTempDir.resolve("live-non-git-results"));
+            try (McpRegistry registry = McpRegistry.open(nonGit, nonGitResults)) {
+                ToolRouter.Result fixtureSearch = new ToolRouter(registry).call("pipeline.search",
+                        Map.of("root", nonGit.toString(), "query", "fixword"));
+                expect("live non-Git fixture содержит 3 совпадения в 2 файлах", fixtureSearch.ok()
+                        && Integer.valueOf(3).equals(fixtureSearch.data().get("totalMatches"))
+                        && ((List<?>) fixtureSearch.data().get("matches")).stream()
+                        .map(item -> String.valueOf(((Map<?, ?>) item).get("file"))).distinct().count() == 2);
+                McpOrchestrator liveOrchestrator = new McpOrchestrator(registry,
+                        (system, prompt) -> llm.askWithoutHistory(system, prompt));
+                McpOrchestrator.Outcome outcome = liveOrchestrator.run(
+                        "Проверь состояние репозитория " + nonGit
+                                + ". Git-шаг может завершиться ошибкой, но продолжи pipeline:"
+                                + " найди все fixword, сделай сводку и ОБЯЗАТЕЛЬНО вызови "
+                                + "pipeline.saveToFile с inputRef от summarize; только после сохранения "
+                                + "верни final и упомяни ошибку Git.");
+                for (ToolRouter.Step step : outcome.steps()) {
+                    System.out.println("live b: " + step.number() + " | " + step.server() + " | "
+                            + step.tool() + " | " + step.inputRef() + " | "
+                            + (step.ok() ? "ok" : "error: " + step.error())
+                            + " | args=" + step.args());
+                }
+                expect("live non-Git: Git ошибка, pipeline выполнен",
+                        outcome.steps().size() <= 8 && outcome.steps().stream().anyMatch(step -> !step.ok()
+                                && "git".equals(step.server()))
+                                && outcome.steps().stream().anyMatch(step -> step.ok() && "saveToFile".equals(step.tool()))
+                                && outcome.steps().stream().anyMatch(step -> !step.ok()
+                                && "Путь не является Git-репозиторием.".equals(step.error())));
+                int liveSearch = indexOf(outcome.steps(), "pipeline", "search");
+                Object liveTotal = liveSearch < 0 ? null
+                        : liveOrchestrator.router().data("step:" + (liveSearch + 1)) == null ? null
+                        : liveOrchestrator.router().data("step:" + (liveSearch + 1)).get("totalMatches");
+                expect("live non-Git: search query=fixword и 3 совпадения", liveSearch >= 0
+                        && String.valueOf(outcome.steps().get(liveSearch).args().get("query"))
+                        .equalsIgnoreCase("fixword")
+                        && Integer.valueOf(3).equals(liveTotal));
+            }
         }
     }
 

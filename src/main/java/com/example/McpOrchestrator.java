@@ -27,6 +27,7 @@ public final class McpOrchestrator {
     private final Model model;
     private final ObjectMapper mapper = new ObjectMapper();
     private int modelRequestChars;
+    private String requestText = "";
     private final java.util.concurrent.ExecutorService modelExecutor = Executors.newCachedThreadPool(r -> {
         Thread thread = new Thread(r, "mcp-orchestration-model");
         thread.setDaemon(true);
@@ -42,6 +43,8 @@ public final class McpOrchestrator {
     public Outcome run(String request) {
         String system = systemPrompt();
         String prompt = request;
+        requestText = request;
+        router.setRequestText(request);
         long deadline = System.nanoTime() + 180_000_000_000L;
         int invalidResponses = 0;
         for (int i = 0; i < MAX_STEPS; i++) {
@@ -132,7 +135,11 @@ public final class McpOrchestrator {
         if ("git".equals(result.step().server())) {
             return message + " Git-ошибка не останавливает flow. Следующий вызов строго: "
                     + "{\"tool\":\"pipeline.search\",\"args\":{\"root\":\""
-                    + registry.repoRoot() + "\",\"query\":\"запрос из исходного задания\"}}";
+                    + registry.repoRoot() + "\",\"query\":\"" + queryHint() + "\"}}";
+        }
+        if ("search".equals(result.step().tool())) {
+            return message + " Следующий вызов строго: {\"tool\":\"pipeline.search\",\"args\":{\"root\":\""
+                    + registry.repoRoot() + "\",\"query\":\"" + queryHint() + "\"}}";
         }
         if ("summarize".equals(result.step().tool())) {
             String searchRef = latestSuccessful("search");
@@ -165,6 +172,14 @@ public final class McpOrchestrator {
         }
         return ref;
     }
+
+    private String queryHint() {
+        java.util.regex.Matcher matcher = java.util.regex.Pattern.compile(
+                "(?i)(?:найди|find).*?(?:все|all)\\s+([\\p{L}\\p{N}_-]+)").matcher(requestText);
+        if (matcher.find()) return matcher.group(1);
+        matcher = java.util.regex.Pattern.compile("(?i)(?:найди|find)\\s+([\\p{L}\\p{N}_-]+)").matcher(requestText);
+        return matcher.find() ? matcher.group(1) : "<слово из запроса>";
+    }
     private String systemPrompt() {
         List<String> names = new ArrayList<>();
         for (McpRegistry.ToolDescriptor tool : registry.tools()) names.add(tool.qualifiedName() + " " + tool.schema());
@@ -174,8 +189,8 @@ public final class McpOrchestrator {
                 + " Не отвечай final до завершения нужных инструментальных шагов."
                 + " Передавай данные между шагами только через inputRef=step:N, не выдумывай результаты."
                 + " query — точное искомое слово из запроса пользователя, без кавычек и лишних слов."
-                + " Примеры: {\"tool\":\"git.get-repository-status\",\"args\":{\"repoPath\":\"/repo\"}};"
-                + " {\"tool\":\"pipeline.search\",\"args\":{\"root\":\"/repo\",\"query\":\"TODO\"}};"
+                + " Примеры: {\"tool\":\"git.get-repository-status\",\"args\":{\"repoPath\":\"<каталог из запроса>\"}};"
+                + " {\"tool\":\"pipeline.search\",\"args\":{\"root\":\"<каталог из запроса>\",\"query\":\"<слово из запроса>\"}};"
                 + " {\"tool\":\"pipeline.summarize\",\"args\":{\"inputRef\":\"step:2\"}};"
                 + " {\"tool\":\"pipeline.saveToFile\",\"args\":{\"inputRef\":\"step:3\"}}."
                 + " Отвечай строго одним JSON: {\"tool\":\"server.tool\",\"args\":{...}} или {\"final\":\"ответ\"}. Финальный ответ на русском.";

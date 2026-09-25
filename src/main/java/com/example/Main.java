@@ -3390,7 +3390,8 @@ public final class Main {
     }
 
     private static String orchestrationStepSummary(ToolRouter.Step step, Map<String, Object> data) {
-        if (!step.ok()) return step.error() == null ? "ошибка" : step.error();
+        if (!step.ok()) return (step.error() == null ? "ошибка" : step.error())
+                + " (" + formatOrchestrationArgs(step.args()) + ")";
         if ("search".equals(step.tool())) {
             Object count = data == null ? null : data.get("totalMatches");
             return String.valueOf(count == null ? 0 : count) + " совпадений"
@@ -3400,6 +3401,11 @@ public final class Main {
         if ("saveToFile".equals(step.tool())) return String.valueOf(data == null ? "результат сохранён" : data.get("path"));
         if ("get-repository-status".equals(step.tool())) return "(repoPath=" + step.args().get("repoPath") + ")";
         return "выполнено";
+    }
+
+    private static String formatOrchestrationArgs(Map<String, Object> args) {
+        return args.entrySet().stream().map(entry -> entry.getKey() + "=" + entry.getValue())
+                .collect(java.util.stream.Collectors.joining(", "));
     }
 
     /** Каталог результатов pipeline: тестовый хук (system property) или домашний по умолчанию. */

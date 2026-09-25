@@ -18,10 +18,12 @@ public final class ToolRouter {
     private final List<Step> steps = new ArrayList<>();
     private final Map<String, Map<String, Object>> results = new LinkedHashMap<>();
     private final Map<String, String> resultTools = new LinkedHashMap<>();
+    private String requestText = "";
 
     public ToolRouter(McpRegistry registry) { this.registry = registry; }
     public List<Step> steps() { return List.copyOf(steps); }
     public Map<String, Object> data(String ref) { return results.get(ref); }
+    public void setRequestText(String requestText) { this.requestText = requestText == null ? "" : requestText; }
 
     public Result call(String qualifiedName, Map<String, Object> supplied) {
         long start = System.nanoTime();
@@ -30,6 +32,10 @@ public final class ToolRouter {
         String server = name.length == 2 ? name[0] : "?";
         String tool = name.length == 2 ? name[1] : String.valueOf(qualifiedName);
         Map<String, Object> args = supplied == null ? Map.of() : new LinkedHashMap<>(supplied);
+        if ("git".equals(server) && "get-repository-status".equals(tool)
+                && !args.containsKey("repoPath") && registry.repoRoot() != null) {
+            args.put("repoPath", registry.repoRoot());
+        }
         if ("pipeline".equals(server) && "search".equals(tool) && args.get("root") instanceof String root) {
             String normalizedRoot = expandUser(root.trim().replaceAll("[.,;:!?\\)\\]]+$", ""));
             if (!normalizedRoot.equals(root)) args.put("root", normalizedRoot);
@@ -42,6 +48,10 @@ public final class ToolRouter {
                 callArgs.remove("inputRef");
                 if ("summarize".equals(tool)) callArgs.put("searchResult", results.get(inputRef));
                 if ("saveToFile".equals(tool)) callArgs.put("summary", results.get(inputRef));
+                if ("git".equals(server) && "get-repository-status".equals(tool)
+                        && registry.repoRoot() != null && !callArgs.containsKey("repoPath")) {
+                    callArgs.put("repoPath", registry.repoRoot());
+                }
                 McpClientComponent.ToolCallResult response = registry.call(server, tool, callArgs);
                 if (response.error()) error = response.text();
                 else {
@@ -81,6 +91,12 @@ public final class ToolRouter {
             return "pipeline.search разрешён только внутри проверяемого Git-репозитория;"
                     + " используй root=" + registry.repoRoot();
         }
+        if ("pipeline".equals(server) && "search".equals(tool)
+                && args.get("query") instanceof String query
+                && !requestText.isBlank()
+                && !containsQueryWord(requestText, query)) {
+            return "query должен быть словом из запроса пользователя";
+        }
         if ("summarize".equals(tool) || "saveToFile".equals(tool)) {
             if (args.containsKey("searchResult") || args.containsKey("summary")) return "используй inputRef вместо сырых данных";
             if (inputRef == null || !inputRef.matches("step:\\d+")) return "нужна ссылка inputRef=step:N";
@@ -110,6 +126,14 @@ public final class ToolRouter {
         if ("~".equals(value)) return System.getProperty("user.home");
         if (value.startsWith("~/")) return System.getProperty("user.home") + value.substring(1);
         return value;
+    }
+
+    private static boolean containsQueryWord(String request, String query) {
+        String withoutPaths = request.replaceAll("(?:~[/\\\\]|/)[^\\s,;]+", " ");
+        return java.util.regex.Pattern.compile("(?i)(?<![\\p{L}\\p{N}_])"
+                        + java.util.regex.Pattern.quote(query)
+                        + "(?![\\p{L}\\p{N}_])")
+                .matcher(withoutPaths).find();
     }
 
     private Step step(int n, String server, String tool, Map<String, Object> args, String ref,
