@@ -95,6 +95,10 @@ public final class McpOrchestrator {
             }
             @SuppressWarnings("unchecked") Map<String, Object> args = (Map<String, Object>) rawArgs;
             ToolRouter.Result result = router.call(qualified, args);
+            if (result.ok() && "pipeline".equals(result.step().server())
+                    && "saveToFile".equals(result.step().tool())) {
+                return new Outcome(savedAnswer(result.data()), false, null, router.steps());
+            }
             prompt = result.ok() ? successFeedback(result) : errorFeedback(result);
         }
         return stopped("Остановлено: превышен лимит шагов (8)");
@@ -149,6 +153,20 @@ public final class McpOrchestrator {
         return message + " Исправь вызов, используя точное имя инструмента и inputRef.";
     }
 
+    /** Итог собирается из журнала: путь, размер и SHA-256 файла результата. */
+    private static String savedAnswer(Map<String, Object> data) {
+        if (data == null) return "Файл сохранён.";
+        Object path = data.get("path");
+        Object bytes = data.get("bytes");
+        Object sha = data.get("fileSha256");
+        StringBuilder answer = new StringBuilder("Файл сохранён");
+        if (path != null) answer.append(": ").append(path);
+        if (bytes != null) answer.append(" (").append(bytes).append(" байт");
+        if (sha != null) answer.append(bytes == null ? " (SHA-256: " : ", SHA-256: ").append(sha);
+        if (bytes != null || sha != null) answer.append(")");
+        return answer.append(".").toString();
+    }
+
     private String nextInstruction(ToolRouter.Step step) {
         if ("get-repository-status".equals(step.tool())) {
             return "Следующий вызов строго pipeline.search с root=" + registry.repoRoot() + ".";
@@ -178,7 +196,7 @@ public final class McpOrchestrator {
                 "(?i)(?:найди|find).*?(?:все|all)\\s+([\\p{L}\\p{N}_-]+)").matcher(requestText);
         if (matcher.find()) return matcher.group(1);
         matcher = java.util.regex.Pattern.compile("(?i)(?:найди|find)\\s+([\\p{L}\\p{N}_-]+)").matcher(requestText);
-        return matcher.find() ? matcher.group(1) : "<слово из запроса>";
+        return matcher.find() ? matcher.group(1) : "слово из запроса";
     }
     private String systemPrompt() {
         List<String> names = new ArrayList<>();
@@ -189,8 +207,8 @@ public final class McpOrchestrator {
                 + " Не отвечай final до завершения нужных инструментальных шагов."
                 + " Передавай данные между шагами только через inputRef=step:N, не выдумывай результаты."
                 + " query — точное искомое слово из запроса пользователя, без кавычек и лишних слов."
-                + " Примеры: {\"tool\":\"git.get-repository-status\",\"args\":{\"repoPath\":\"<каталог из запроса>\"}};"
-                + " {\"tool\":\"pipeline.search\",\"args\":{\"root\":\"<каталог из запроса>\",\"query\":\"<слово из запроса>\"}};"
+                + " Примеры: {\"tool\":\"git.get-repository-status\",\"args\":{\"repoPath\":\"каталог из запроса\"}};"
+                + " {\"tool\":\"pipeline.search\",\"args\":{\"root\":\"каталог из запроса\",\"query\":\"слово из запроса\"}};"
                 + " {\"tool\":\"pipeline.summarize\",\"args\":{\"inputRef\":\"step:2\"}};"
                 + " {\"tool\":\"pipeline.saveToFile\",\"args\":{\"inputRef\":\"step:3\"}}."
                 + " Отвечай строго одним JSON: {\"tool\":\"server.tool\",\"args\":{...}} или {\"final\":\"ответ\"}. Финальный ответ на русском.";
@@ -200,7 +218,8 @@ public final class McpOrchestrator {
     private String completeWithRetry(String system, String prompt, long timeoutMillis)
             throws TimeoutException, InterruptedException, ApiFailure {
         Throwable failure = null;
-        for (int attempt = 0; attempt < 2; attempt++) {
+        for (int attempt = 0; attempt < 1 + RETRY_PAUSES_MILLIS.length; attempt++) {
+            if (attempt > 0) Thread.sleep(RETRY_PAUSES_MILLIS[attempt - 1]);
             try {
                 String modelPrompt = prompt;
                 modelRequestChars = system.length() + modelPrompt.length();
@@ -208,17 +227,21 @@ public final class McpOrchestrator {
                 return call.get(timeoutMillis, TimeUnit.MILLISECONDS);
             } catch (ExecutionException e) {
                 failure = e.getCause() == null ? e : e.getCause();
-                if (attempt == 0 && transientApiFailure(failure)) continue;
+                if (attempt < RETRY_PAUSES_MILLIS.length && transientApiFailure(failure)) continue;
                 throw new ApiFailure(apiReason(failure), failure, attempt + 1);
             }
         }
-        throw new ApiFailure(apiReason(failure), failure, 2);
+        throw new ApiFailure(apiReason(failure), failure, RETRY_PAUSES_MILLIS.length + 1);
     }
+
+    /** Паузы между повторами при временных сбоях API: 2 с и 5 с. */
+    private static final long[] RETRY_PAUSES_MILLIS = {2000, 5000};
 
     private static boolean transientApiFailure(Throwable error) {
         String text = error == null ? "" : String.valueOf(error.getMessage()).toLowerCase();
         return text.contains("http-статус 429") || text.matches(".*http-статус 5\\d\\d.*")
-                || text.contains("сетевая ошибка") || text.contains("timeout");
+                || text.contains("сетевая ошибка") || text.contains("таймаут") || text.contains("timeout")
+                || text.contains("пустой итоговый ответ");
     }
 
     private static String apiReason(Throwable error) {
@@ -245,6 +268,7 @@ public final class McpOrchestrator {
                 current = current.getCause();
             }
             return "класс=" + (cause == null ? "unknown" : cause.getClass().getSimpleName())
+                    + "; статус=" + reason
                     + "; cause=" + String.join("->", causes)
                     + "; повтор=" + (attempts - 1) + "; requestChars=" + requestChars;
         }

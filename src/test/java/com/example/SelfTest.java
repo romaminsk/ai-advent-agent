@@ -468,7 +468,9 @@ public final class SelfTest {
             });
             McpOrchestrator.Outcome outcome = orchestrator.run("Проверь TODO и сохрани сводку");
             List<ToolRouter.Step> steps = outcome.steps();
-            expect("длинный флоу завершён", !outcome.stopped() && "Проверка выполнена.".equals(outcome.answer()));
+            expect("длинный флоу завершён", !outcome.stopped()
+                    && outcome.answer().contains("orchestration.md")
+                    && outcome.answer().contains("SHA-256"));
             expect("маршрутизация git и pipeline", steps.size() == 4
                     && "git".equals(steps.get(0).server()) && "pipeline".equals(steps.get(1).server()));
             expect("порядок search summarize saveToFile", "search".equals(steps.get(1).tool())
@@ -504,7 +506,7 @@ public final class SelfTest {
                 expect("O15 ошибка Git не останавливает pipeline", badOutcome.steps().size() == 4
                         && !badOutcome.steps().get(0).ok() && badOutcome.steps().get(1).ok()
                         && Files.exists(nonGitResults.resolve("non-git.md"))
-                        && badOutcome.answer().contains("Git-шаг"));
+                        && badOutcome.answer().contains("non-git.md"));
                 expect("O27 ошибка Git-шаг содержит repoPath", badOutcome.steps().get(0).args().containsKey("repoPath"));
                 ToolRouter.Result validFromOutside = new ToolRouter(outsideRegistry).call(
                         "git.get-repository-status", Map.of("repoPath", repo.toString()));
@@ -552,7 +554,8 @@ public final class SelfTest {
                     }
                 });
                 McpOrchestrator.Outcome secondOutcome = second.run("найди все fixword");
-                expect("O25 второй flow изолирован и ищет fixword", secondOutcome.answer().equals("second")
+                expect("O25 второй flow изолирован и ищет fixword", !secondOutcome.stopped()
+                        && secondOutcome.answer().contains("second.md")
                         && secondOutcome.steps().stream().anyMatch(step -> "search".equals(step.tool()) && step.ok())
                         && secondContext.get() != null && !secondContext.get().contains("TODO")
                         && secondContext.get().contains("fixword"));
@@ -582,7 +585,7 @@ public final class SelfTest {
             McpOrchestrator.Outcome corrected = new McpOrchestrator(registry,
                     new SequenceModel(correction.toArray(String[]::new))).run("исправь имя и найди TODO");
             expect("O17 неверное имя исправляется", corrected.steps().get(0).error().contains("Ближайшее точное имя")
-                    && !corrected.stopped() && corrected.answer().equals("исправлено"));
+                    && !corrected.stopped() && corrected.answer().contains("corrected.md"));
 
             StringBuilder large = new StringBuilder();
             for (int i = 0; i < 120; i++) large.append("fixword ").append("x".repeat(70)).append('\n');
@@ -602,12 +605,49 @@ public final class SelfTest {
                     && captured.get().contains("обрезано") && largeOutcome.steps().size() == 4);
 
             McpOrchestrator.Outcome apiFailure = new McpOrchestrator(registry,
-                    new McpOrchestrator.Model() { int i; public String complete(String s, String p) {
-                        if (i++ < 4) return replies.get(i - 1);
+                    new McpOrchestrator.Model() { public String complete(String s, String p) {
                         throw new AgentException("Сервер вернул HTTP-статус 500. Запрос не выполнен.");
                     }}).run("api failure");
-            expect("O19 API 500 получает один повтор", apiFailure.answer().contains("ошибка API модели: HTTP-статус 500")
+            expect("O19 API 500 повторяется дважды, итог — диагностика со статусом",
+                    apiFailure.answer().contains("ошибка API модели: HTTP-статус 500")
+                    && apiFailure.diagnostic() != null
+                    && apiFailure.diagnostic().contains("статус=HTTP-статус 500")
+                    && apiFailure.diagnostic().contains("повтор=2")
                     && Files.exists(results.resolve("orchestration.md")));
+
+            // O28: после успешного saveToFile модель больше не вызывается.
+            List<String> autoFlow = List.of(replies.get(0), replies.get(1), replies.get(2),
+                    "{\"tool\":\"pipeline.saveToFile\",\"args\":{\"inputRef\":\"step:3\",\"fileName\":\"auto.md\"}}");
+            java.util.concurrent.atomic.AtomicInteger autoCalls = new java.util.concurrent.atomic.AtomicInteger();
+            McpOrchestrator.Outcome autoOutcome = new McpOrchestrator(registry,
+                    new McpOrchestrator.Model() {
+                        @Override public String complete(String system, String prompt) {
+                            int call = autoCalls.getAndIncrement();
+                            return call < autoFlow.size() ? autoFlow.get(call) : "{\"final\":\"ЛИШНИЙ ВЫЗОВ\"}";
+                        }}).run("найди TODO");
+            expect("O28 после saveToFile новых запросов к модели нет", !autoOutcome.stopped()
+                    && autoCalls.get() == autoFlow.size()
+                    && autoOutcome.answer().contains("auto.md")
+                    && autoOutcome.answer().contains("SHA-256")
+                    && Files.exists(results.resolve("auto.md")));
+
+            // O29: 429, 429, затем успех — флоу завершается файлом.
+            List<String> retryFlow = List.of(replies.get(0), replies.get(1), replies.get(2),
+                    "{\"tool\":\"pipeline.saveToFile\",\"args\":{\"inputRef\":\"step:3\",\"fileName\":\"retry.md\"}}");
+            java.util.concurrent.atomic.AtomicInteger retryCalls = new java.util.concurrent.atomic.AtomicInteger();
+            McpOrchestrator.Outcome retryOutcome = new McpOrchestrator(registry,
+                    new McpOrchestrator.Model() {
+                        @Override public String complete(String system, String prompt) {
+                            int call = retryCalls.getAndIncrement();
+                            if (call < 2) {
+                                throw new AgentException("Сервер вернул HTTP-статус 429. Запрос не выполнен.");
+                            }
+                            return retryFlow.get(Math.min(call - 2, retryFlow.size() - 1));
+                        }}).run("найди TODO");
+            expect("O29 429, 429, затем успех — флоу завершён", !retryOutcome.stopped()
+                    && retryCalls.get() == retryFlow.size() + 2
+                    && retryOutcome.answer().contains("retry.md")
+                    && Files.exists(results.resolve("retry.md")));
         }
     }
 
