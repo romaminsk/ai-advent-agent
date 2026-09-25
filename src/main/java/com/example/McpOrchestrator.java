@@ -26,6 +26,7 @@ public final class McpOrchestrator {
         thread.setDaemon(true);
         return thread;
     });
+    private static final String TRUNCATION = " [обрезано, полные данные доступны через inputRef step:%d]";
 
     public McpOrchestrator(McpRegistry registry, Model model) {
         this.registry = registry; this.router = new ToolRouter(registry); this.model = model;
@@ -36,21 +37,20 @@ public final class McpOrchestrator {
         String system = systemPrompt();
         String prompt = request;
         long deadline = System.nanoTime() + 180_000_000_000L;
+        int invalidResponses = 0;
         for (int i = 0; i < MAX_STEPS; i++) {
             if (System.nanoTime() >= deadline) return stopped("Остановлено: таймаут");
             String raw;
             long remainingMillis = Math.max(1, (deadline - System.nanoTime()) / 1_000_000);
             try {
-                String modelPrompt = prompt;
-                Future<String> call = modelExecutor.submit(() -> model.complete(system, modelPrompt));
-                raw = call.get(remainingMillis, TimeUnit.MILLISECONDS);
+                raw = completeWithRetry(system, prompt, remainingMillis);
             } catch (TimeoutException e) {
                 return stopped("Остановлено: таймаут");
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return stopped("Остановлено: таймаут");
-            } catch (ExecutionException e) {
-                return stopped("Остановлено: ошибка модели");
+            } catch (ApiFailure e) {
+                return stopped("Остановлено: ошибка API модели: " + e.reason());
             }
             Map<String, Object> command;
             try {
@@ -60,10 +60,15 @@ public final class McpOrchestrator {
                 boolean toolShape = command.size() == 2 && command.containsKey("tool") && command.containsKey("args");
                 if (!finalShape && !toolShape) throw new IllegalArgumentException("нужны final или tool+args");
             } catch (Exception e) {
-                ToolRouter.Result invalid = router.call("invalid.invalid", Map.of());
+                invalidResponses++;
+                router.call("invalid.invalid", Map.of());
+                if (invalidResponses >= 3) {
+                    return stopped("Остановлено: модель вернула невалидный ответ 3 раза подряд");
+                }
                 prompt = "Ошибка шага: невалидный JSON (" + safe(e.getMessage()) + "). Верни строгий JSON.";
                 continue;
             }
+            invalidResponses = 0;
             if (command.containsKey("final")) {
                 if (!requiredFlowComplete()) {
                     router.call("invalid.invalid", Map.of());
@@ -81,8 +86,7 @@ public final class McpOrchestrator {
             }
             @SuppressWarnings("unchecked") Map<String, Object> args = (Map<String, Object>) rawArgs;
             ToolRouter.Result result = router.call(qualified, args);
-            prompt = result.ok() ? successFeedback(result) :
-                    "Ошибка шага " + result.step().number() + ": " + safe(result.message()) + ". Исправь вызов и продолжай.";
+            prompt = result.ok() ? successFeedback(result) : errorFeedback(result);
         }
         return stopped("Остановлено: превышен лимит шагов (8)");
     }
@@ -90,24 +94,67 @@ public final class McpOrchestrator {
     private Outcome stopped(String reason) { return new Outcome(reason, true, reason, router.steps()); }
     private boolean requiredFlowComplete() {
         boolean git = false, search = false, summarize = false, save = false;
-        for (ToolRouter.Step step : router.steps()) if (step.ok()) {
+        for (ToolRouter.Step step : router.steps()) {
             if ("git".equals(step.server()) && "get-repository-status".equals(step.tool())) git = true;
-            if ("pipeline".equals(step.server()) && "search".equals(step.tool())) search = true;
-            if ("pipeline".equals(step.server()) && "summarize".equals(step.tool())) summarize = true;
-            if ("pipeline".equals(step.server()) && "saveToFile".equals(step.tool())) save = true;
+            if (step.ok() && "pipeline".equals(step.server()) && "search".equals(step.tool())) search = true;
+            if (step.ok() && "pipeline".equals(step.server()) && "summarize".equals(step.tool())) summarize = true;
+            if (step.ok() && "pipeline".equals(step.server()) && "saveToFile".equals(step.tool())) save = true;
         }
         return git && search && summarize && save;
     }
     private String successFeedback(ToolRouter.Result result) {
         String feedback = "Шаг " + result.step().number() + " выполнен. Результат сохранён как step:"
                 + result.step().number() + "; используй inputRef для следующего шага.";
-        if ("get-repository-status".equals(result.step().tool()) && result.data() != null) {
-            Object root = result.data().get("repositoryRoot");
-            if (root != null) feedback += " Точный repositoryRoot для pipeline.search: " + root;
-        } else if ("search".equals(result.step().tool()) && result.data() != null) {
-            feedback += " Найдено совпадений: " + result.data().get("totalMatches") + ".";
+        try {
+            String json = mapper.writeValueAsString(result.data());
+            if (json.length() > 4000) {
+                json = json.substring(0, Math.max(0, 4000 - TRUNCATION.length() - 8))
+                        + String.format(TRUNCATION, result.step().number());
+            }
+            String next = nextInstruction(result.step());
+            return feedback + " Результат инструмента: " + json + " " + next;
+        } catch (Exception e) {
+            return feedback + " " + nextInstruction(result.step());
         }
-        return feedback;
+    }
+
+    private String errorFeedback(ToolRouter.Result result) {
+        String message = "Ошибка шага " + result.step().number() + ": " + safe(result.message()) + ".";
+        if ("git".equals(result.step().server())) {
+            return message + " Git-ошибка не останавливает flow. Следующий вызов строго: "
+                    + "{\"tool\":\"pipeline.search\",\"args\":{\"root\":\""
+                    + registry.repoRoot() + "\",\"query\":\"запрос из исходного задания\"}}";
+        }
+        if ("summarize".equals(result.step().tool())) {
+            String searchRef = latestSuccessful("search");
+            return message + " Следующий вызов строго: {\"tool\":\"pipeline.summarize\",\"args\":{\"inputRef\":\""
+                    + searchRef + "\"}}";
+        }
+        return message + " Исправь вызов, используя точное имя инструмента и inputRef.";
+    }
+
+    private String nextInstruction(ToolRouter.Step step) {
+        if ("get-repository-status".equals(step.tool())) {
+            return "Следующий вызов строго pipeline.search с root=" + registry.repoRoot() + ".";
+        }
+        if ("search".equals(step.tool())) {
+            return "Следующий вызов строго {\"tool\":\"pipeline.summarize\",\"args\":{\"inputRef\":\"step:"
+                    + step.number() + "\"}}.";
+        }
+        if ("summarize".equals(step.tool())) {
+            return "Следующий вызов строго {\"tool\":\"pipeline.saveToFile\",\"args\":{\"inputRef\":\"step:"
+                    + step.number() + "\"}}.";
+        }
+        if ("saveToFile".equals(step.tool())) return "Теперь верни final на русском.";
+        return "Продолжай flow.";
+    }
+
+    private String latestSuccessful(String tool) {
+        String ref = "step:2";
+        for (ToolRouter.Step step : router.steps()) {
+            if (step.ok() && tool.equals(step.tool())) ref = "step:" + step.number();
+        }
+        return ref;
     }
     private String systemPrompt() {
         List<String> names = new ArrayList<>();
@@ -117,7 +164,48 @@ public final class McpOrchestrator {
                 + " только потом pipeline.summarize и pipeline.saveToFile. Сначала собери данные."
                 + " Не отвечай final до завершения нужных инструментальных шагов."
                 + " Передавай данные между шагами только через inputRef=step:N, не выдумывай результаты."
+                + " Примеры: {\"tool\":\"git.get-repository-status\",\"args\":{\"repoPath\":\"/repo\"}};"
+                + " {\"tool\":\"pipeline.search\",\"args\":{\"root\":\"/repo\",\"query\":\"TODO\"}};"
+                + " {\"tool\":\"pipeline.summarize\",\"args\":{\"inputRef\":\"step:2\"}};"
+                + " {\"tool\":\"pipeline.saveToFile\",\"args\":{\"inputRef\":\"step:3\"}}."
                 + " Отвечай строго одним JSON: {\"tool\":\"server.tool\",\"args\":{...}} или {\"final\":\"ответ\"}. Финальный ответ на русском.";
     }
     private static String safe(String value) { return value == null ? "ошибка" : value.replaceAll("[\\r\\n]+", " "); }
+
+    private String completeWithRetry(String system, String prompt, long timeoutMillis)
+            throws TimeoutException, InterruptedException, ApiFailure {
+        Throwable failure = null;
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try {
+                String modelPrompt = prompt;
+                Future<String> call = modelExecutor.submit(() -> model.complete(system, modelPrompt));
+                return call.get(timeoutMillis, TimeUnit.MILLISECONDS);
+            } catch (ExecutionException e) {
+                failure = e.getCause() == null ? e : e.getCause();
+                if (attempt == 0 && transientApiFailure(failure)) continue;
+                throw new ApiFailure(apiReason(failure));
+            }
+        }
+        throw new ApiFailure(apiReason(failure));
+    }
+
+    private static boolean transientApiFailure(Throwable error) {
+        String text = error == null ? "" : String.valueOf(error.getMessage()).toLowerCase();
+        return text.contains("http-статус 429") || text.matches(".*http-статус 5\\d\\d.*")
+                || text.contains("сетевая ошибка") || text.contains("timeout");
+    }
+
+    private static String apiReason(Throwable error) {
+        String text = error == null ? "" : String.valueOf(error.getMessage());
+        java.util.regex.Matcher code = java.util.regex.Pattern.compile("HTTP-статус \\d+").matcher(text);
+        if (code.find()) return code.group();
+        if (text.toLowerCase().contains("сетевая ошибка")) return "сетевая ошибка";
+        return error == null ? "неизвестный тип" : error.getClass().getSimpleName();
+    }
+
+    private static final class ApiFailure extends Exception {
+        private final String reason;
+        private ApiFailure(String reason) { this.reason = reason; }
+        private String reason() { return reason; }
+    }
 }

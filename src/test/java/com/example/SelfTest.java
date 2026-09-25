@@ -483,6 +483,67 @@ public final class SelfTest {
             McpOrchestrator.Outcome invalidOutcome = invalid.run("исправь");
             expect("ошибочные шаги возвращаются модели", invalidOutcome.steps().size() >= 2
                     && !invalidOutcome.steps().get(0).ok() && !invalidOutcome.steps().get(1).ok());
+
+            Path nonGit = Files.createDirectory(baseTempDir.resolve("orchestration-non-git"));
+            Files.writeString(nonGit.resolve("fix.txt"), "fixword one\nfixword two\n");
+            Path nonGitResults = Files.createDirectory(baseTempDir.resolve("non-git-results"));
+            try (McpRegistry outsideRegistry = McpRegistry.open(nonGit, nonGitResults)) {
+                expect("O14 Git MCP доступен из non-Git cwd", outsideRegistry.tools().size() == 4
+                        && outsideRegistry.statuses().stream().allMatch(McpRegistry.ServerStatus::available));
+                String badPath = nonGit.resolve("not-a-repository").toString();
+                List<String> badFlow = List.of(
+                        "{\"tool\":\"git.get-repository-status\",\"args\":{\"repoPath\":\"" + badPath + "\"}}",
+                        "{\"tool\":\"pipeline.search\",\"args\":{\"root\":\"" + nonGit + "\",\"query\":\"fixword\"}}",
+                        "{\"tool\":\"pipeline.summarize\",\"args\":{\"inputRef\":\"step:2\"}}",
+                        "{\"tool\":\"pipeline.saveToFile\",\"args\":{\"inputRef\":\"step:3\",\"fileName\":\"non-git.md\"}}",
+                        "{\"final\":\"Git-шаг не удался, но pipeline завершён.\"}");
+                McpOrchestrator.Outcome badOutcome = new McpOrchestrator(outsideRegistry,
+                        new SequenceModel(badFlow.toArray(String[]::new))).run("проверь fixword");
+                expect("O15 ошибка Git не останавливает pipeline", badOutcome.steps().size() == 4
+                        && !badOutcome.steps().get(0).ok() && badOutcome.steps().get(1).ok()
+                        && Files.exists(nonGitResults.resolve("non-git.md"))
+                        && badOutcome.answer().contains("Git-шаг"));
+                ToolRouter.Result validFromOutside = new ToolRouter(outsideRegistry).call(
+                        "git.get-repository-status", Map.of("repoPath", repo.toString()));
+                expect("O16 Git-репозиторий читается из non-Git cwd", validFromOutside.ok());
+            }
+
+            List<String> correction = List.of(
+                    "{\"tool\":\"server.pipeline.summarize\",\"args\":{\"inputRef\":\"step:2\"}}",
+                    "{\"tool\":\"git.get-repository-status\",\"args\":{\"repoPath\":\"" + repo + "\"}}",
+                    "{\"tool\":\"pipeline.search\",\"args\":{\"root\":\"" + repo + "\",\"query\":\"TODO\"}}",
+                    "{\"tool\":\"pipeline.summarize\",\"args\":{\"inputRef\":\"step:3\"}}",
+                    "{\"tool\":\"pipeline.saveToFile\",\"args\":{\"inputRef\":\"step:4\",\"fileName\":\"corrected.md\"}}",
+                    "{\"final\":\"исправлено\"}");
+            McpOrchestrator.Outcome corrected = new McpOrchestrator(registry,
+                    new SequenceModel(correction.toArray(String[]::new))).run("исправь имя");
+            expect("O17 неверное имя исправляется", corrected.steps().get(0).error().contains("Ближайшее точное имя")
+                    && !corrected.stopped() && corrected.answer().equals("исправлено"));
+
+            StringBuilder large = new StringBuilder();
+            for (int i = 0; i < 120; i++) large.append("fixword ").append("x".repeat(70)).append('\n');
+            Files.writeString(repo.resolve("large.txt"), large.toString());
+            java.util.concurrent.atomic.AtomicReference<String> captured = new java.util.concurrent.atomic.AtomicReference<>();
+            List<String> largeFlow = List.of(
+                    "{\"tool\":\"git.get-repository-status\",\"args\":{\"repoPath\":\"" + repo + "\"}}",
+                    "{\"tool\":\"pipeline.search\",\"args\":{\"root\":\"" + repo + "\",\"query\":\"fixword\"}}",
+                    "{\"tool\":\"pipeline.summarize\",\"args\":{\"inputRef\":\"step:2\"}}",
+                    "{\"tool\":\"pipeline.saveToFile\",\"args\":{\"inputRef\":\"step:3\",\"fileName\":\"large.md\"}}",
+                    "{\"final\":\"large done\"}");
+            McpOrchestrator.Outcome largeOutcome = new McpOrchestrator(registry,
+                    new McpOrchestrator.Model() { int i; public String complete(String s, String p) {
+                        if (i++ == 2) captured.set(p); return largeFlow.get(Math.min(i - 1, largeFlow.size() - 1));
+                    }}).run("large");
+            expect("O18 результат ограничен только в prompt", captured.get() != null
+                    && captured.get().contains("обрезано") && largeOutcome.steps().size() == 4);
+
+            McpOrchestrator.Outcome apiFailure = new McpOrchestrator(registry,
+                    new McpOrchestrator.Model() { int i; public String complete(String s, String p) {
+                        if (i++ < 4) return replies.get(i - 1);
+                        throw new AgentException("Сервер вернул HTTP-статус 500. Запрос не выполнен.");
+                    }}).run("api failure");
+            expect("O19 API 500 получает один повтор", apiFailure.answer().contains("ошибка API модели: HTTP-статус 500")
+                    && Files.exists(results.resolve("orchestration.md")));
         }
     }
 
@@ -527,6 +588,33 @@ public final class SelfTest {
             }
         }
         expect("live orchestration соответствует контракту", passedAttempt);
+
+        Path nonGit = Files.createDirectory(baseTempDir.resolve("live-non-git"));
+        Files.writeString(nonGit.resolve("fix.txt"), "fixword one\nfixword two\n");
+        Path nonGitResults = Files.createDirectory(baseTempDir.resolve("live-non-git-results"));
+        try (JsonConversationStore store = new JsonConversationStore(baseTempDir.resolve("live-non-git-history.json"));
+             McpRegistry registry = McpRegistry.open(nonGit, nonGitResults)) {
+            LlmAgent llm = new LlmAgent(new Config(env.get("LLM_API_KEY"), url, model),
+                    ModelSettings.fromEnv(), store,
+                    new MemoryStore(baseTempDir.resolve("live-non-git-memory.json")),
+                    new ProfileStore(baseTempDir.resolve("live-non-git-profile.json")),
+                    new InvariantStore(baseTempDir.resolve("live-non-git-invariants.json")));
+            McpOrchestrator.Outcome outcome = new McpOrchestrator(registry,
+                    (system, prompt) -> llm.askWithoutHistory(system, prompt)).run(
+                    "Проверь состояние репозитория " + nonGit
+                            + ". Git-шаг может завершиться ошибкой, но продолжи pipeline:"
+                            + " найди fixword, сделай сводку и сохрани файл; финальный ответ упомяни ошибку Git.");
+            for (ToolRouter.Step step : outcome.steps()) {
+                System.out.println("live b: " + step.number() + " | " + step.server() + " | "
+                        + step.tool() + " | " + step.inputRef() + " | "
+                        + (step.ok() ? "ok" : "error: " + step.error()));
+            }
+            expect("live non-Git: Git ошибка, pipeline выполнен",
+                    outcome.steps().size() <= 8 && outcome.steps().stream().anyMatch(step -> !step.ok()
+                            && "git".equals(step.server()))
+                            && outcome.steps().stream().anyMatch(step -> step.ok() && "saveToFile".equals(step.tool()))
+                            && outcome.answer().toLowerCase(Locale.ROOT).contains("git"));
+        }
     }
 
     private static boolean liveChecks(List<ToolRouter.Step> steps, Path results, String secret) {
@@ -558,6 +646,14 @@ public final class SelfTest {
     private static Map<String, String> readDotEnv() throws IOException {
         Map<String, String> values = new LinkedHashMap<>();
         Path file = Path.of(".env");
+        if (!Files.isRegularFile(file)) {
+            try {
+                Path location = Path.of(SelfTest.class.getProtectionDomain().getCodeSource()
+                        .getLocation().toURI()).toAbsolutePath();
+                Path project = Files.isDirectory(location) ? location.getParent().getParent() : location.getParent();
+                file = project.resolve(".env");
+            } catch (Exception ignored) { }
+        }
         if (!Files.isRegularFile(file)) return values;
         for (String line : Files.readAllLines(file, StandardCharsets.UTF_8)) {
             String value = line.trim();

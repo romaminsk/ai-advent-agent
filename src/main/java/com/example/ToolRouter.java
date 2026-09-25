@@ -66,7 +66,16 @@ public final class ToolRouter {
         if (registry.status(server) != null && !registry.status(server).available()) {
             return "Сервер " + server + " недоступен: " + registry.status(server).reason();
         }
-        if (!registry.has(server + "." + tool)) return "Неизвестный инструмент: " + server + "." + tool;
+        if (!registry.has(server + "." + tool)) {
+            String requested = server + "." + tool;
+            String available = registry.tools().stream().map(McpRegistry.ToolDescriptor::qualifiedName)
+                    .reduce((a, b) -> a + ", " + b).orElse("нет");
+            String nearest = registry.tools().stream()
+                    .min(java.util.Comparator.comparingInt(t -> distance(requested, t.qualifiedName())))
+                    .map(McpRegistry.ToolDescriptor::qualifiedName).orElse("нет");
+            return "Инструмент " + requested + " недоступен. Доступны: " + available
+                    + ". Ближайшее точное имя: " + nearest;
+        }
         if ("pipeline".equals(server) && "search".equals(tool)
                 && args.get("root") instanceof String root && !registry.allowsRoot(root)) {
             return "pipeline.search разрешён только внутри проверяемого Git-репозитория;"
@@ -80,6 +89,21 @@ public final class ToolRouter {
             if (!expected.equals(resultTools.get(inputRef))) return "Ссылка " + inputRef + " указывает на результат не того инструмента";
         } else if (args.containsKey("inputRef")) return "inputRef допустим только для pipeline summarize/saveToFile";
         return null;
+    }
+
+    private static int distance(String left, String right) {
+        int[] row = new int[right.length() + 1];
+        for (int j = 0; j < row.length; j++) row[j] = j;
+        for (int i = 1; i <= left.length(); i++) {
+            int previous = row[0]; row[0] = i;
+            for (int j = 1; j <= right.length(); j++) {
+                int current = row[j];
+                row[j] = Math.min(Math.min(row[j] + 1, row[j - 1] + 1),
+                        previous + (left.charAt(i - 1) == right.charAt(j - 1) ? 0 : 1));
+                previous = current;
+            }
+        }
+        return row[right.length()];
     }
 
     private Step step(int n, String server, String tool, Map<String, Object> args, String ref,

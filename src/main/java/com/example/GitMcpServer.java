@@ -34,6 +34,19 @@ public final class GitMcpServer implements AutoCloseable {
                 .build();
     }
 
+    private GitMcpServer(Path allowedRoot, boolean orchestration)
+            throws GitRepositoryReader.GitRepositoryException {
+        this.reader = new GitRepositoryReader(allowedRoot, false, orchestration);
+        StdioServerTransportProvider transport = new StdioServerTransportProvider(
+                new JacksonMcpJsonMapperSupplier().get());
+        McpServerFeatures.SyncToolSpecification specification =
+                McpServerFeatures.SyncToolSpecification.builder().tool(toolDefinition())
+                        .callHandler((exchange, request) -> handle(request)).build();
+        this.server = McpServer.sync(transport).serverInfo("local-git", "1.0")
+                .capabilities(McpSchema.ServerCapabilities.builder().tools(true).build())
+                .tools(specification).build();
+    }
+
     static McpSchema.Tool toolDefinition() {
         return McpSchema.Tool.builder()
                 .name(TOOL_NAME)
@@ -68,7 +81,7 @@ public final class GitMcpServer implements AutoCloseable {
             return error("Неверные аргументы: требуется непустой абсолютный repoPath.");
         }
         try {
-            GitRepositoryStatus status = reader.read(Path.of(repoPath));
+            GitRepositoryStatus status = reader.read(expandUser(Path.of(repoPath)));
             return McpSchema.CallToolResult.builder()
                     .structuredContent(status.toMap())
                     .addTextContent(new com.fasterxml.jackson.databind.ObjectMapper()
@@ -83,6 +96,13 @@ public final class GitMcpServer implements AutoCloseable {
 
     private static McpSchema.CallToolResult error(String message) {
         return McpSchema.CallToolResult.builder().isError(true).addTextContent(message).build();
+    }
+
+    private static Path expandUser(Path path) {
+        String value = path.toString();
+        if ("~".equals(value)) return Path.of(System.getProperty("user.home"));
+        if (value.startsWith("~/")) return Path.of(System.getProperty("user.home"), value.substring(2));
+        return path;
     }
 
     @Override
@@ -114,10 +134,33 @@ public final class GitMcpServer implements AutoCloseable {
 
     /** Команда для оркестрации: использует установленный shaded CLI, если он доступен. */
     static String orchestrationCommand(Path allowedRoot) {
-        if (commandExists("ai-agent")) {
-            return "ai-agent --mcp-server git --repo-root " + quote(allowedRoot.toString());
+        try {
+            Path location = Path.of(GitMcpServer.class.getProtectionDomain().getCodeSource()
+                    .getLocation().toURI()).toAbsolutePath();
+            if (java.nio.file.Files.isRegularFile(location) && commandExists("ai-agent")) {
+            return "ai-agent --mcp-server git --repo-root /";
+            }
+            String classpath = runtimeClasspath(location);
+            String javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+            return quote(javaExecutable) + " -cp " + quote(classpath) + " " + GitMcpServer.class.getName()
+                    + " " + ROOT_ARGUMENT + " /";
+        } catch (Exception e) {
+            return command(Path.of("/"));
         }
-        return command(allowedRoot);
+    }
+
+    private static String runtimeClasspath(Path location) {
+        String configured = System.getProperty("java.class.path", "");
+        if (!configured.isBlank() && !configured.contains("plexus-classworlds")) return configured;
+        if (GitMcpServer.class.getClassLoader() instanceof java.net.URLClassLoader loader) {
+            StringBuilder result = new StringBuilder();
+            for (java.net.URL url : loader.getURLs()) {
+                if (result.length() > 0) result.append(java.io.File.pathSeparator);
+                result.append(Path.of(url.getPath()));
+            }
+            if (result.length() > 0) return result.toString();
+        }
+        return location.toString();
     }
 
     private static String quote(String value) {
@@ -143,7 +186,7 @@ public final class GitMcpServer implements AutoCloseable {
             System.err.println("Git MCP: требуется " + ROOT_ARGUMENT + " <корень репозитория>");
             return 2;
         }
-        try (GitMcpServer ignored = new GitMcpServer(Path.of(args[1]))) {
+        try (GitMcpServer ignored = new GitMcpServer(Path.of(args[1]), true)) {
             Thread.currentThread().join();
             return 0;
         } catch (GitRepositoryReader.GitRepositoryException e) {

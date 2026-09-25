@@ -3279,6 +3279,10 @@ public final class Main {
             handleGitStatus(ui, repoPath, mcpSnapshot);
             return;
         }
+        if (argument.equalsIgnoreCase("git status")) {
+            handleGitStatus(ui, Path.of(".").toAbsolutePath().normalize().toString(), mcpSnapshot);
+            return;
+        }
         if (argument.equalsIgnoreCase("monitor tools")) {
             try {
                 ui.showSystem(McpClientComponent.format(
@@ -3348,11 +3352,18 @@ public final class Main {
                 .matcher(request);
         while (matcher.find()) {
             String candidate = matcher.group().replaceAll("[.。)]+$", "");
-            try {
-                return GitRepositoryReader.resolveLocation(Path.of(candidate)).repositoryRoot();
-            } catch (Exception ignored) { }
+            Path path = expandUserPath(Path.of(candidate));
+            try { return GitRepositoryReader.resolveLocation(path).repositoryRoot(); }
+            catch (Exception ignored) { return path.toAbsolutePath().normalize(); }
         }
         return defaultRepoRoot();
+    }
+
+    private static Path expandUserPath(Path path) {
+        String value = path.toString();
+        if ("~".equals(value)) return Path.of(System.getProperty("user.home"));
+        if (value.startsWith("~/")) return Path.of(System.getProperty("user.home"), value.substring(2));
+        return path;
     }
 
     private static void runMcpAgent(TerminalUi ui, LlmAgent agent, String request) {

@@ -24,35 +24,44 @@ public final class GitRepositoryReader {
     static final int MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 
     private final Path allowedRoot;
+    private final boolean allowAnyRepository;
 
     public record RepositoryLocation(Path requestedPath, Path repositoryRoot) {
     }
 
     public GitRepositoryReader(Path allowedRoot) throws GitRepositoryException {
+        this(allowedRoot, true, false);
+    }
+
+    GitRepositoryReader(Path allowedRoot, boolean validateRoot, boolean allowAnyRepository)
+            throws GitRepositoryException {
         this.allowedRoot = canonicalDirectory(allowedRoot, "Разрешённый корень репозитория");
-        ensureRepository(this.allowedRoot);
+        this.allowAnyRepository = allowAnyRepository;
+        if (validateRoot) {
+            ensureRepository(this.allowedRoot);
+        }
     }
 
     public GitRepositoryStatus read(Path repoPath) throws GitRepositoryException {
         Path requested = canonicalDirectory(repoPath, "Путь репозитория");
-        if (!requested.startsWith(allowedRoot)) {
+        if (!allowAnyRepository && !requested.startsWith(allowedRoot)) {
             throw new GitRepositoryException("Путь находится вне разрешённого репозитория.");
         }
         RepositoryLocation location = resolveLocation(requested);
         Path actualRoot = location.repositoryRoot();
-        if (!allowedRoot.equals(actualRoot)) {
+        if (!allowAnyRepository && !allowedRoot.equals(actualRoot)) {
             throw new GitRepositoryException("Путь относится к другому или вложенному репозиторию.");
         }
 
-        CommandResult status = run(List.of("git", "--no-optional-locks", "-C", allowedRoot.toString(),
+        CommandResult status = run(List.of("git", "--no-optional-locks", "-C", actualRoot.toString(),
                 "status", "--porcelain=v1", "-z", "--untracked-files=all"));
         ParsedStatus parsed = parseStatus(status.stdout());
-        String branch = symbolicBranch();
-        CommandResult head = runAllowFailure(List.of("git", "-C", allowedRoot.toString(),
+        String branch = symbolicBranch(actualRoot);
+        CommandResult head = runAllowFailure(List.of("git", "-C", actualRoot.toString(),
                 "rev-parse", "--verify", "HEAD"));
         String headCommit = head.exitCode() == 0 ? text(head.stdout()) : null;
         boolean detached = branch == null;
-        return new GitRepositoryStatus(allowedRoot.toString(), branch, detached, headCommit,
+        return new GitRepositoryStatus(actualRoot.toString(), branch, detached, headCommit,
                 parsed.staged().isEmpty() && parsed.unstaged().isEmpty()
                         && parsed.untracked().isEmpty() && parsed.conflicts().isEmpty(),
                 parsed.staged(), parsed.unstaged(), parsed.untracked(), parsed.conflicts());
@@ -102,8 +111,8 @@ public final class GitRepositoryReader {
         }
     }
 
-    private String symbolicBranch() throws GitRepositoryException {
-        CommandResult result = runAllowFailure(List.of("git", "-C", allowedRoot.toString(),
+    private String symbolicBranch(Path root) throws GitRepositoryException {
+        CommandResult result = runAllowFailure(List.of("git", "-C", root.toString(),
                 "symbolic-ref", "--short", "-q", "HEAD"));
         return result.exitCode() == 0 && !text(result.stdout()).isBlank() ? text(result.stdout()) : null;
     }
