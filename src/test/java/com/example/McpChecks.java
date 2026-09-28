@@ -517,7 +517,6 @@ final class McpChecks extends SelfTestSupport {
         MonitorStore.RuntimeLease first = store.tryRuntimeLock(schedule.id());
         expect("runtime-lock T1 захватывается и создаётся", first != null && Files.exists(runtime));
         first.close();
-        first.close();
         expect("runtime-lock T1 удалён после успешного close", !Files.exists(runtime));
 
         MonitorStore.RuntimeLease second = store.tryRuntimeLock(schedule.id());
