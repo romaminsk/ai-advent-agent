@@ -10,7 +10,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.function.Supplier;
-import java.util.stream.Collectors;
 
 /**
  * CLI-команды /index: build [путь], stats, search <текст>, compare.
@@ -114,10 +113,10 @@ public final class IndexCommands {
             }
             double avg = index.chunks().isEmpty() ? 0 : (double) total / index.chunks().size();
             lines.add(String.format(Locale.ROOT,
-                    "%s: %d чанков, %d файлов, средний %.0f, мин %d, макс %d, сборка %d мс, запросов %d, модель %s, dim %d",
+                    "%s: %d чанков, %d файлов, средний %.0f, мин %d, макс %d, сборка %d мс, API последней сборки %d, coldRequests %d, модель %s, dim %d",
                     strategy, index.chunks().size(), sources.size(), avg,
                     min == Integer.MAX_VALUE ? 0 : min, max, index.buildMs(),
-                    index.apiRequests(), index.model(), index.dim()));
+                    index.apiRequests(), index.coldRequests(), index.model(), index.dim()));
         }
         return String.join("\n", lines);
     }
@@ -159,6 +158,10 @@ public final class IndexCommands {
         if (parsed.isEmpty()) {
             return "Нет контрольных вопросов: " + questions;
         }
+        String sourceValidation = validateExpectedSources(parsed, fixed, structure);
+        if (sourceValidation != null) {
+            return "Ошибка контрольных вопросов: " + sourceValidation;
+        }
         for (String[] item : parsed) {
             String question = item[0];
             String expected = item[1];
@@ -172,32 +175,46 @@ public final class IndexCommands {
         Path target = store.directory().resolve("compare-" + date + ".md");
         Files.createDirectories(store.directory());
         Files.writeString(target, report, StandardCharsets.UTF_8);
-        return "Сравнение записано: " + target + "\n\n" + verdictLine(parsed, resultsFixed, resultsStructure);
+        return "Сравнение записано: " + target + "\n\n"
+                + verdictLines(fixed, structure, parsed, resultsFixed, resultsStructure);
     }
 
-    /** Ответ одной строкой: какая стратегия лучше и почему. */
-    static String verdictLine(List<String[]> parsed,
-                              List<QuestionResult> fixed, List<QuestionResult> structure) {
+    /** Сравнивает метрики отдельно; близкие top-k результаты помечаются незначимыми. */
+    static String verdictLines(IndexStore.Index fixedIndex, IndexStore.Index structureIndex,
+                               List<String[]> parsed,
+                               List<QuestionResult> fixed, List<QuestionResult> structure) {
         int top1Fixed = hits(fixed, true);
         int top1Structure = hits(structure, true);
         int top3Fixed = hits(fixed, false);
         int top3Structure = hits(structure, false);
-        if (top1Fixed == top1Structure && top3Fixed == top3Structure) {
-            return "Вывод: обе стратегии одинаковы по контрольным вопросам ("
-                    + top1Fixed + " top-1, " + top3Fixed + " top-3 из "
-                    + parsed.size() + ") — различия только в размере чанков";
+        String top1 = questionWinner("top-1", top1Fixed, top1Structure, parsed.size());
+        String top3 = questionWinner("top-3", top3Fixed, top3Structure, parsed.size());
+        String cuts = lowerIsBetter("обрезанности", midCutShare(fixedIndex),
+                midCutShare(structureIndex), "%.1f%%");
+        String requests = lowerIsBetter("cold API-запросов", fixedIndex.coldRequests(),
+                structureIndex.coldRequests(), "%.0f");
+        return "Вывод:\n" + top1 + "; " + top3 + "\n" + cuts + "\n" + requests;
+    }
+
+    private static String questionWinner(String metric, int fixed, int structure, int total) {
+        if (Math.abs(fixed - structure) <= 1) {
+            return metric + ": fixed " + fixed + "/" + total + ", structure "
+                    + structure + "/" + total + " — разница ≤ 1 вопроса, незначимо";
         }
-        boolean structureWins = top1Structure * 3 + top3Structure
-                > top1Fixed * 3 + top3Fixed;
-        String winner = structureWins ? "structure" : "fixed";
-        String loser = structureWins ? "fixed" : "structure";
-        int wTop1 = structureWins ? top1Structure : top1Fixed;
-        int wTop3 = structureWins ? top3Structure : top3Fixed;
-        int lTop1 = structureWins ? top1Fixed : top1Structure;
-        int lTop3 = structureWins ? top3Fixed : top3Structure;
-        return "Вывод: лучше " + winner + " — top-1 " + wTop1 + " против " + lTop1
-                + ", top-3 " + wTop3 + " против " + lTop3 + " у " + loser
-                + " (из " + parsed.size() + " вопросов)";
+        return metric + ": лучше " + (fixed > structure ? "fixed" : "structure")
+                + " (fixed " + fixed + "/" + total + ", structure " + structure
+                + "/" + total + ")";
+    }
+
+    private static String lowerIsBetter(String metric, double fixed, double structure,
+                                        String format) {
+        if (Double.compare(fixed, structure) == 0) {
+            return metric + ": равны (fixed " + String.format(Locale.ROOT, format, fixed)
+                    + ", structure " + String.format(Locale.ROOT, format, structure) + ")";
+        }
+        return metric + ": лучше " + (fixed < structure ? "fixed" : "structure")
+                + " (fixed " + String.format(Locale.ROOT, format, fixed)
+                + ", structure " + String.format(Locale.ROOT, format, structure) + ")";
     }
 
     private static int hits(List<QuestionResult> results, boolean top1) {
@@ -229,8 +246,35 @@ public final class IndexCommands {
     }
 
     private static boolean matches(IndexSearch.Hit hit, String expected) {
-        return hit.chunk().meta().source().toLowerCase(Locale.ROOT)
-                .contains(expected.toLowerCase(Locale.ROOT));
+        String source = hit.chunk().meta().source().toLowerCase(Locale.ROOT);
+        for (String candidate : expected.split("\\|")) {
+            String normalized = candidate.trim().toLowerCase(Locale.ROOT);
+            if (!normalized.isEmpty() && source.contains(normalized)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String validateExpectedSources(List<String[]> questions,
+                                                  IndexStore.Index fixed,
+                                                  IndexStore.Index structure) {
+        for (String[] question : questions) {
+            for (String candidate : question[1].split("\\|")) {
+                String expected = candidate.trim().toLowerCase(Locale.ROOT);
+                if (expected.isEmpty()) {
+                    return "для вопроса «" + question[0] + "» не задан expected source";
+                }
+                boolean inFixed = fixed.chunks().stream().anyMatch(chunk ->
+                        chunk.meta().source().toLowerCase(Locale.ROOT).contains(expected));
+                boolean inStructure = structure.chunks().stream().anyMatch(chunk ->
+                        chunk.meta().source().toLowerCase(Locale.ROOT).contains(expected));
+                if (!inFixed || !inStructure) {
+                    return "файл «" + candidate.trim() + "» отсутствует в одном из индексов";
+                }
+            }
+        }
+        return null;
     }
 
     /** Сравнительная таблица + вопросы в markdown. */
@@ -256,8 +300,8 @@ public final class IndexCommands {
                 midCutShare(fixed), midCutShare(structure)));
         out.append(String.format(Locale.ROOT, "| время сборки | %d мс | %d мс |\n",
                 fixed.buildMs(), structure.buildMs()));
-        out.append(String.format(Locale.ROOT, "| запросов к API | %d | %d |\n",
-                fixed.apiRequests(), structure.apiRequests()));
+        out.append(String.format(Locale.ROOT, "| запросов к API (coldRequests) | %d | %d |\n",
+                fixed.coldRequests(), structure.coldRequests()));
         out.append("\n## Контрольные вопросы\n\n");
         out.append("| # | вопрос | ожидаемый файл | fixed top-1 | fixed top-3 | fixed avg | structure top-1 | structure top-3 | structure avg |\n");
         out.append("|---|---|---|---|---|---|---|---|---|\n");
@@ -269,7 +313,8 @@ public final class IndexCommands {
                     f.hitTop1() ? "да" : "нет", f.hitTop3() ? "да" : "нет", f.avgTop3(),
                     s.hitTop1() ? "да" : "нет", s.hitTop3() ? "да" : "нет", s.avgTop3()));
         }
-        out.append("\n").append(verdictLine(parsed, resultsFixed, resultsStructure)).append("\n");
+        out.append("\n").append(verdictLines(fixed, structure, parsed,
+                resultsFixed, resultsStructure)).append("\n");
         out.append("\nВопросы: ").append(questionsFile).append("\n");
         return out.toString();
     }

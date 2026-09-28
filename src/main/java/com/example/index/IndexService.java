@@ -62,10 +62,12 @@ public final class IndexService {
         EmbeddingCache cache = new EmbeddingCache(cacheFile());
         Map<Integer, float[]> fresh = new HashMap<>();
         List<Integer> pending = new ArrayList<>();
+        int cachedChunks = 0;
         for (int i = 0; i < allChunks.size(); i++) {
             float[] cached = cache.get(sha256(allChunks.get(i).text()));
             if (cached != null) {
                 fresh.put(i, cached);
+                cachedChunks++;
             } else {
                 pending.add(i);
             }
@@ -126,8 +128,15 @@ public final class IndexService {
         }
         int dim = indexed.isEmpty() ? 0 : indexed.get(0).vector().length;
         long buildMs = System.currentTimeMillis() - started;
+        IndexStore.Index previous = store.load(strategy);
+        int coldRequests = previous == null ? 0 : previous.coldRequests();
+        if (cachedChunks == 0 && apiRequests > 0) {
+            coldRequests = apiRequests;
+        } else if (coldRequests == 0 && previous != null) {
+            coldRequests = previous.apiRequests();
+        }
         store.save(new IndexStore.Index(strategy, model, dim, Instant.now(),
-                corpusRootPath, buildMs, apiRequests, indexed));
+                corpusRootPath, buildMs, apiRequests, coldRequests, indexed));
         return new BuildReport(strategy, documents.size(), indexed.size(), buildMs,
                 apiRequests, embeddedFresh);
     }

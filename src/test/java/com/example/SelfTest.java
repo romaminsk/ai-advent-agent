@@ -2793,6 +2793,7 @@ public final class SelfTest {
         if (fixed == null || structure == null) {
             return;
         }
+        expect("I9 холодные запросы сохранены при первой сборке", fixed.coldRequests() > 0);
 
         // I1: fixed ≤ 800, перекрытие 100, покрытие без потерь.
         boolean sizesOk = true;
@@ -2892,9 +2893,12 @@ public final class SelfTest {
 
         // I5: повторная сборка без изменений = 0 запросов.
         int before = fake.requests();
+        int coldRequestsBefore = fixed.coldRequests();
         commands.handle("build " + corpus);
         expect("I5 повторная сборка без изменений = 0 запросов",
                 fake.requests() == before);
+        expect("I9 coldRequests сохраняется при кэшевой сборке",
+                new IndexStore(indexDir).load("fixed").coldRequests() == coldRequestsBefore);
 
         // I4: туда-обратно без потерь, запись атомарная.
         boolean roundtripOk = structure.chunks().size() == structure2.chunks().size();

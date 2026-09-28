@@ -1,10 +1,10 @@
 # index-questions.txt — контрольные вопросы для /index compare
-# Формат: вопрос<TAB>ожидаемая подстрока source (файл должен быть в top-1/top-3)
-как работает оркестрация MCP	McpOrchestrator.java
-как сохранить историю беседы и блокировки	JsonConversationStore.java
-как считаются токены сообщения	HeuristicTokenCounter.java
-что такое инварианты и как они защищают	InvariantStore.java
-какие есть стратегии контекста	ContextStrategy.java
-как настроить обращение к пользователю	ProfileStore.java
-как работает расписание монитора	MonitorSchedule.java
-спиннер прогресса в терминале	ProgressSpinner.java
+# Формат: 1–2 слова запроса<TAB>expected source; несколько файлов через |
+McpOrchestrator systemPrompt	McpOrchestrator.java
+JsonConversationStore lock	JsonConversationStore.java
+HeuristicTokenCounter count	HeuristicTokenCounter.java
+InvariantStore invariant	InvariantStore.java
+ContextStrategy strategy	ContextStrategy.java
+ProfileStore profile	ProfileStore.java
+MonitorSchedule schedule	MonitorSchedule.java
+ProgressSpinner spinner	ProgressSpinner.java

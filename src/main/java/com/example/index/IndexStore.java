@@ -19,7 +19,7 @@ import java.util.List;
 
 /**
  * Хранилище JSON-индекса: {model, dim, createdAt, corpusRoot, buildMs,
- * apiRequests, chunks:[{chunkId, source, title, section, strategy,
+ * apiRequests, coldRequests, chunks:[{chunkId, source, title, section, strategy,
  * startChar, endChar, chars, text, vector}]}. Запись атомарная
  * (tmp → move). Файл: <dir>/<strategy>.json.
  */
@@ -36,7 +36,7 @@ public final class IndexStore {
 
     /** Готовый индекс в памяти. */
     public record Index(String strategy, String model, int dim, Instant createdAt,
-                        String corpusRoot, long buildMs, int apiRequests,
+                        String corpusRoot, long buildMs, int apiRequests, int coldRequests,
                         List<IndexedChunk> chunks) {
     }
 
@@ -72,6 +72,7 @@ public final class IndexStore {
             generator.writeStringField("corpusRoot", index.corpusRoot());
             generator.writeNumberField("buildMs", index.buildMs());
             generator.writeNumberField("apiRequests", index.apiRequests());
+            generator.writeNumberField("coldRequests", index.coldRequests());
             generator.writeFieldName("chunks");
             generator.writeStartArray();
             for (IndexedChunk chunk : index.chunks()) {
@@ -118,6 +119,7 @@ public final class IndexStore {
             String corpusRoot = "";
             long buildMs = 0;
             int apiRequests = 0;
+            int coldRequests = 0;
             List<IndexedChunk> chunks = new ArrayList<>();
             if (!parser.hasCurrentToken()) {
                 parser.nextToken();
@@ -135,6 +137,7 @@ public final class IndexStore {
                     case "corpusRoot" -> corpusRoot = parser.getValueAsString();
                     case "buildMs" -> buildMs = parser.getLongValue();
                     case "apiRequests" -> apiRequests = parser.getIntValue();
+                    case "coldRequests" -> coldRequests = parser.getIntValue();
                     case "chunks" -> { if (value == JsonToken.START_ARRAY) readChunks(parser, chunks); }
                     default -> parser.skipChildren();
                 }
@@ -142,8 +145,13 @@ public final class IndexStore {
             if (model == null) {
                 return null;
             }
+            // Старые индексы без coldRequests читаются по числу API-запросов
+            // последней сборки; для кэшевых legacy-индексов значение 0 означает unknown.
+            if (coldRequests == 0) {
+                coldRequests = apiRequests;
+            }
             return new Index(strategy, model, dim, createdAt, corpusRoot, buildMs,
-                    apiRequests, List.copyOf(chunks));
+                    apiRequests, coldRequests, List.copyOf(chunks));
         }
     }
 
