@@ -417,7 +417,7 @@ class SelfTestSupport {
         }
     }
      static PipelineRunner pipelineRunner(Path results) {
-        return new PipelineRunner(results, pipelineChildCommand(results), Duration.ofSeconds(10));
+         return new PipelineRunner(results, pipelineChildCommand(results), Duration.ofSeconds(2));
     }
      static boolean noPipelineChildProcess(Path results) throws Exception {
         String marker = "PipelineMcpServer --results-dir " + results;

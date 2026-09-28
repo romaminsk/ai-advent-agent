@@ -24,6 +24,7 @@ public final class McpClientComponent {
 
     static final Duration TIMEOUT = Duration.ofSeconds(10);
     private static final String AUTH_TOKEN_ENV = "MCP_AUTH_TOKEN";
+    private static final ThreadLocal<Duration> TEST_TIMEOUT = new ThreadLocal<>();
 
     public record ToolInfo(String name, String description) {
     }
@@ -42,11 +43,29 @@ public final class McpClientComponent {
     private final Duration timeout;
 
     public McpClientComponent() {
-        this(TIMEOUT);
+        this(currentTimeout());
     }
 
     McpClientComponent(Duration timeout) {
         this.timeout = timeout;
+    }
+
+    /** Test-only scoped default. Production keeps TIMEOUT unless a test installs an override. */
+    static AutoCloseable useTestTimeout(Duration timeout) {
+        if (timeout == null || timeout.isZero() || timeout.isNegative()) {
+            throw new IllegalArgumentException("test timeout must be positive");
+        }
+        Duration previous = TEST_TIMEOUT.get();
+        TEST_TIMEOUT.set(timeout);
+        return () -> {
+            if (previous == null) TEST_TIMEOUT.remove();
+            else TEST_TIMEOUT.set(previous);
+        };
+    }
+
+    static Duration currentTimeout() {
+        Duration override = TEST_TIMEOUT.get();
+        return override == null ? TIMEOUT : override;
     }
 
     /** URL означает HTTP, всё остальное разбирается как команда процесса. */

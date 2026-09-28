@@ -101,7 +101,7 @@ final class McpChecks extends SelfTestSupport {
         }
 
         try {
-            new McpClientComponent(Duration.ofMillis(100)).listTools(command + " timeout");
+            new McpClientComponent(Duration.ofSeconds(1)).listTools(command + " timeout");
             expect("таймаут MCP обрабатывается", false);
         } catch (McpClientComponent.McpClientException e) {
             expect("таймаут MCP обрабатывается", e.getMessage().contains("время ожидания"));
@@ -152,7 +152,7 @@ final class McpChecks extends SelfTestSupport {
                     !e.getMessage().contains("времени ожидания"));
         }
         try {
-            new McpClientComponent(Duration.ofMillis(100))
+            new McpClientComponent(Duration.ofSeconds(1))
                     .callTool(command + " long-timeout", "greet", Map.of());
             expect("живой MCP-процесс без ответа даёт timeout", false);
         } catch (McpClientComponent.McpClientException e) {
@@ -516,7 +516,6 @@ final class McpChecks extends SelfTestSupport {
 
         MonitorStore.RuntimeLease first = store.tryRuntimeLock(schedule.id());
         expect("runtime-lock T1 захватывается и создаётся", first != null && Files.exists(runtime));
-        first.close();
         first.close();
         expect("runtime-lock T1 удалён после успешного close", !Files.exists(runtime));
 

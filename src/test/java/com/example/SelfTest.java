@@ -162,9 +162,12 @@ public final class SelfTest extends SelfTestSupport {
         groups.put("commands", new TestGroup("Команды", true, CommandChecks::run));
         groups.put("invariant-guard", new TestGroup("InvariantGuard", true, InvariantGuardChecks::run));
         groups.put("ux", new TestGroup("UX", true, UxChecks::run));
-        groups.put("mcp", new TestGroup("MCP", true, McpChecks::run));
-        groups.put("mcp-pipeline", new TestGroup("MCP Pipeline", true, McpPipelineChecks::run));
-        groups.put("orchestration", new TestGroup("Orchestration", true, OrchestrationChecks::run));
+        groups.put("mcp", new TestGroup("MCP", true,
+                () -> runWithMcpTestTimeout(McpChecks::run)));
+        groups.put("mcp-pipeline", new TestGroup("MCP Pipeline", true,
+                () -> runWithMcpTestTimeout(McpPipelineChecks::run)));
+        groups.put("orchestration", new TestGroup("Orchestration", true,
+                () -> runWithMcpTestTimeout(OrchestrationChecks::run)));
         groups.put("worker-scheduler", new TestGroup("Worker планировщик", true, WorkerSchedulerChecks::run));
         groups.put("worker-process", new TestGroup("Worker процесс", true, WorkerProcessChecks::run));
         groups.put("store-failures", new TestGroup("Store и runner отказы", true, StoreFailureChecks::run));
@@ -175,6 +178,12 @@ public final class SelfTest extends SelfTestSupport {
         groups.put("orchestration-live", new TestGroup("Orchestration live", false,
                 SelfTest::runLiveOrchestration));
         return groups;
+    }
+
+    private static void runWithMcpTestTimeout(GroupAction action) throws Exception {
+        try (AutoCloseable ignored = McpClientComponent.useTestTimeout(Duration.ofSeconds(2))) {
+            action.run();
+        }
     }
 
     private static void runLiveOrchestration() throws Exception {
