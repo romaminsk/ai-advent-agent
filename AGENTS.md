@@ -16,7 +16,10 @@
 - Monitor: `MonitorStore`, `MonitorRunner`, `MonitorWorker`, `MonitorSchedule`, `MonitorAggregator`.
 - Pipeline utilities: `FileSearcher`, `SearchSummarizer`, `ResultFileWriter`, `PipelineCanonicalJson`.
 - `com.example.index` — загрузка документов, chunking, embeddings, кэш, JSON-индекс, поиск и сравнение.
-- `src/test/java/com/example` — локальный self-test harness (`SelfTest`), MCP stub и writer для процессных тестов.
+- `src/test/java/com/example` — локальные self-tests без платных запросов к LLM.
+- `SelfTest.java` — короткий runner и реестр групп; `SelfTestSupport.java` — expect, counters, stores, stubs, локальные серверы и process helpers.
+- Group files: `DialogChecks`, `StoreChecks`, `TaskStateChecks`, `ContextChecks`, `ContextStrategyChecks`, `CommandChecks`, `InvariantGuardChecks`, `UxChecks`, `McpChecks`, `McpPipelineChecks`, `OrchestrationChecks`, `OrchestrationLiveChecks`, `WorkerSchedulerChecks`, `WorkerProcessChecks`, `StoreFailureChecks`, `MeasurementChecks`, `QuietOutputChecks`, `IntegrationChecks`, `IndexChecks`.
+- Другие test support: `McpStubServer`, `SelfTestStoreWriter`.
 
 ## Run And Build
 - Запуск установленного CLI: `ai-agent` (launcher загружает настройки из `.env`).
@@ -24,13 +27,13 @@
 - Справка без запуска диалога: `ai-agent --help`; plain UI: `ai-agent --plain`.
 
 ## Tests
-- Группа: `mvn -q test-compile exec:java@self-test -Dexec.args=<аргумент>`.
-- Самостоятельные аргументы: `orchestration`, `orchestration-live`, `mcp`, `index`, `ux`.
-- `mcp` запускает обе группы MCP и MCP Pipeline; `orchestration-live` обращается к настроенному провайдеру.
-- Группы полного suite: Диалог, Хранилища, Состояние задачи, Контекст, Команды, InvariantGuard, UX, MCP, MCP Pipeline, Orchestration, Worker планировщик, Worker процесс, Store и runner отказы, Измерения, Тихий вывод, Интеграция.
-- Остальные группы не имеют отдельного аргумента и запускаются полным suite.
+- Группа: `mvn -q test-compile exec:java@self-test -Dexec.args=<group[,group]>`; `-Dexec.args=list` печатает реестр.
+- Группы полного suite: `dialog`, `stores`, `task-state`, `context`, `commands`, `invariant-guard`, `ux`, `mcp`, `mcp-pipeline`, `orchestration`, `worker-scheduler`, `worker-process`, `store-failures`, `measurements`, `quiet-output`, `integration`, `index`.
+- `mcp` — совместимый алиас для `mcp,mcp-pipeline`; `mcp-pipeline` можно запускать отдельно.
+- `orchestration-live` запускается только явно и обращается к настроенному провайдеру; не включать его в обычный полный suite.
+- После каждой группы runner печатает `group | passed | failed | ms`; targeted selectors принимают список через запятую.
 - Полный прогон: `mvn -q test-compile exec:java@self-test`; выполнять один раз в конце задачи перед слиянием, если это требуется.
-- SelfTest использует локальные HTTPS/MCP stubs и `expect`; добавляйте тесты в существующую тематическую группу.
+- Группы используют локальные HTTPS/MCP stubs и `expect`; индекс использует fake embedder.
 
 ## Safety And Fast Mode
 - Секреты хранить только в `.env`; права файла — `600` (`chmod 600 .env`). Не печатать ключи в логах, выводе команд, коде или индексах.
@@ -47,9 +50,10 @@
 3. Добавьте проверки в `SelfTest` в группу UX или Команды; если нужна отдельная быстрая группа, добавьте аргументный маршрут и общий метод группы, не дублируя тесты.
 
 ### Add A Test Group
-1. Добавьте тематические `check...` методы в `SelfTest` и вызов `group("...")` в основном списке.
-2. Для отдельного запуска добавьте `args[0]` маршрут с временным каталогом и гарантированной очисткой; тот же метод группы вызывайте из полного suite.
-3. Используйте фейковый embedder/локальный HTTP или MCP stub; не делайте платные запросы в обычной группе.
+1. Добавьте static-проверки в отдельный `<Group>Checks.java` в `com.example`; общие helpers берите из `SelfTestSupport`.
+2. Зарегистрируйте короткое имя, display name и `GroupChecks::run` в `SelfTest.groupRegistry`; `fullRun=true` добавляет группу в suite, иначе она остаётся explicit-only.
+3. Внутри группы используйте общий `expect`; files/processes изолируйте через временный каталог и `SelfTestSupport`.
+4. Используйте fake embedder/локальный HTTP или MCP stub; проверьте standalone и общий suite без изменения тел существующих проверок.
 
 ### Add An MCP Tool
 1. Добавьте инструмент и обработчик в подходящий сервер (`PipelineMcpServer`, `GitMcpServer` или `GitMonitorMcpServer`); вход валидируйте, результат возвращайте структурированно.
