@@ -92,9 +92,6 @@ public final class EmbeddingCache {
         dirty = false;
     }
 
-    private static final com.fasterxml.jackson.databind.util.RawValue RAW =
-            new com.fasterxml.jackson.databind.util.RawValue("");
-
     /** Формат вектора в файл: массив чисел с 7 значимыми знаками после запятой. */
     private static String floatArrayJson(float[] vector) {
         StringBuilder json = new StringBuilder(vector.length * 12 + 2);

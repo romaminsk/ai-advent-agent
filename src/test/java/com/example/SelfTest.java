@@ -166,6 +166,14 @@ public final class SelfTest {
         passed++;
         System.out.println("OK: " + description);
     }
+    @FunctionalInterface
+    private interface GroupAction {
+        void run() throws Exception;
+    }
+
+    private record TestGroup(String displayName, boolean fullRun, GroupAction action) {
+    }
+
     public static void main(String[] args) throws Exception {
         String encoding = System.getProperty("sun.jnu.encoding", "");
         if (!encoding.equalsIgnoreCase("UTF-8")) {
@@ -175,120 +183,95 @@ public final class SelfTest {
         }
         Runtime.getRuntime().addShutdownHook(new Thread(SelfTest::cleanupProcesses,
                 "self-test-process-cleanup"));
-        if (args.length > 0 && "orchestration".equals(args[0])) {
-            baseTempDir = Files.createTempDirectory("selftest-orchestration");
-            try {
-                group("Orchestration");
-                checkOrchestration();
-                printSummary();
-                if (!failures.isEmpty()) System.exit(1);
-            } catch (Throwable error) {
-                failures.add("группа: Orchestration; непредвиденная ошибка: "
-                        + error + "\n" + stackTrace(error));
-                System.out.println("CATCH-INFO: непредвиденная ошибка: " + error);
-                error.printStackTrace();
-            } finally {
-                cleanupProcesses();
-                deleteRecursively(baseTempDir);
-            }
+        LinkedHashMap<String, TestGroup> registry = groupRegistry();
+        if (args.length == 1 && "list".equalsIgnoreCase(args[0])) {
+            registry.forEach((name, entry) -> System.out.println(name
+                    + (entry.fullRun() ? "" : " (explicit only)") + "\t" + entry.displayName()));
             return;
         }
-        if (args.length > 0 && "orchestration-live".equals(args[0])) {
-            group("Orchestration live");
-            Map<String, String> env = readDotEnv();
-            if (env.get("LLM_API_KEY") == null || env.get("LLM_API_KEY").isBlank()) {
-                failures.add("orchestration-live: нет ключа в .env");
-                System.out.println("FAIL: orchestration-live: нет ключа в .env");
-                printSummary();
-                System.exit(1);
-            }
-            baseTempDir = Files.createTempDirectory("selftest-orchestration-live");
-            try {
-                checkOrchestrationLive(env);
-            } catch (Throwable error) {
-                failures.add("orchestration-live: " + error + "\n" + stackTrace(error));
-                System.out.println("FAIL: orchestration-live: " + error.getMessage());
-            } finally {
-                cleanupProcesses();
-                deleteRecursively(baseTempDir);
-            }
-            printSummary();
-            if (!failures.isEmpty()) System.exit(1);
-            return;
-        }
-        if (args.length > 0 && "index".equals(args[0])) {
-            baseTempDir = Files.createTempDirectory("selftest-index");
-            try {
-                group("Индексация");
-                checkIndex();
-                printSummary();
-                if (!failures.isEmpty()) System.exit(1);
-            } catch (Throwable error) {
-                failures.add("группа: Индексация; непредвиденная ошибка: "
-                        + error + "\n" + stackTrace(error));
-                System.out.println("CATCH-INFO: непредвиденная ошибка: " + error);
-                error.printStackTrace();
-            } finally {
-                cleanupProcesses();
-                deleteRecursively(baseTempDir);
-            }
-            return;
-        }
-        if (args.length > 0 && "ux".equalsIgnoreCase(args[0])) {
-            baseTempDir = Files.createTempDirectory("selftest-ux");
-            try {
-                checkUxGroup();
-                printSummary();
-                if (!failures.isEmpty()) System.exit(1);
-            } catch (Throwable error) {
-                failures.add("группа: UX; непредвиденная ошибка: "
-                        + error + "\n" + stackTrace(error));
-                System.out.println("CATCH-INFO: непредвиденная ошибка: " + error);
-                error.printStackTrace();
-            } finally {
-                cleanupProcesses();
-                deleteRecursively(baseTempDir);
-            }
-            return;
-        }
-        if (args.length > 0 && "mcp".equals(args[0])) {
-            baseTempDir = Files.createTempDirectory("selftest-mcp");
-            try {
-                group("MCP");
-                checkMcpClient();
-                checkGitMcp();
-                checkMonitorStage();
-                checkMonitorRuntimeLockCleanup();
-                group("MCP Pipeline");
-                checkPipelineStage();
-                checkPipelineChildProcess();
-                checkPipelineCommandsViaMain();
-                printSummary();
-                if (!failures.isEmpty()) System.exit(1);
-            } catch (Throwable error) {
-                failures.add("группа: " + currentGroup + "; непредвиденная ошибка: "
-                        + error + "\n" + stackTrace(error));
-                System.out.println("CATCH-INFO: непредвиденная ошибка: " + error);
-                error.printStackTrace();
-            } finally {
-                cleanupProcesses();
-                deleteRecursively(baseTempDir);
-            }
-            return;
-        }
-        baseTempDir = Files.createTempDirectory("selftest-day8");
+        List<Map.Entry<String, TestGroup>> selected;
         try {
-            // --- Диалог с моделью (локальный HTTPS-сервер, без платных запросов) ---
-            group("Диалог");
+            selected = selectGroups(args, registry);
+        } catch (IllegalArgumentException invalid) {
+            System.err.println("Ошибка выбора группы: " + invalid.getMessage()
+                    + ". Список: mvn -q test-compile exec:java@self-test -Dexec.args=list");
+            System.exit(2);
+            return;
+        }
+
+        baseTempDir = Files.createTempDirectory(args.length == 0
+                ? "selftest-day8" : "selftest-groups");
+        try {
+            for (Map.Entry<String, TestGroup> entry : selected) {
+                int beforePassed = passed;
+                int beforeFailed = failures.size();
+                long started = System.nanoTime();
+                group(entry.getValue().displayName());
+                try {
+                    entry.getValue().action().run();
+                } finally {
+                    long elapsedMs = (System.nanoTime() - started) / 1_000_000;
+                    System.out.printf(Locale.ROOT, "GROUP: %s | %d | %d | %d ms%n",
+                            entry.getKey(), passed - beforePassed,
+                            failures.size() - beforeFailed, elapsedMs);
+                }
+            }
+        } catch (Throwable error) {
+            failures.add("группа: " + currentGroup + "; непредвиденная ошибка: "
+                    + error + "\n" + stackTrace(error));
+            System.out.println("CATCH-INFO: непредвиденная ошибка группы: "
+                    + error + "\n" + stackTrace(error));
+            error.printStackTrace();
+        } finally {
+            cleanupProcesses();
+            deleteRecursively(baseTempDir);
+        }
+        printSummary();
+        if (failures.isEmpty()) {
+            System.out.println("OK: все проверки пройдены (" + passed + ").");
+        } else {
+            System.exit(1);
+        }
+    }
+
+    private static List<Map.Entry<String, TestGroup>> selectGroups(
+            String[] args, LinkedHashMap<String, TestGroup> registry) {
+        if (args.length == 0) {
+            return registry.entrySet().stream().filter(entry -> entry.getValue().fullRun()).toList();
+        }
+        if (args.length != 1 || args[0].isBlank()) {
+            throw new IllegalArgumentException("ожидается один аргумент <группа>[,<группа>]");
+        }
+        List<Map.Entry<String, TestGroup>> selected = new ArrayList<>();
+        Set<String> selectedNames = new java.util.LinkedHashSet<>();
+        for (String rawName : args[0].split(",", -1)) {
+            String name = rawName.trim().toLowerCase(Locale.ROOT);
+            if (name.equals("mcp")) {
+                selectedNames.add("mcp");
+                selectedNames.add("mcp-pipeline");
+                continue;
+            }
+            Map.Entry<String, TestGroup> entry = registry.entrySet().stream()
+                    .filter(candidate -> candidate.getKey().equals(name))
+                    .findFirst().orElseThrow(() -> new IllegalArgumentException(
+                            "неизвестная группа «" + rawName.trim() + "»"));
+            selectedNames.add(entry.getKey());
+        }
+        for (String name : selectedNames) selected.add(Map.entry(name, registry.get(name)));
+        return selected;
+    }
+
+    private static LinkedHashMap<String, TestGroup> groupRegistry() {
+        LinkedHashMap<String, TestGroup> groups = new LinkedHashMap<>();
+        groups.put("dialog", new TestGroup("Диалог", true, () -> {
             checkConfigErrors();
             checkEmptyQueryNoApiCall();
             checkDialogOnLocalServer();
             checkRequestParameters();
             checkContextLimit();
             checkErrorClassification();
-
-            // --- Хранилища: ConversationStore, MemoryStore, ProfileStore, InvariantStore ---
-            group("Хранилища");
+        }));
+        groups.put("stores", new TestGroup("Хранилища", true, () -> {
             checkConversationStore();
             checkStoreValidation();
             checkPersistenceAcrossAgents();
@@ -300,9 +283,8 @@ public final class SelfTest {
             checkStoresHardening();
             checkModelSettings();
             checkSessionTokenLimitSettings();
-
-            // --- Модель состояния: TaskState, TaskStage, TaskStatus, Invariant ---
-            group("Состояние задачи");
+        }));
+        groups.put("task-state", new TestGroup("Состояние задачи", true, () -> {
             checkTaskStateMachineModel();
             checkTaskStateEdgeCases();
             checkTaskControlledTransitions();
@@ -312,9 +294,8 @@ public final class SelfTest {
             checkTaskStateCommands();
             checkTaskStateBlockInSystemMessage();
             checkTaskStatePauseResumeInRequest();
-
-            // --- Контекст: Layer Builder (ContextBuilder, режимы, стратегии) ---
-            group("Контекст");
+        }));
+        groups.put("context", new TestGroup("Контекст", true, () -> {
             checkDiagnosticsAndLimit();
             checkContextBudget();
             checkTokensStatsCommandsNoApi();
@@ -360,9 +341,8 @@ public final class SelfTest {
             checkThreeLayersInRequest();
             checkContextBlockOrder();
             checkMemoryUpdateAccountingOnce();
-
-            // --- Команды: профиль, память, задачи, инварианты ---
-            group("Команды");
+        }));
+        groups.put("commands", new TestGroup("Команды", true, () -> {
             checkMemoryLayerSeparation();
             checkRememberKeyFormats();
             checkRememberForgetMemoryCommands();
@@ -387,48 +367,47 @@ public final class SelfTest {
             checkTaskInvariantCommands();
             checkHelpForEveryCommand();
             checkUnknownSubcommands();
-
-            // --- Детерминированная проверка (InvariantGuard) ---
-            group("InvariantGuard");
+        }));
+        groups.put("invariant-guard", new TestGroup("InvariantGuard", true, () -> {
             checkInvariantGuardRules();
             checkInvariantGuardNoApiInMessage();
             checkTaskInvariantBlockAndGuard();
             checkInvariantsNotInWorkingMemoryOrHistory();
-
-            // --- UX: терминал, справка, меню, подсказки, онбординг ---
-            checkUxGroup();
-
-            // --- MCP: локальный stdio-сервер, без сети и внешних секретов ---
-            group("MCP");
+        }));
+        groups.put("ux", new TestGroup("UX", true, SelfTest::checkUxGroup));
+        groups.put("mcp", new TestGroup("MCP", true, () -> {
             checkMcpClient();
             checkGitMcp();
             checkMonitorStage();
             checkMonitorRuntimeLockCleanup();
-            group("MCP Pipeline");
+        }));
+        groups.put("mcp-pipeline", new TestGroup("MCP Pipeline", true, () -> {
             checkPipelineStage();
             checkPipelineChildProcess();
             checkPipelineCommandsViaMain();
-            group("Orchestration");
-            checkOrchestration();
-            group("Worker планировщик");
+        }));
+        groups.put("orchestration", new TestGroup("Orchestration", true,
+                SelfTest::checkOrchestration));
+        groups.put("worker-scheduler", new TestGroup("Worker планировщик", true, () -> {
             checkWorkerSchedulerInterval();
             checkWorkerCoalesce();
             checkWorkerBusyTicker();
             checkWorkerSummaryRetention();
             checkWorkerStoreRefresh();
             checkWorkerScheduleIsolation();
-            group("Worker процесс");
+        }));
+        groups.put("worker-process", new TestGroup("Worker процесс", true, () -> {
             checkWorkerProcessStarts();
             checkWorkerSecondInstanceRejected();
             checkWorkerHeartbeatAndShutdown();
             checkWorkerNoSecretLeak();
-            group("Store и runner отказы");
+        }));
+        groups.put("store-failures", new TestGroup("Store и runner отказы", true, () -> {
             checkStoreAtomicWriteFailure();
             checkStoreConcurrentWriters();
             checkRunnerRetrySilentMcp();
-
-            // --- Режим измерений /demo ---
-            group("Измерения");
+        }));
+        groups.put("measurements", new TestGroup("Измерения", true, () -> {
             checkClearCommand();
             checkClearConfirmationUi();
             checkClearDemoIsolation();
@@ -438,36 +417,33 @@ public final class SelfTest {
             checkDemoCommandsNoApi();
             checkPasteInput();
             checkDay10OtherStoreValidation();
-
-            // --- Тихий вывод и диагностика (LLM_DIAGNOSTICS) ---
-            group("Тихий вывод");
+        }));
+        groups.put("quiet-output", new TestGroup("Тихий вывод", true, () -> {
             checkUserFacingOutputNeutral();
             checkDefaultRunSettings();
             checkQuietStartupAndAnswer();
             checkExplicitCommandsStillDetailed();
             checkDiagnosticsHiddenByDefault();
-
-            // --- Интеграционные прогоны процесса ---
-            group("Интеграция");
+        }));
+        groups.put("integration", new TestGroup("Интеграция", true, () -> {
             checkTwoProcessIntegration();
             checkProfilePersistenceAcrossProcesses();
             checkOldHistoryCompatible();
-            } catch (Throwable error) {
-                failures.add("группа: " + currentGroup + "; непредвиденная ошибка: "
-                        + error + "\n" + stackTrace(error));
-                System.out.println("CATCH-INFO: непредвиденная полная ошибка группы: "
-                        + error + "\n" + stackTrace(error));
-            } finally {
-            cleanupProcesses();
-            deleteRecursively(baseTempDir);
-        }
+        }));
+        groups.put("index", new TestGroup("Индексация", true, SelfTest::checkIndex));
+        groups.put("orchestration-live", new TestGroup("Orchestration live", false,
+                SelfTest::runLiveOrchestration));
+        return groups;
+    }
 
-        printSummary();
-        if (failures.isEmpty()) {
-            System.out.println("OK: все проверки пройдены (" + passed + ").");
-        } else {
-            System.exit(1);
+    private static void runLiveOrchestration() throws Exception {
+        Map<String, String> env = readDotEnv();
+        if (env.get("LLM_API_KEY") == null || env.get("LLM_API_KEY").isBlank()) {
+            failures.add("orchestration-live: нет ключа в .env");
+            System.out.println("FAIL: orchestration-live: нет ключа в .env");
+            return;
         }
+        checkOrchestrationLive(env);
     }
 
     private static void checkOrchestration() throws Exception {
@@ -5701,7 +5677,6 @@ public final class SelfTest {
 
     /** Все проверки UX; аргумент self-test=ux запускает этот же полный набор отдельно. */
     private static void checkUxGroup() throws Exception {
-        group("UX");
         checkPlainTerminalUi();
         checkAnsiSanitizer();
         checkProgressSpinner();
@@ -5813,12 +5788,9 @@ public final class SelfTest {
         }
 
         String help = TerminalUi.chatIndex(80);
-        expect("полный индекс /help all — по группам, с назначением каждой",
-                help.contains("Память") && help.contains("Контекст")
-                        && help.contains("Статистика")
-                        && help.contains("/memory") && help.contains("/context")
-                        && help.contains("/status")
-                        && help.lines().count() <= 18);
+        expect("полный индекс /help all содержит группу индекса с подкомандами",
+                help.contains("Индекс") && help.contains("/index build")
+                        && help.contains("/index search") && help.contains("/index compare"));
         expect("внизу справки — подсказка /help <команда> и навигация",
                 help.contains("/help <команда>") && help.contains("Tab"));
     }
@@ -11856,8 +11828,8 @@ public final class SelfTest {
     /** /help короткий (не стена), /help all полный, у групп — назначение. */
     private static void checkShortHelpAndFullIndex() {
         String shortHelp = TerminalUi.shortHelp();
-        String[] lines = shortHelp.split("\n", -1);
-        expect("короткая /help умещается в 8 строк", lines.length <= 8);
+        String[] shortLines = shortHelp.split("\n", -1);
+        expect("короткая /help умещается в 8 строк", shortLines.length <= 8);
         expect("короткая /help отсылает к полному списку",
                 shortHelp.contains("/help all"));
         expect("короткая /help показывает /task start, /remember и /profile name",
@@ -11867,14 +11839,48 @@ public final class SelfTest {
                 shortHelp.matches("(?s).*ещё \\d+ .*: /help all.*"));
 
         String full = TerminalUi.chatIndex(80);
-        for (String group : new String[]{"Память", "Профиль", "Контекст", "Диалог",
-                "Режимы", "Статистика", "Прочее"}) {
-            expect("полный индекс содержит группу «" + group + "»",
-                    full.contains(group));
+        String[] fullLines = full.split("\n", -1);
+        String[] groups = {"Память", "Профиль", "Рамки", "Контекст", "Диалог",
+                "Режимы", "Статистика", "Индекс", "Прочее"};
+        String[] purposes = {"что агент помнит", "как к вам обращаться",
+                "жёсткие ограничения", "что уходит в запрос", "удалить текущую историю",
+                "формат ответа", "расход и обзор состояния", "сборка, статистика, поиск",
+                "подключения, мониторинг и справка"};
+        for (int g = 0; g < groups.length; g++) {
+            int row = -1;
+            for (int i = 0; i < fullLines.length; i++) {
+                if (fullLines[i].startsWith(groups[g]) && fullLines[i].length() > 11) {
+                    row = i;
+                    break;
+                }
+            }
+            boolean hasCommandsAndPurpose = row >= 0 && row + 1 < fullLines.length
+                    && !fullLines[row].substring(11).isBlank()
+                    && fullLines[row + 1].startsWith("  ")
+                    && fullLines[row + 1].contains(purposes[g]);
+            expect("полный индекс содержит группу «" + groups[g]
+                            + "» с командами и назначением",
+                    hasCommandsAndPurpose);
         }
-        expect("полный индекс объясняет назначение групп",
-                full.contains("что агент помнит") && full.contains("что уходит в запрос"));
-        expect("полный индекс содержит /status", full.contains("/status"));
+
+        boolean commandsHavePurpose = true;
+        for (String command : TerminalUi.chatCommandNames()) {
+            boolean listed = false;
+            for (int i = 0; i + 1 < fullLines.length; i++) {
+                boolean groupRow = !fullLines[i].startsWith("  ")
+                        && !fullLines[i].startsWith("/") && fullLines[i].length() > 11;
+                if (groupRow && fullLines[i].substring(11).contains(command)
+                        && fullLines[i + 1].startsWith("  ") && !fullLines[i + 1].isBlank()) {
+                    listed = true;
+                    break;
+                }
+            }
+            commandsHavePurpose &= listed;
+        }
+        expect("каждая известная CLI-команда стоит в группе с назначением",
+                commandsHavePurpose);
+        expect("строки /help all не длиннее 100 символов",
+                java.util.Arrays.stream(fullLines).allMatch(line -> line.length() <= 100));
 
         // Вывод plain-терминала: /help короткий, /help all полный.
         CapturedStream out = capturingStream();
@@ -11889,7 +11895,8 @@ public final class SelfTest {
                 helpText.contains("/task start") && helpText.contains("/help all")
                         && !helpText.contains("Память"));
         expect("plain /help all выводит полный индекс",
-                fullText.contains("Память") && fullText.contains("Статистика"));
+                fullText.contains("Память") && fullText.contains("Статистика")
+                        && fullText.contains("Индекс"));
     }
 
     /** Подсказка следующего шага после /task start, /profile, /skill, /remember. */

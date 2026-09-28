@@ -3545,7 +3545,7 @@ public final class Main {
             return;
         }
         try {
-            Map<String, Object> arguments = new com.fasterxml.jackson.databind.ObjectMapper()
+            Map<String, Object> arguments = JsonSupport.MAPPER
                     .readValue(json, new com.fasterxml.jackson.core.type.TypeReference<>() {
                     });
             McpClientComponent.ToolCallResult result = new McpClientComponent()
@@ -3739,7 +3739,7 @@ public final class Main {
     static String buildMcpExplainPrompt(GitRepositoryStatus status) {
         final String structured;
         try {
-            structured = new com.fasterxml.jackson.databind.ObjectMapper()
+            structured = JsonSupport.MAPPER
                     .writeValueAsString(status.toMap());
         } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
             throw new IllegalStateException("Не удалось подготовить Git-снимок для объяснения.", e);
@@ -3800,7 +3800,7 @@ public final class Main {
         String server = prefix.substring(0, toolEnd).trim();
         String tool = prefix.substring(toolEnd + 1).trim();
         try {
-            Map<String, Object> arguments = new com.fasterxml.jackson.databind.ObjectMapper()
+            Map<String, Object> arguments = JsonSupport.MAPPER
                     .readValue(json, new com.fasterxml.jackson.core.type.TypeReference<>() {
                     });
             McpClientComponent.ToolCallResult result = new McpClientComponent()

@@ -24,8 +24,6 @@ import java.util.Locale;
 final class InteractiveTerminalUi implements TerminalUi {
 
     private static final String MULTILINE_PROMPT = "… › ";
-    private static final String MULTILINE_PROMPT_ASCII = "... > ";
-
     private static final String RESET = "\u001b[0m";
     private static final String BOLD = "\u001b[1m";
     private static final String DIM = "\u001b[2m";
@@ -277,14 +275,6 @@ final class InteractiveTerminalUi implements TerminalUi {
         String clean = text == null ? "" : text;
         terminal.writer().println(colors ? TerminalUi.categoryColor(glyph(clean)) : glyph(clean));
         terminal.writer().flush();
-    }
-
-    /** Первый маркер строки задаёт цвет: ! → жёлтый, ✓ → зелёный, ? → акцент. */
-    private String colorByMarker(String text, String marker, String color) {
-        if (!colors || !text.startsWith(marker)) {
-            return dim(text);
-        }
-        return color + text + RESET;
     }
 
     @Override
