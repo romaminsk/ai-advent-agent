@@ -234,6 +234,23 @@ public final class SelfTest {
             }
             return;
         }
+        if (args.length > 0 && "ux".equalsIgnoreCase(args[0])) {
+            baseTempDir = Files.createTempDirectory("selftest-ux");
+            try {
+                checkUxGroup();
+                printSummary();
+                if (!failures.isEmpty()) System.exit(1);
+            } catch (Throwable error) {
+                failures.add("группа: UX; непредвиденная ошибка: "
+                        + error + "\n" + stackTrace(error));
+                System.out.println("CATCH-INFO: непредвиденная ошибка: " + error);
+                error.printStackTrace();
+            } finally {
+                cleanupProcesses();
+                deleteRecursively(baseTempDir);
+            }
+            return;
+        }
         if (args.length > 0 && "mcp".equals(args[0])) {
             baseTempDir = Files.createTempDirectory("selftest-mcp");
             try {
@@ -379,24 +396,7 @@ public final class SelfTest {
             checkInvariantsNotInWorkingMemoryOrHistory();
 
             // --- UX: терминал, справка, меню, подсказки, онбординг ---
-            group("UX");
-            checkPlainTerminalUi();
-            checkAnsiSanitizer();
-            checkProgressSpinner();
-            checkUiPrompt();
-            checkUiMessageMarkers();
-            checkUiRedesign();
-            checkUiColorAndMarkdown();
-            checkHistoryStoreCleanText();
-            checkShortHelpAndFullIndex();
-            checkNextHints();
-            checkInteractiveMenus();
-            checkInteractiveMenuCancel();
-            checkPlainMenusDisabledWithSyntaxHint();
-            checkTypoSuggestions();
-            checkStatusOverview();
-            checkOnboardingFirstLaunch();
-            checkInvariantHelpAndIndex();
+            checkUxGroup();
 
             // --- MCP: локальный stdio-сервер, без сети и внешних секретов ---
             group("MCP");
@@ -5698,6 +5698,28 @@ public final class SelfTest {
     }
 
     // ---------- UI: приглашение, маркеры, справка, цвет, Markdown ----------
+
+    /** Все проверки UX; аргумент self-test=ux запускает этот же полный набор отдельно. */
+    private static void checkUxGroup() throws Exception {
+        group("UX");
+        checkPlainTerminalUi();
+        checkAnsiSanitizer();
+        checkProgressSpinner();
+        checkUiPrompt();
+        checkUiMessageMarkers();
+        checkUiRedesign();
+        checkUiColorAndMarkdown();
+        checkHistoryStoreCleanText();
+        checkShortHelpAndFullIndex();
+        checkNextHints();
+        checkInteractiveMenus();
+        checkInteractiveMenuCancel();
+        checkPlainMenusDisabledWithSyntaxHint();
+        checkTypoSuggestions();
+        checkStatusOverview();
+        checkOnboardingFirstLaunch();
+        checkInvariantHelpAndIndex();
+    }
 
     /** Приглашение: задача, ветка, обрезка, многострочный маркер. */
     private static void checkUiPrompt() {

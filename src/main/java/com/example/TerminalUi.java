@@ -196,10 +196,8 @@ public interface TerminalUi extends AutoCloseable {
                 new Row("Диалог", "/clear /reset", "удалить текущую историю"),
                 new Row("Режимы", "/mode /multiline /paste /demo",
                         "формат ответа, длинный ввод, измерения"),
-                new Row("Статистика", "/tokens /stats /limit /status",
-                        "расход и обзор состояния"),
-                new Row("Индекс", "/index build /stats /search /compare",
-                        "поиск по документам проекта (локальные эмбеддинги)"),
+                new Row("Статистика", "/tokens /stats /limit /status /index",
+                        "расход, обзор и поиск по документам (/help /index)"),
                 new Row("Прочее", "/mcp /monitor /help /exit (также exit, quit)", ""),
         };
         StringBuilder out = new StringBuilder();
