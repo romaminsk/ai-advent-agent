@@ -3216,6 +3216,8 @@ public final class Main {
                             ui.showCommandHelp(commandName);
                         }
                     }
+                } else if (normalized.equals("/index") || normalized.startsWith("/index ")) {
+                    handleIndexCommand(ui, command);
                 } else if (normalized.equals("/mode") || normalized.startsWith("/mode ")) {
                     handleModeCommand(ui, agent, normalized);
                 } else if (normalized.equals("/limit") || normalized.startsWith("/limit ")) {
@@ -3953,6 +3955,36 @@ public final class Main {
      * /mode — показать профиль и лимит; /mode fast|balanced|detailed — сменить
      * профиль в текущем запуске. Команда не вызывает API и не трогает историю.
      */
+    /** Команды /index: локальная индексация корпуса без вызова чат-модели. */
+    private static void handleIndexCommand(TerminalUi ui, String raw) {
+        String argument = raw.length() > "/index".length()
+                ? raw.substring("/index".length()).trim() : "";
+        try {
+            com.example.index.IndexStore store = new com.example.index.IndexStore(
+                    Path.of(System.getProperty("user.home"), ".ai-advent-agent", "index"));
+            String baseUrl = System.getenv("EMBEDDING_BASE_URL");
+            String embeddingModel = System.getenv("EMBEDDING_MODEL");
+            if (baseUrl == null || embeddingModel == null
+                    || baseUrl.isBlank() || embeddingModel.isBlank()) {
+                ui.showSystem("Ошибка /index: не заданы EMBEDDING_BASE_URL и EMBEDDING_MODEL"
+                        + " (добавьте их в .env)");
+                return;
+            }
+            com.example.index.IndexCommands commands =
+                    new com.example.index.IndexCommands(store, () -> {
+                        try {
+                            return new com.example.index.OpenAiEmbedder(baseUrl, embeddingModel);
+                        } catch (RuntimeException e) {
+                            throw new IllegalStateException(
+                                    "Ошибка конфигурации эмбеддера: " + e.getMessage(), e);
+                        }
+                    }, embeddingModel);
+            ui.showSystem(commands.handle(argument));
+        } catch (Exception e) {
+            ui.showError("Ошибка /index: " + e.getMessage());
+        }
+    }
+
     private static void handleModeCommand(TerminalUi ui, LlmAgent agent, String normalized) {
         String prefix = "/mode";
         String argument = normalized.length() > prefix.length()

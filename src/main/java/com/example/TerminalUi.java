@@ -198,6 +198,8 @@ public interface TerminalUi extends AutoCloseable {
                         "формат ответа, длинный ввод, измерения"),
                 new Row("Статистика", "/tokens /stats /limit /status",
                         "расход и обзор состояния"),
+                new Row("Индекс", "/index build /stats /search /compare",
+                        "поиск по документам проекта (локальные эмбеддинги)"),
                 new Row("Прочее", "/mcp /monitor /help /exit (также exit, quit)", ""),
         };
         StringBuilder out = new StringBuilder();
@@ -227,7 +229,7 @@ public interface TerminalUi extends AutoCloseable {
                 "/profile", "/skill", "/pipeline", "/invariant", "/clear", "/reset",
                 "/mode", "/multiline", "/paste", "/demo",
                 "/context", "/summary", "/strategy", "/facts", "/branch",
-                "/tokens", "/stats", "/limit", "/status", "/mcp", "/monitor", "/exit",
+                "/tokens", "/stats", "/limit", "/status", "/mcp", "/monitor", "/index", "/exit",
         };
     }
 
@@ -636,6 +638,27 @@ public interface TerminalUi extends AutoCloseable {
                       действует до конца текущего запуска.
 
                     Связано: /stats.""";
+            case "/index" -> """
+                    /index — поиск по документам проекта (локальные эмбеддинги)
+
+                    Использование
+                      /index build [путь]     — собрать оба индекса (fixed и structure)
+                      /index stats            — статистика по каждой стратегии
+                      /index search <текст>   — top-5 из обоих индексов
+                      /index compare          — сравнение стратегий в маркдауне
+
+                    Примеры
+                      /index build
+                      /index search "как работает оркестрация MCP"
+                      /index compare
+
+                    Эффекты
+                      индексы в ~/.ai-advent-agent/index/<strategy>.json; эмбеддинги —
+                      EMBEDDING_BASE_URL и EMBEDDING_MODEL из .env (OpenAI-совместимый
+                      формат, по умолчанию локальная Ollama bge-m3). Сравнение
+                      пишет compare-<дата>.md рядом с индексами.
+
+                    Связано: /mcp, .env.""";
             case "/mode" -> """
                     /mode — профиль ответа
 
