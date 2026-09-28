@@ -1,0 +1,10 @@
+# index-questions.txt — контрольные вопросы для /index compare
+# Формат: 1–2 слова запроса<TAB>expected source; несколько файлов через |
+McpOrchestrator systemPrompt	McpOrchestrator.java
+JsonConversationStore lock	JsonConversationStore.java
+HeuristicTokenCounter count	HeuristicTokenCounter.java
+InvariantStore invariant	InvariantStore.java
+ContextStrategy strategy	ContextStrategy.java
+ProfileStore profile	ProfileStore.java
+MonitorSchedule schedule	MonitorSchedule.java
+ProgressSpinner spinner	ProgressSpinner.java
