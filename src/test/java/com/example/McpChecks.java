@@ -101,7 +101,7 @@ final class McpChecks extends SelfTestSupport {
         }
 
         try {
-            new McpClientComponent(Duration.ofMillis(100)).listTools(command + " timeout");
+            new McpClientComponent(Duration.ofSeconds(1)).listTools(command + " timeout");
             expect("таймаут MCP обрабатывается", false);
         } catch (McpClientComponent.McpClientException e) {
             expect("таймаут MCP обрабатывается", e.getMessage().contains("время ожидания"));
@@ -152,7 +152,7 @@ final class McpChecks extends SelfTestSupport {
                     !e.getMessage().contains("времени ожидания"));
         }
         try {
-            new McpClientComponent(Duration.ofMillis(100))
+            new McpClientComponent(Duration.ofSeconds(1))
                     .callTool(command + " long-timeout", "greet", Map.of());
             expect("живой MCP-процесс без ответа даёт timeout", false);
         } catch (McpClientComponent.McpClientException e) {

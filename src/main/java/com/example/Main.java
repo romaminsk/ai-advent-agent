@@ -3462,7 +3462,7 @@ public final class Main {
     private static void runPipeline(TerminalUi ui, String path, String query, boolean diagnostics) {
         try {
             PipelineRunner.ChainResult result = new PipelineRunner(pipelineResultsDir(),
-                    pipelineServerCommand(), McpClientComponent.TIMEOUT).run(path, query);
+                    pipelineServerCommand(), McpClientComponent.currentTimeout()).run(path, query);
             for (PipelineRunner.StepResult step : result.steps()) {
                 String marker = step.ok() ? "✓" : "×";
                 ui.showSystem(step.number() + "/3 " + step.tool() + " " + marker

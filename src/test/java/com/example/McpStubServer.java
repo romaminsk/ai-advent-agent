@@ -22,7 +22,8 @@ public final class McpStubServer {
             while ((line = input.readLine()) != null) {
                 if (line.contains("\"method\":\"initialize\"")) {
                     if ("timeout".equals(mode) || "long-timeout".equals(mode)) {
-                        Thread.sleep("long-timeout".equals(mode) ? 20_000 : 2_000);
+                        // No response: closing the client's stdin releases this stub immediately.
+                        continue;
                     }
                     reply(line, "{\"protocolVersion\":\"2025-11-25\","
                             + "\"capabilities\":{\"tools\":{}},"

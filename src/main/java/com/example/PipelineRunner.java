@@ -53,7 +53,7 @@ public final class PipelineRunner {
     private final Duration timeout;
 
     public PipelineRunner(Path resultsDir) {
-        this(resultsDir, PipelineMcpServer.command(resultsDir), McpClientComponent.TIMEOUT);
+        this(resultsDir, PipelineMcpServer.command(resultsDir), McpClientComponent.currentTimeout());
     }
 
     /** Для SelfTest: явная команда запуска (всегда java из текущего classpath). */
