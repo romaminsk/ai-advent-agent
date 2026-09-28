@@ -1,5 +1,7 @@
 package com.example.index;
 
+import com.example.JsonSupport;
+
 import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.net.URI;
@@ -139,8 +141,7 @@ public final class OpenAiEmbedder implements Embedder {
     /** Разбор ответа {"data":[{"embedding":[...]}]} в порядке входа. */
     private static List<float[]> parseEmbeddings(byte[] body, int expected)
             throws IOException {
-        com.fasterxml.jackson.databind.JsonNode root =
-                new com.fasterxml.jackson.databind.ObjectMapper().readTree(body);
+        com.fasterxml.jackson.databind.JsonNode root = JsonSupport.MAPPER.readTree(body);
         if (root == null || !root.has("data") || !root.get("data").isArray()) {
             throw new IOException("Эмбеддинги: неожиданный ответ без data[]");
         }
