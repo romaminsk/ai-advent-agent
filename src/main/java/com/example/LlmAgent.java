@@ -717,7 +717,7 @@ public final class LlmAgent {
             return null;
         }
         int projected = projectedContextTokens(tokenCounter.countMessages(
-                buildOutgoingMessages(userMessage)));
+                buildOutgoingMessages(userMessage, null, null)));
         if (projected <= settings.contextWindowTokens()) {
             return null;
         }
@@ -817,6 +817,21 @@ public final class LlmAgent {
      * история не меняется, полученный ответ доставляется вызывающему коду.
      */
     public String ask(String userMessage) {
+        return askInternal(userMessage, null, null);
+    }
+
+    /** Sends RAG instructions and retrieved context without archiving either one. */
+    public String askWithRagContext(String userMessage, String systemInstruction,
+                                    String outboundUserMessage) {
+        if (systemInstruction == null || systemInstruction.isBlank()
+                || outboundUserMessage == null || outboundUserMessage.isBlank()) {
+            throw new AgentException("Пустой RAG-контекст запроса.");
+        }
+        return askInternal(userMessage, systemInstruction, outboundUserMessage);
+    }
+
+    private String askInternal(String userMessage, String supplementalSystemPrompt,
+                               String outboundUserMessage) {
         if (userMessage == null || userMessage.isBlank()) {
             // Пустой запрос не отправляем — API не вызываем вовсе.
             throw new AgentException("Пустой запрос: нечего отправлять модели.");
@@ -857,7 +872,8 @@ public final class LlmAgent {
         // Локальные оценки (≈): новое сообщение и окончательный список messages
         // (system + выбранная история + новое сообщение) непосредственно перед HTTP.
         int userMessageTokens = tokenCounter.count(userMessage);
-        List<ChatMessage> outgoing = buildOutgoingMessages(userMessage);
+        List<ChatMessage> outgoing = buildOutgoingMessages(userMessage,
+                supplementalSystemPrompt, outboundUserMessage);
         int sentVerbatimCount = outgoing.size() - 2;
         int requestTokens = tokenCounter.countMessages(outgoing);
 
@@ -2851,9 +2867,17 @@ public final class LlmAgent {
      * LLM_CONTEXT_MAX_TURNS ограничивает только отправку: файл истории
      * и память сохраняют всю существующую политику хранения.
      */
-    private List<ChatMessage> buildOutgoingMessages(String userMessage) {
-        List<ChatMessage> outgoing = buildContextMessages(userMessage);
-        outgoing.add(new ChatMessage("user", userMessage));
+    private List<ChatMessage> buildOutgoingMessages(String userMessage,
+                                                    String supplementalSystemPrompt,
+                                                    String outboundUserMessage) {
+        List<ChatMessage> outgoing = new ArrayList<>(buildContextMessages(userMessage));
+        if (supplementalSystemPrompt != null && !supplementalSystemPrompt.isBlank()) {
+            ChatMessage system = outgoing.get(0);
+            outgoing.set(0, new ChatMessage("system",
+                    system.content() + "\n\n" + supplementalSystemPrompt));
+        }
+        outgoing.add(new ChatMessage("user",
+                outboundUserMessage == null ? userMessage : outboundUserMessage));
         return outgoing;
     }
 

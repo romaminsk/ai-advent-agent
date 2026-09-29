@@ -1,0 +1,72 @@
+[
+  {
+    "id": "history-lock",
+    "question": "Если два запуска агента откроют один и тот же файл переписки, как хранилище предотвращает одновременную запись и заменяет файл после сохранения?",
+    "expected": ["lock-файл", "FileLock", "атомарная замена"],
+    "expectedSources": "src/main/java/com/example/JsonConversationStore.java",
+    "note": "Отдельный lock-файл удерживает файловую блокировку; новая версия пишется во временный файл и атомарно заменяет старую."
+  },
+  {
+    "id": "context-layers",
+    "question": "Какие данные ContextBuilder собирает в системную часть запроса агента, помимо базовой инструкции?",
+    "expected": ["профиль", "долговременная память", "задача", "факты"],
+    "expectedSources": "src/main/java/com/example/ContextBuilder.java",
+    "note": "В системный контекст могут входить профиль, долговременная память, задача и факты; сообщения истории добавляются отдельно."
+  },
+  {
+    "id": "mcp-agent-flow",
+    "question": "Когда я прошу /mcp agent проверить репозиторий и подготовить результат, какие обязательные действия выполняются и как шаги передают данные друг другу?",
+    "expected": ["git.get-repository-status", "pipeline.search", "pipeline.summarize", "inputRef"],
+    "expectedSources": "src/main/java/com/example/McpOrchestrator.java|src/main/java/com/example/Main.java",
+    "note": "Оркестратор требует Git-снимок, затем pipeline search, summarize и сохранение; результаты передаются по inputRef=step:N."
+  },
+  {
+    "id": "fixed-limits",
+    "question": "Какой размер окна и перекрытие использует fixed-чанкер, и где он старается разрезать текст?",
+    "expected": ["800", "100", "пробел"],
+    "expectedSources": "src/main/java/com/example/index/FixedChunker.java",
+    "note": "Окно составляет 800 символов, перекрытие 100; граница ищется по пробелу или переводу строки."
+  },
+  {
+    "id": "structure-limits",
+    "question": "При каких размерах structure-чанкер разрезает большие секции и склеивает мелкие?",
+    "expected": ["1500", "200", "фиксированным окном"],
+    "expectedSources": "src/main/java/com/example/index/StructureChunker.java",
+    "note": "Секции больше 1500 символов режутся, куски меньше 200 склеиваются с соседом."
+  },
+  {
+    "id": "embedding-batch",
+    "question": "Сколько текстов OpenAiEmbedder отправляет за один батч и с какими паузами повторяет временную ошибку сервера?",
+    "expected": ["16", "2000", "5000"],
+    "expectedSources": "src/main/java/com/example/index/OpenAiEmbedder.java",
+    "note": "Размер батча — 16; предусмотрены две повторные попытки с паузами 2 и 5 секунд."
+  },
+  {
+    "id": "index-build",
+    "question": "Что именно строит /index build и как повторная сборка экономит запросы к эмбеддеру?",
+    "expected": ["fixed", "structure", "кэш"],
+    "expectedSources": "src/main/java/com/example/index/IndexCommands.java|src/main/java/com/example/index/IndexService.java",
+    "note": "Команда строит индексы fixed и structure; IndexService переиспользует EmbeddingCache."
+  },
+  {
+    "id": "pipeline-run",
+    "question": "Когда я запускаю /mcp pipeline run, какие шаги проходят данные до файла результата и требуется ли для этой цепочки вызов чат-модели?",
+    "expected": ["search", "summarize", "saveToFile", "модель не вызывается"],
+    "expectedSources": "src/main/java/com/example/Main.java|src/main/java/com/example/PipelineRunner.java",
+    "note": "Локальная команда последовательно выполняет search, summarize и saveToFile без чат-модели."
+  },
+  {
+    "id": "chunking-comparison",
+    "question": "Чем отличается fixed-разбиение документов от structure-разбиения исходников и Markdown в нашем индексаторе?",
+    "expected": ["800", "100", "заголовкам", "классам и методам"],
+    "expectedSources": "src/main/java/com/example/index/FixedChunker.java|src/main/java/com/example/index/StructureChunker.java",
+    "note": "Fixed использует окно 800 с перекрытием 100; structure учитывает Markdown-заголовки и Java-классы/методы, ограничивая секцию 1500 символами."
+  },
+  {
+    "id": "not-in-database",
+    "question": "Какой личный номер мобильного телефона владельца проекта указан в настройках приложения?",
+    "expected": ["В базе нет ответа"],
+    "expectedSources": "",
+    "note": "Этих персональных сведений в кодовой базе нет; корректный ответ — отказ от догадки."
+  }
+]

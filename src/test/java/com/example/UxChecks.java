@@ -299,6 +299,10 @@ final class UxChecks extends SelfTestSupport {
                         && taskHelp.contains("Эффекты") && taskHelp.contains("Связано"));
         expect("неизвестная команда справки даёт один шаг",
                 TerminalUi.chatCommandHelp("/несуществующая") == null);
+        String ragHelp = TerminalUi.chatCommandHelp("/rag");
+        expect("подробная справка /rag описывает режимы ask и eval",
+                ragHelp != null && ragHelp.contains("/rag on|off|status")
+                        && ragHelp.contains("/rag ask") && ragHelp.contains("/rag eval"));
     }
 
      static void checkUiColorAndMarkdown() {
@@ -490,11 +494,11 @@ final class UxChecks extends SelfTestSupport {
         String full = TerminalUi.chatIndex(80);
         String[] fullLines = full.split("\n", -1);
         String[] groups = {"Память", "Профиль", "Рамки", "Контекст", "Диалог",
-                "Режимы", "Статистика", "Индекс", "Прочее"};
+                "Режимы", "Статистика", "Индекс", "RAG", "Прочее"};
         String[] purposes = {"что агент помнит", "как к вам обращаться",
                 "жёсткие ограничения", "что уходит в запрос", "удалить текущую историю",
                 "формат ответа", "расход и обзор состояния", "сборка, статистика, поиск",
-                "подключения, мониторинг и справка"};
+                "ответы с контекстом", "подключения, мониторинг и справка"};
         for (int g = 0; g < groups.length; g++) {
             int row = -1;
             for (int i = 0; i < fullLines.length; i++) {
@@ -545,7 +549,7 @@ final class UxChecks extends SelfTestSupport {
                         && !helpText.contains("Память"));
         expect("plain /help all выводит полный индекс",
                 fullText.contains("Память") && fullText.contains("Статистика")
-                        && fullText.contains("Индекс"));
+                        && fullText.contains("Индекс") && fullText.contains("RAG"));
     }
 
      static void checkNextHints() throws Exception {

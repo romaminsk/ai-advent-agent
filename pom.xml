@@ -43,6 +43,17 @@
     </dependencies>
 
     <build>
+        <resources>
+            <resource>
+                <directory>src/main/resources</directory>
+            </resource>
+            <resource>
+                <directory>src/test/resources</directory>
+                <includes>
+                    <include>rag/questions.json</include>
+                </includes>
+            </resource>
+        </resources>
         <plugins>
             <!-- Запуск CLI: mvn compile exec:java -->
             <plugin>

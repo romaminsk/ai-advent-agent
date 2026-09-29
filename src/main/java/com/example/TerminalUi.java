@@ -200,6 +200,8 @@ public interface TerminalUi extends AutoCloseable {
                         "расход и обзор состояния"),
                 new Row("Индекс", "/index build /index stats /index search /index compare",
                         "сборка, статистика, поиск и сравнение индекса"),
+                new Row("RAG", "/rag on /rag off /rag status /rag ask /rag eval",
+                        "ответы с контекстом и сравнение качества"),
                 new Row("Прочее", "/mcp /monitor /help /exit (также exit, quit)",
                         "подключения, мониторинг и справка"),
         };
@@ -230,7 +232,7 @@ public interface TerminalUi extends AutoCloseable {
                 "/profile", "/skill", "/pipeline", "/invariant", "/clear", "/reset",
                 "/mode", "/multiline", "/paste", "/demo",
                 "/context", "/summary", "/strategy", "/facts", "/branch",
-                "/tokens", "/stats", "/limit", "/status", "/mcp", "/monitor", "/index", "/exit",
+                "/tokens", "/stats", "/limit", "/status", "/mcp", "/monitor", "/index", "/rag", "/exit",
         };
     }
 
@@ -660,6 +662,22 @@ public interface TerminalUi extends AutoCloseable {
                       пишет compare-<дата>.md рядом с индексами.
 
                     Связано: /mcp, .env.""";
+            case "/rag" -> """
+                    /rag — retrieval-augmented generation по индексу проекта
+
+                    Использование
+                      /rag on|off|status       — режим обычного диалога
+                      /rag ask <вопрос>        — сравнить один вопрос без истории
+                      /rag eval                — сравнить 10 контрольных вопросов
+
+                    Эффекты
+                      режим on ищет до 5 чанков в structure-индексе и передаёт их
+                      только текущему запросу; в историю записываются обычные
+                      реплики без текста чанков. Eval сравнивает факты и источники
+                      без LLM-судьи; полный отчёт сохраняется в
+                      ~/.ai-advent-agent/rag-results/ и artifacts/.
+
+                    Связано: /index stats, /help all.""";
             case "/mode" -> """
                     /mode — профиль ответа
 
