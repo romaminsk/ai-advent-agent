@@ -667,7 +667,8 @@ public interface TerminalUi extends AutoCloseable {
 
                     Использование
                       /rag on|off|status       — режим обычного диалога
-                      /rag retrieval           — сравнить top-5 fixed и structure без LLM
+                      /rag retrieval [вопрос]  — top-5 source › section, score без LLM
+                                                   без вопроса — сравнение 10 вопросов
                       /rag ask <вопрос>        — сравнить один вопрос без истории
                       /rag eval                — сравнить 10 контрольных вопросов
 

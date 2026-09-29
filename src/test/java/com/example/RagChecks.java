@@ -29,6 +29,7 @@ final class RagChecks extends SelfTestSupport {
         checkRetrievalRecallReport();
         checkHistoryExcludesRagContext();
         checkModeCommands();
+        checkAskProgressAndSingleRetrieval();
         checkQuestionsAndMetrics();
     }
 
@@ -272,6 +273,59 @@ final class RagChecks extends SelfTestSupport {
                 output.contains("Режим RAG: выключен") && output.contains("RAG включён")
                         && output.contains("Режим RAG: включён")
                         && output.contains("Режим RAG: выключен") && ui.errors.isEmpty());
+    }
+
+    private static void checkAskProgressAndSingleRetrieval() throws Exception {
+        String question = "unique question";
+        IndexStore store = populatedStore(
+                Files.createTempDirectory(baseTempDir, "rag-progress-index-"), question, 8);
+        FakeUi askUi = new FakeUi(TerminalUi.Input.command("/rag ask " + question),
+                TerminalUi.Input.command("/exit"));
+        AtomicInteger llmCalls = new AtomicInteger();
+        AtomicReference<Boolean> searchWasShownBeforeOff = new AtomicReference<>(false);
+        AtomicReference<Boolean> offWasShownBeforeOn = new AtomicReference<>(false);
+        RagService askService = new RagService(new RagRetriever(store, new CountingEmbedder(8)),
+                new RagPromptBuilder(), ContextBuilder.BASE_SYSTEM_PROMPT, (system, user, tokens) -> {
+                    llmCalls.incrementAndGet();
+                    if (user.equals(question)) {
+                        searchWasShownBeforeOff.set(askUi.systems.stream()
+                                .anyMatch(line -> line.startsWith("Поиск чанков…")));
+                        return "off answer";
+                    }
+                    offWasShownBeforeOn.set(askUi.systems.stream()
+                            .anyMatch(line -> line.startsWith("Ответ без RAG…")));
+                    return "on answer [DocumentLoader.java]";
+                });
+        LlmAgent askAgent = newMemoryAgent(new Config("test-key",
+                        "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash"),
+                HttpClient.newHttpClient(), Map.of());
+        Main.runLoop(askUi, askAgent, "glm-5.3-flash", askService);
+        String askOutput = String.join("\n", askUi.systems);
+        expect("/rag ask печатает поиск до LLM и показывает off сразу перед запросом on",
+                searchWasShownBeforeOff.get() && offWasShownBeforeOn.get()
+                        && askOutput.contains("Поиск чанков…")
+                        && askOutput.contains("Ответ без RAG…")
+                        && askOutput.contains("Ответ с RAG…") && llmCalls.get() == 2);
+
+        AtomicInteger retrievalLlmCalls = new AtomicInteger();
+        RagService retrievalService = new RagService(
+                new RagRetriever(store, new CountingEmbedder(8)), new RagPromptBuilder(),
+                ContextBuilder.BASE_SYSTEM_PROMPT, (system, user, tokens) -> {
+                    retrievalLlmCalls.incrementAndGet();
+                    return "unexpected LLM call";
+                });
+        FakeUi retrievalUi = new FakeUi(
+                TerminalUi.Input.command("/rag retrieval " + question),
+                TerminalUi.Input.command("/exit"));
+        LlmAgent retrievalAgent = newMemoryAgent(new Config("test-key",
+                        "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash"),
+                HttpClient.newHttpClient(), Map.of());
+        Main.runLoop(retrievalUi, retrievalAgent, "glm-5.3-flash", retrievalService);
+        String retrievalOutput = String.join("\n", retrievalUi.systems);
+        expect("/rag retrieval <вопрос> выводит source, section, score без LLM",
+                retrievalOutput.contains("DocumentLoader.java › loading")
+                        && retrievalOutput.contains("score 1.000000")
+                        && retrievalLlmCalls.get() == 0 && retrievalUi.errors.isEmpty());
     }
 
     private static void checkQuestionsAndMetrics() throws Exception {
