@@ -9,6 +9,7 @@ import com.example.rag.RagRetriever;
 import com.example.rag.RagService;
 
 import java.net.http.HttpClient;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -23,6 +24,9 @@ final class RagChecks extends SelfTestSupport {
     static void run() throws Exception {
         checkPromptAndRetriever();
         checkContextLimitAndNoAnswer();
+        checkRetryAndPartialEval();
+        checkDocumentLoaderExcludesTests();
+        checkRetrievalRecallReport();
         checkHistoryExcludesRagContext();
         checkModeCommands();
         checkQuestionsAndMetrics();
@@ -34,10 +38,12 @@ final class RagChecks extends SelfTestSupport {
         CountingEmbedder embedder = new CountingEmbedder(8);
         AtomicReference<String> userPrompt = new AtomicReference<>();
         AtomicReference<String> systemPrompt = new AtomicReference<>();
+        AtomicInteger maxOutputTokens = new AtomicInteger();
         RagService service = new RagService(new RagRetriever(store, embedder),
-                new RagPromptBuilder(), ContextBuilder.BASE_SYSTEM_PROMPT, (system, user) -> {
+                new RagPromptBuilder(), ContextBuilder.BASE_SYSTEM_PROMPT, (system, user, maxTokens) -> {
                     systemPrompt.set(system);
                     userPrompt.set(user);
+                    maxOutputTokens.set(maxTokens);
                     return "ответ [src/main/java/com/example/DocumentLoader.java]";
                 });
 
@@ -56,6 +62,8 @@ final class RagChecks extends SelfTestSupport {
                         && systemPrompt.get().contains("Не выдумывай"));
         expect("RAG измеряет retrieve и LLM раздельно",
                 on.retrieveMs() >= 0 && on.llmMs() >= 0);
+        expect("RAG off/on используют отдельный лимит max_tokens=4096",
+                maxOutputTokens.get() == RagConstants.RAG_MAX_OUTPUT_TOKENS);
     }
 
     private static void checkContextLimitAndNoAnswer() throws Exception {
@@ -72,14 +80,145 @@ final class RagChecks extends SelfTestSupport {
         IndexStore empty = new IndexStore(Files.createTempDirectory(baseTempDir, "rag-empty-"));
         AtomicInteger llmCalls = new AtomicInteger();
         RagService noHits = new RagService(new RagRetriever(empty, new CountingEmbedder(8)),
-                builder, ContextBuilder.BASE_SYSTEM_PROMPT, (system, user) -> {
+                builder, ContextBuilder.BASE_SYSTEM_PROMPT, (system, user, maxTokens) -> {
                     llmCalls.incrementAndGet();
                     return "неожиданный ответ";
                 });
         RagService.Result result = noHits.ask("unindexed", RagService.Mode.ON);
         expect("пустой поиск возвращает честный отказ без вызова LLM",
                 result.answer().equals(RagConstants.NO_ANSWER) && result.chunks().isEmpty()
-                        && llmCalls.get() == 0);
+                && llmCalls.get() == 0);
+    }
+
+    private static void checkRetryAndPartialEval() throws Exception {
+        List<RagEval.Question> questions = RagEval.loadQuestions();
+        String first = questions.get(0).question();
+        IndexStore store = populatedStore(Files.createTempDirectory(baseTempDir, "rag-eval-index-"),
+                first, 8);
+        AtomicInteger calls = new AtomicInteger();
+        AtomicInteger maxTokens = new AtomicInteger();
+        RagService retryOnce = new RagService(new RagRetriever(store, new CountingEmbedder(8)),
+                new RagPromptBuilder(), ContextBuilder.BASE_SYSTEM_PROMPT,
+                (system, user, maxOutputTokens) -> {
+                    maxTokens.set(maxOutputTokens);
+                    return calls.incrementAndGet() == 1 ? " " : "ответ";
+                });
+        RagService.Result recovered = retryOnce.ask("retry question", RagService.Mode.OFF);
+        expect("пустой ответ повторяется один раз и успешный retry возвращает текст",
+                recovered.status() == RagService.Status.OK && calls.get() == 2
+                        && recovered.answer().equals("ответ")
+                        && maxTokens.get() == RagConstants.RAG_MAX_OUTPUT_TOKENS);
+
+        AtomicInteger alwaysEmptyCalls = new AtomicInteger();
+        RagService alwaysEmpty = new RagService(new RagRetriever(store, new CountingEmbedder(8)),
+                new RagPromptBuilder(), ContextBuilder.BASE_SYSTEM_PROMPT,
+                (system, user, maxOutputTokens) -> {
+                    alwaysEmptyCalls.incrementAndGet();
+                    return "";
+                });
+        RagService.Result empty = alwaysEmpty.ask("empty question", RagService.Mode.OFF);
+        expect("после двух пустых ответов возвращается status=EMPTY",
+                empty.status() == RagService.Status.EMPTY && alwaysEmptyCalls.get() == 2);
+
+        RagService partialService = new RagService(new RagRetriever(store, new CountingEmbedder(8)),
+                new RagPromptBuilder(), ContextBuilder.BASE_SYSTEM_PROMPT,
+                (system, user, maxOutputTokens) -> {
+                    if (user.equals(questions.get(0).question())) {
+                        throw new IllegalStateException("stub failure");
+                    }
+                    if (user.equals(questions.get(1).question())) {
+                        return "";
+                    }
+                    return "FileLock atomic replacement [JsonConversationStore.java]";
+                });
+        Path partialFile = Files.createTempDirectory(baseTempDir, "rag-partial-")
+                .resolve("rag-eval.md");
+        List<Integer> snapshots = new ArrayList<>();
+        List<String> progress = new ArrayList<>();
+        RagEval.Report report = RagEval.run(partialService, progress::add, snapshot -> {
+            snapshots.add(snapshot.rows().size());
+            try {
+                RagEval.writeReport(partialFile, snapshot.markdown());
+            } catch (IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+        });
+        expect("eval продолжает следующие вопросы после ошибки и empty",
+                report.rows().size() == 10 && report.errorResults() == 1
+                        && report.emptyResults() == 1 && report.successfulQuestions() == 8
+                        && report.rows().get(0).status().contains("off=error")
+                        && report.rows().get(1).status().contains("off=empty"));
+        expect("частичный отчёт сохранялся после каждого завершённого вопроса",
+                snapshots.equals(java.util.stream.IntStream.rangeClosed(1, 10).boxed().toList())
+                        && Files.readString(partialFile).contains("Прогресс: 10/10"));
+        expect("прогресс печатает номер, длительности off/on и sourceHit",
+                progress.size() == 10 && progress.get(2).startsWith("[3/10] off ")
+                        && progress.get(2).contains(" | on ")
+                        && progress.get(2).contains("sourceHit "));
+        expect("ошибки и пустые ответы исключаются из сумм успешных вопросов",
+                report.factsOff() == report.rows().subList(2, 10).stream()
+                        .mapToInt(RagEval.Row::factsOff).sum());
+    }
+
+    private static void checkDocumentLoaderExcludesTests() throws Exception {
+        Path root = Files.createTempDirectory(baseTempDir, "rag-corpus-");
+        Path mainSource = root.resolve("src/main/java/com/example/Keep.java");
+        Path testSource = root.resolve("src/test/java/com/example/SelfTest.java");
+        Path questions = root.resolve("src/test/resources/rag/questions.json");
+        Files.createDirectories(mainSource.getParent());
+        Files.createDirectories(testSource.getParent());
+        Files.createDirectories(questions.getParent());
+        Files.createDirectories(root.resolve("target"));
+        Files.createDirectories(root.resolve("artifacts"));
+        Files.createDirectories(root.resolve(".idea"));
+        Files.writeString(mainSource, "class Keep {}", StandardCharsets.UTF_8);
+        Files.writeString(testSource, "class SelfTest {}", StandardCharsets.UTF_8);
+        Files.writeString(questions, "questions must not enter index", StandardCharsets.UTF_8);
+        Files.writeString(root.resolve("target/Generated.md"), "target", StandardCharsets.UTF_8);
+        Files.writeString(root.resolve("artifacts/Report.md"), "artifacts", StandardCharsets.UTF_8);
+        Files.writeString(root.resolve(".idea/Project.md"), "idea", StandardCharsets.UTF_8);
+        List<String> sources = new com.example.index.DocumentLoader().load(root).stream()
+                .map(com.example.index.DocumentLoader.Document::relativePath).toList();
+        expect("DocumentLoader исключает src/test, generated target, artifacts и .idea",
+                sources.equals(List.of("src/main/java/com/example/Keep.java"))
+                        && sources.stream().noneMatch(source -> source.contains("SelfTest")
+                        || source.contains("questions.json")));
+    }
+
+    private static void checkRetrievalRecallReport() throws Exception {
+        List<RagEval.Question> questions = RagEval.loadQuestions();
+        CountingEmbedder embedder = new CountingEmbedder(8);
+        List<IndexStore.IndexedChunk> fixedChunks = new ArrayList<>();
+        List<IndexStore.IndexedChunk> structureChunks = new ArrayList<>();
+        int index = 0;
+        for (RagEval.Question question : questions) {
+            if (question.noAnswerExpected()) {
+                continue;
+            }
+            String source = question.expectedSources().split("\\|")[0];
+            fixedChunks.add(indexedChunk("fixed-" + index, source, "fixed", question,
+                    embedder.vector(question.question())));
+            structureChunks.add(indexedChunk("structure-" + index, source, "structure", question,
+                    embedder.vector(question.question())));
+            index++;
+        }
+        IndexStore store = new IndexStore(Files.createTempDirectory(baseTempDir, "rag-recall-"));
+        store.save(new IndexStore.Index("fixed", "fake", 8, Instant.now(), "tmp", 0,
+                0, 0, fixedChunks));
+        store.save(new IndexStore.Index("structure", "fake", 8, Instant.now(), "tmp", 0,
+                0, 0, structureChunks));
+        RagEval.RetrievalReport report = RagEval.retrieval(questions,
+                new RagRetriever(store, embedder, "fixed"),
+                new RagRetriever(store, embedder, "structure"));
+        expect("retrieval comparison excludes no-answer question and ranks expected sources",
+                report.expectedQuestions() == 9 && report.fixedHits() == 9
+                        && report.structureHits() == 9
+                        && report.rows().stream().allMatch(row -> row.fixedRank() == 1
+                        && row.structureRank() == 1));
+        expect("retrieval report contains both top-5 lists and recall summaries",
+                report.format().contains("fixed top-5") && report.format().contains("structure top-5")
+                        && report.format().contains("structure 9/9")
+                        && report.format().contains("fixed 9/9"));
     }
 
     private static void checkHistoryExcludesRagContext() throws Exception {
@@ -101,7 +240,8 @@ final class RagChecks extends SelfTestSupport {
             agent.askWithRagContext("original question", RagConstants.SYSTEM_PROMPT,
                     "Контекст:\n" + privateChunk + "\n\nВопрос: original question");
             expect("текущий запрос отправляет RAG-чанк модели",
-                    requestBodies.size() == 1 && requestBodies.get(0).contains(privateChunk));
+                    requestBodies.size() == 1 && requestBodies.get(0).contains(privateChunk)
+                            && requestBodies.get(0).contains("\"max_tokens\":4096"));
             expect("в историю и JSON-файл записываются только исходный вопрос и ответ",
                     agent.getHistory().equals(List.of(new ChatMessage("user", "original question"),
                             new ChatMessage("assistant", "Ответ по контексту")))
@@ -118,7 +258,7 @@ final class RagChecks extends SelfTestSupport {
         IndexStore empty = new IndexStore(Files.createTempDirectory(baseTempDir, "rag-command-"));
         RagService service = new RagService(new RagRetriever(empty, new CountingEmbedder(8)),
                 new RagPromptBuilder(), ContextBuilder.BASE_SYSTEM_PROMPT,
-                (system, user) -> "answer");
+                (system, user, maxTokens) -> "answer");
         LlmAgent agent = newMemoryAgent(new Config("test-key",
                         "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash"),
                 HttpClient.newHttpClient(), Map.of());
@@ -173,5 +313,13 @@ final class RagChecks extends SelfTestSupport {
 
     private static RagRetriever.Chunk chunk(String source, String section, String text) {
         return new RagRetriever.Chunk(source, section, source + "-id", 1.0, text);
+    }
+
+    private static IndexStore.IndexedChunk indexedChunk(String id, String source,
+                                                        String strategy,
+                                                        RagEval.Question question,
+                                                        float[] vector) {
+        return new IndexStore.IndexedChunk(new ChunkMeta(id, source, source,
+                question.id(), strategy, 0, 1, 1), question.note(), vector);
     }
 }

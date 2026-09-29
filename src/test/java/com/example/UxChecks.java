@@ -302,7 +302,8 @@ final class UxChecks extends SelfTestSupport {
         String ragHelp = TerminalUi.chatCommandHelp("/rag");
         expect("подробная справка /rag описывает режимы ask и eval",
                 ragHelp != null && ragHelp.contains("/rag on|off|status")
-                        && ragHelp.contains("/rag ask") && ragHelp.contains("/rag eval"));
+                        && ragHelp.contains("/rag retrieval") && ragHelp.contains("/rag ask")
+                        && ragHelp.contains("/rag eval") && ragHelp.contains("4096"));
     }
 
      static void checkUiColorAndMarkdown() {

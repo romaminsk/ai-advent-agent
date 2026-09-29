@@ -13,9 +13,10 @@ import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
-/** Fixed-question comparison and deterministic lexical metrics. */
+/** Fixed-question comparison, retrieval recall, and deterministic lexical metrics. */
 public final class RagEval {
     public record Question(String id, String question, List<String> expected,
                            String expectedSources, String note) {
@@ -30,11 +31,16 @@ public final class RagEval {
 
     public record Row(Question question, RagService.Result off, RagService.Result on,
                       int factsOff, int factsOn, boolean sourceHit, boolean cited,
-                      boolean offInvented, boolean onDeclined, String verdict) {
+                      boolean offInvented, boolean onDeclined, String status, String verdict) {
+        public boolean successful() {
+            return off.status() == RagService.Status.OK && on.status() == RagService.Status.OK;
+        }
     }
 
     public record Report(List<Row> rows, int factsOff, int factsOn,
-                         int sourceHits, int sourceQuestions, int wins, String markdown) {
+                         int sourceHits, int sourceQuestions, int wins,
+                         int successfulQuestions, int errorResults, int emptyResults,
+                         String markdown) {
         public Report {
             rows = List.copyOf(rows);
         }
@@ -43,23 +49,74 @@ public final class RagEval {
             return sourceQuestions == 0 ? 0 : (double) sourceHits / sourceQuestions;
         }
 
+        public int failedQuestions() {
+            return rows.size() - successfulQuestions;
+        }
+
         public List<String> summaryLines() {
-            long retrievalMisses = rows.stream().filter(row -> !row.question().noAnswerExpected()
-                    && !row.sourceHit()).count();
-            long ignored = rows.stream().filter(row -> !row.question().noAnswerExpected()
-                    && row.sourceHit() && row.factsOn() <= row.factsOff()).count();
+            long retrievalMisses = rows.stream().filter(Row::successful)
+                    .filter(row -> !row.question().noAnswerExpected() && !row.sourceHit()).count();
+            long uncited = rows.stream().filter(Row::successful)
+                    .filter(row -> !row.question().noAnswerExpected() && !row.cited()).count();
             return List.of(
-                    "Факты: без RAG " + factsOff + ", с RAG " + factsOn
-                            + "; RAG выиграл " + wins + "/" + rows.size() + " вопросов.",
+                    "Успешно: " + successfulQuestions + "/" + rows.size()
+                            + "; error/empty вопросов: " + failedQuestions()
+                            + "; error results: " + errorResults
+                            + "; empty results: " + emptyResults + ".",
+                    "Факты на успешных вопросах: off " + factsOff + ", on " + factsOn
+                            + "; RAG выиграл " + wins + "/" + successfulQuestions + ".",
                     String.format(Locale.ROOT, "Retrieval recall@5: %d/%d (%.0f%%).",
                             sourceHits, sourceQuestions, recallAt5() * 100),
-                    "Промахи поиска: " + retrievalMisses
-                            + "; найденный контекст не улучшил факты: " + ignored + ".",
-                    "Для вопроса без ответа: on "
-                            + (rows.stream().anyMatch(row -> row.question().noAnswerExpected()
-                            && row.onDeclined()) ? "отказал" : "не отказал")
-                            + ", off " + (rows.stream().anyMatch(row -> row.question().noAnswerExpected()
-                            && row.offInvented()) ? "выдал ответ" : "не выдумал") + ".");
+                    "Промахи поиска: " + retrievalMisses + "; без ожидаемой ссылки: "
+                            + uncited + ".");
+        }
+    }
+
+    public record RetrievalRow(Question question, List<RagRetriever.Chunk> fixed,
+                               List<RagRetriever.Chunk> structure,
+                               int fixedRank, int structureRank) {
+        public RetrievalRow {
+            fixed = List.copyOf(fixed);
+            structure = List.copyOf(structure);
+        }
+    }
+
+    public record RetrievalReport(List<RetrievalRow> rows, int fixedHits,
+                                  int structureHits, int expectedQuestions) {
+        public RetrievalReport {
+            rows = List.copyOf(rows);
+        }
+
+        public double fixedRecallAt5() {
+            return expectedQuestions == 0 ? 0 : (double) fixedHits / expectedQuestions;
+        }
+
+        public double structureRecallAt5() {
+            return expectedQuestions == 0 ? 0 : (double) structureHits / expectedQuestions;
+        }
+
+        public String format() {
+            StringBuilder out = new StringBuilder("| # | вопрос | ожидаемый source | fixed top-5 | hit | rank | structure top-5 | hit | rank |\n")
+                    .append("|---:|---|---|---|:---:|---:|---|:---:|---:|\n");
+            for (int i = 0; i < rows.size(); i++) {
+                RetrievalRow row = rows.get(i);
+                out.append("| ").append(i + 1).append(" | ")
+                        .append(table(row.question().question())).append(" | ")
+                        .append(table(row.question().expectedSources())).append(" | ")
+                        .append(table(formatSources(row.fixed()))).append(" | ")
+                        .append(row.fixedRank() > 0 ? "да" : "нет").append(" | ")
+                        .append(rank(row.fixedRank())).append(" | ")
+                        .append(table(formatSources(row.structure()))).append(" | ")
+                        .append(row.structureRank() > 0 ? "да" : "нет").append(" | ")
+                        .append(rank(row.structureRank())).append(" |\n");
+            }
+            out.append(String.format(Locale.ROOT,
+                    "\nRecall@5 (из %d вопросов): structure %d/%d (%.0f%%), fixed %d/%d (%.0f%%).\n",
+                    expectedQuestions, structureHits, expectedQuestions,
+                    structureRecallAt5() * 100, fixedHits, expectedQuestions,
+                    fixedRecallAt5() * 100));
+            out.append("Вопрос без ответа в базе исключён из recall@5.\n");
+            return out.toString();
         }
     }
 
@@ -105,47 +162,129 @@ public final class RagEval {
         }
     }
 
-    public static Report run(RagService service) throws Exception {
+    public static Report run(RagService service) throws IOException {
+        return run(service, ignored -> { }, ignored -> { });
+    }
+
+    /** Saves a snapshot after each completed question and reports progress immediately. */
+    public static Report run(RagService service, Consumer<String> progress,
+                             Consumer<Report> checkpoint) throws IOException {
+        List<Question> questions = loadQuestions();
         List<Row> rows = new ArrayList<>();
-        for (Question question : loadQuestions()) {
+        for (int i = 0; i < questions.size(); i++) {
+            Question question = questions.get(i);
             RagService.Result off = service.ask(question.question(), RagService.Mode.OFF);
             RagService.Result on = service.ask(question.question(), RagService.Mode.ON);
-            int factsOff = factsHit(off.answer(), question.expected());
-            int factsOn = factsHit(on.answer(), question.expected());
-            boolean sourceHit = question.noAnswerExpected()
-                    || sourceMatch(on.retrievedChunks(), question.expectedSources());
-            boolean cited = question.noAnswerExpected()
-                    || citedExpectedSource(on.answer(), question.expectedSources());
-            boolean offInvented = question.noAnswerExpected() && !saysNoAnswer(off.answer());
-            boolean onDeclined = question.noAnswerExpected() && saysNoAnswer(on.answer());
-            String verdict;
-            if (question.noAnswerExpected()) {
-                verdict = onDeclined && offInvented ? "RAG помог: не выдумал"
-                        : onDeclined ? "RAG отказал; off тоже не выдумал"
-                        : "RAG не удержал отказ";
-            } else if (factsOn > factsOff) {
-                verdict = "RAG помог";
-            } else if (factsOn < factsOff) {
-                verdict = "RAG хуже";
-            } else if (!sourceHit) {
-                verdict = "без улучшения: промах поиска";
-            } else if (!cited) {
-                verdict = "контекст найден, но источник не процитирован";
-            } else {
-                verdict = "без изменения числа фактов";
-            }
-            rows.add(new Row(question, off, on, factsOff, factsOn, sourceHit, cited,
-                    offInvented, onDeclined, verdict));
+            Row row = evaluate(question, off, on);
+            rows.add(row);
+            Report snapshot = report(rows);
+            checkpoint.accept(snapshot);
+            progress.accept(progressLine(i + 1, questions.size(), off, on, row));
         }
-        int factsOff = rows.stream().mapToInt(Row::factsOff).sum();
-        int factsOn = rows.stream().mapToInt(Row::factsOn).sum();
-        int sourceQuestions = (int) rows.stream().filter(row -> !row.question().noAnswerExpected()).count();
-        int sourceHits = (int) rows.stream().filter(row -> !row.question().noAnswerExpected()
+        return report(rows);
+    }
+
+    private static Row evaluate(Question question, RagService.Result off, RagService.Result on) {
+        int factsOff = off.status() == RagService.Status.OK
+                ? factsHit(off.answer(), question.expected()) : 0;
+        int factsOn = on.status() == RagService.Status.OK
+                ? factsHit(on.answer(), question.expected()) : 0;
+        boolean sourceHit = !question.noAnswerExpected()
+                && sourceMatch(on.retrievedChunks(), question.expectedSources());
+        boolean cited = !question.noAnswerExpected() && on.status() == RagService.Status.OK
+                && citedExpectedSource(on.answer(), question.expectedSources());
+        boolean offInvented = question.noAnswerExpected() && off.status() == RagService.Status.OK
+                && !saysNoAnswer(off.answer());
+        boolean onDeclined = question.noAnswerExpected() && on.status() == RagService.Status.OK
+                && saysNoAnswer(on.answer());
+        String status = questionStatus(off, on);
+        String verdict;
+        if (off.status() == RagService.Status.ERROR || on.status() == RagService.Status.ERROR) {
+            verdict = "запрос завершился ошибкой";
+        } else if (off.status() == RagService.Status.EMPTY || on.status() == RagService.Status.EMPTY) {
+            verdict = "пустой ответ после повтора";
+        } else if (question.noAnswerExpected()) {
+            verdict = onDeclined && offInvented ? "RAG помог: не выдумал"
+                    : onDeclined ? "RAG отказал; off тоже не выдумал"
+                    : "RAG не удержал отказ";
+        } else if (factsOn > factsOff) {
+            verdict = "RAG помог";
+        } else if (factsOn < factsOff) {
+            verdict = "RAG хуже";
+        } else if (!sourceHit) {
+            verdict = "без улучшения: промах поиска";
+        } else if (!cited) {
+            verdict = "контекст найден, но источник не процитирован";
+        } else {
+            verdict = "без изменения числа фактов";
+        }
+        return new Row(question, off, on, factsOff, factsOn, sourceHit, cited,
+                offInvented, onDeclined, status, verdict);
+    }
+
+    private static Report report(List<Row> rows) {
+        List<Row> successful = rows.stream().filter(Row::successful).toList();
+        int factsOff = successful.stream().mapToInt(Row::factsOff).sum();
+        int factsOn = successful.stream().mapToInt(Row::factsOn).sum();
+        int sourceQuestions = (int) successful.stream()
+                .filter(row -> !row.question().noAnswerExpected()).count();
+        int sourceHits = (int) successful.stream().filter(row -> !row.question().noAnswerExpected()
                 && row.sourceHit()).count();
-        int wins = (int) rows.stream().filter(row -> row.verdict().startsWith("RAG помог")).count();
-        Report report = new Report(rows, factsOff, factsOn, sourceHits, sourceQuestions, wins, "");
+        int wins = (int) successful.stream().filter(row -> row.verdict().startsWith("RAG помог")).count();
+        int errors = (int) rows.stream().mapToLong(row ->
+                (row.off().status() == RagService.Status.ERROR ? 1 : 0)
+                        + (row.on().status() == RagService.Status.ERROR ? 1 : 0)).sum();
+        int empty = (int) rows.stream().mapToLong(row ->
+                (row.off().status() == RagService.Status.EMPTY ? 1 : 0)
+                        + (row.on().status() == RagService.Status.EMPTY ? 1 : 0)).sum();
+        Report partial = new Report(rows, factsOff, factsOn, sourceHits, sourceQuestions,
+                wins, successful.size(), errors, empty, "");
         return new Report(rows, factsOff, factsOn, sourceHits, sourceQuestions, wins,
-                markdown(report));
+                successful.size(), errors, empty, markdown(partial));
+    }
+
+    private static String questionStatus(RagService.Result off, RagService.Result on) {
+        return "off=" + off.status().name().toLowerCase(Locale.ROOT)
+                + ",on=" + on.status().name().toLowerCase(Locale.ROOT);
+    }
+
+    private static String progressLine(int number, int total, RagService.Result off,
+                                       RagService.Result on, Row row) {
+        String sourceHit = row.question().noAnswerExpected() ? "—"
+                : row.on().status() == RagService.Status.ERROR ? "error"
+                : row.sourceHit() ? "да" : "нет";
+        return String.format(Locale.ROOT, "[%d/%d] off %.1fс | on %.1fс | sourceHit %s%s",
+                number, total, durationSeconds(off), durationSeconds(on), sourceHit,
+                row.successful() ? "" : " | status=" + row.status());
+    }
+
+    private static double durationSeconds(RagService.Result result) {
+        return (result.retrieveMs() + result.llmMs()) / 1000.0;
+    }
+
+    public static RetrievalReport retrieval(List<Question> questions,
+                                            RagRetriever fixed, RagRetriever structure)
+            throws IOException, InterruptedException {
+        List<Question> answerable = questions.stream().filter(question ->
+                !question.noAnswerExpected()).toList();
+        List<RetrievalRow> rows = new ArrayList<>();
+        int fixedHits = 0;
+        int structureHits = 0;
+        for (Question question : answerable) {
+            List<RagRetriever.Chunk> fixedHitsForQuestion = fixed.retrieve(question.question());
+            List<RagRetriever.Chunk> structureHitsForQuestion = structure.retrieve(question.question());
+            int fixedRank = sourceRank(fixedHitsForQuestion, question.expectedSources());
+            int structureRank = sourceRank(structureHitsForQuestion, question.expectedSources());
+            if (fixedRank > 0) {
+                fixedHits++;
+            }
+            if (structureRank > 0) {
+                structureHits++;
+            }
+            rows.add(new RetrievalRow(question, fixedHitsForQuestion,
+                    structureHitsForQuestion, fixedRank, structureRank));
+        }
+        return new RetrievalReport(rows, fixedHits, structureHits, answerable.size());
     }
 
     public static int factsHit(String answer, List<String> expected) {
@@ -155,10 +294,19 @@ public final class RagEval {
     }
 
     public static boolean sourceMatch(List<RagRetriever.Chunk> chunks, String expectedSources) {
+        return sourceRank(chunks, expectedSources) > 0;
+    }
+
+    public static int sourceRank(List<RagRetriever.Chunk> chunks, String expectedSources) {
         if (expectedSources == null || expectedSources.isBlank()) {
-            return false;
+            return 0;
         }
-        return chunks.stream().anyMatch(chunk -> matchesAnySource(chunk.source(), expectedSources));
+        for (int i = 0; i < chunks.size(); i++) {
+            if (matchesAnySource(chunks.get(i).source(), expectedSources)) {
+                return i + 1;
+            }
+        }
+        return 0;
     }
 
     public static boolean citedExpectedSource(String answer, String expectedSources) {
@@ -195,9 +343,10 @@ public final class RagEval {
     }
 
     private static String markdown(Report report) {
-        StringBuilder out = new StringBuilder("# RAG eval — ").append(LocalDate.now()).append("\n\n");
-        out.append("| # | вопрос | ожидание | источники ожидаемые/найденные | факты off | факты on | cited | вердикт |\n")
-                .append("|---:|---|---|---|---:|---:|:---:|---|\n");
+        StringBuilder out = new StringBuilder("# RAG eval — ").append(LocalDate.now()).append("\n\n")
+                .append("Прогресс: ").append(report.rows().size()).append("/10 вопросов.\n\n")
+                .append("| # | вопрос | ожидание | источники ожидаемые/найденные | факты off | факты on | cited | status | вердикт |\n")
+                .append("|---:|---|---|---|---:|---:|:---:|---|---|\n");
         for (int i = 0; i < report.rows().size(); i++) {
             Row row = report.rows().get(i);
             String found = row.on().retrievedChunks().stream().map(RagRetriever.Chunk::source)
@@ -207,16 +356,23 @@ public final class RagEval {
                     .append(" | ").append(table((row.question().expectedSources().isBlank()
                             ? "нет" : row.question().expectedSources()) + " / "
                             + (found.isBlank() ? "нет" : found)))
-                    .append(" | ").append(row.factsOff()).append(" | ").append(row.factsOn())
-                    .append(" | ").append(row.question().noAnswerExpected() ? "—" : row.cited() ? "да" : "нет")
-                    .append(" | ").append(table(row.verdict())).append(" |\n");
+                    .append(" | ").append(row.successful() ? row.factsOff() : "—")
+                    .append(" | ").append(row.successful() ? row.factsOn() : "—")
+                    .append(" | ").append(row.question().noAnswerExpected() ? "—"
+                            : row.successful() ? row.cited() ? "да" : "нет" : "—")
+                    .append(" | ").append(row.status()).append(" | ")
+                    .append(table(row.verdict())).append(" |\n");
         }
-        out.append("\nИтого: факты off — ").append(report.factsOff())
-                .append(", on — ").append(report.factsOn()).append("; retrieval recall@5 — ")
-                .append(report.sourceHits()).append('/').append(report.sourceQuestions())
-                .append(String.format(Locale.ROOT, " (%.0f%%); вопросов, выигранных RAG — %d/%d.\n",
-                        report.recallAt5() * 100, report.wins(), report.rows().size()));
-        out.append("\n## Вывод\n\n");
+        out.append("\nИтого только по полностью успешным вопросам: факты off — ")
+                .append(report.factsOff()).append(", on — ").append(report.factsOn())
+                .append("; retrieval recall@5 — ").append(report.sourceHits()).append('/')
+                .append(report.sourceQuestions())
+                .append(String.format(Locale.ROOT, " (%.0f%%); RAG wins — %d/%d.\n",
+                        report.recallAt5() * 100, report.wins(), report.successfulQuestions()));
+        out.append("\nНеуспешных вопросов: ").append(report.failedQuestions())
+                .append("; ошибок результатов: ").append(report.errorResults())
+                .append("; пустых ответов после повтора: ").append(report.emptyResults()).append(".\n\n")
+                .append("## Вывод\n\n");
         report.summaryLines().forEach(line -> out.append("- ").append(line).append('\n'));
         for (int i = 0; i < report.rows().size(); i++) {
             Row row = report.rows().get(i);
@@ -226,12 +382,37 @@ public final class RagEval {
                     .append("Найденные источники: ")
                     .append(row.on().retrievedChunks().stream().map(RagRetriever.Chunk::source)
                             .distinct().collect(Collectors.joining(", "))).append("\n\n")
-                    .append("### Без RAG\n\n").append(fenced(row.off().answer()))
-                    .append("\n\n### С RAG\n\n").append(fenced(row.on().answer()))
-                    .append("\n\nВремя retrieve/LLM: ").append(row.on().retrieveMs())
-                    .append("/").append(row.on().llmMs()).append(" мс.\n");
+                    .append("### Без RAG\n\n").append(answerOrError(row.off()))
+                    .append("\n\n### С RAG\n\n").append(answerOrError(row.on()))
+                    .append("\n\nВремя off/on: ").append(formatMs(row.off().llmMs()))
+                    .append(" / ").append(formatMs(row.on().retrieveMs() + row.on().llmMs()))
+                    .append(".\n");
         }
         return out.toString();
+    }
+
+    private static String answerOrError(RagService.Result result) {
+        if (result.status() == RagService.Status.OK) {
+            return fenced(result.answer());
+        }
+        return "Статус: " + result.status().name().toLowerCase(Locale.ROOT)
+                + "\n\n" + fenced(result.error());
+    }
+
+    private static String formatSources(List<RagRetriever.Chunk> chunks) {
+        List<String> ranked = new ArrayList<>();
+        for (int i = 0; i < chunks.size(); i++) {
+            ranked.add((i + 1) + ":" + chunks.get(i).source());
+        }
+        return String.join(", ", ranked);
+    }
+
+    private static String rank(int value) {
+        return value == 0 ? "—" : Integer.toString(value);
+    }
+
+    private static String formatMs(long millis) {
+        return String.format(Locale.ROOT, "%.1fс", millis / 1000.0);
     }
 
     private static String table(String value) {
@@ -249,6 +430,11 @@ public final class RagEval {
 
     public static Path artifactPath(Path project, LocalDate date) {
         return project.resolve("artifacts").resolve("rag-eval-" + date + ".md");
+    }
+
+    public static Path liveLogPath(Path home, LocalDate date) {
+        return home.resolve(".ai-advent-agent").resolve("rag-results")
+                .resolve("rag-live-" + date + ".log");
     }
 
     public static void writeReport(Path target, String contents) throws IOException {

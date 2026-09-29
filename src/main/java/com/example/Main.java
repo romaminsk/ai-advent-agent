@@ -4055,26 +4055,42 @@ public final class Main {
                         com.example.rag.RagService.Mode.OFF);
                 com.example.rag.RagService.Result on = service.ask(question,
                         com.example.rag.RagService.Mode.ON);
-                ui.showSystem("Без RAG (LLM " + off.llmMs() + " мс):\n" + off.answer());
+                ui.showSystem("Без RAG (" + ragResultStatus(off) + ", LLM "
+                        + off.llmMs() + " мс):\n" + ragResultText(off));
                 ui.showSystem("С RAG (retrieve " + on.retrieveMs() + " мс, LLM "
-                        + on.llmMs() + " мс):\n" + on.answer());
+                        + on.llmMs() + " мс, " + ragResultStatus(on) + "):\n"
+                        + ragResultText(on));
                 ui.showSystem("Источники: " + sourceNames(on.chunks()));
             } catch (Exception e) {
                 ui.showError("Ошибка /rag ask: " + safeError(e));
             }
             return;
         }
+        if (lower.equals("retrieval")) {
+            try {
+                com.example.rag.RagEval.RetrievalReport report = ragRef.retrieval();
+                ui.showSystem(report.format());
+            } catch (Exception e) {
+                ui.showError("Ошибка /rag retrieval: " + safeError(e));
+            }
+            return;
+        }
         if (lower.equals("eval")) {
             try {
-                com.example.rag.RagEval.Report report =
-                        com.example.rag.RagEval.run(ragRef.service(agent));
                 java.time.LocalDate date = java.time.LocalDate.now();
                 Path homeReport = com.example.rag.RagEval.reportPath(
                         Path.of(System.getProperty("user.home")), date);
                 Path artifactReport = com.example.rag.RagEval.artifactPath(
                         Path.of(".").toAbsolutePath().normalize(), date);
-                com.example.rag.RagEval.writeReport(homeReport, report.markdown());
-                com.example.rag.RagEval.writeReport(artifactReport, report.markdown());
+                com.example.rag.RagEval.Report report = com.example.rag.RagEval.run(
+                        ragRef.service(agent), ui::showSystem, snapshot -> {
+                            try {
+                                com.example.rag.RagEval.writeReport(homeReport, snapshot.markdown());
+                                com.example.rag.RagEval.writeReport(artifactReport, snapshot.markdown());
+                            } catch (java.io.IOException e) {
+                                throw new java.io.UncheckedIOException(e);
+                            }
+                        });
                 for (String line : report.summaryLines()) {
                     ui.showSystem(line);
                 }
@@ -4085,7 +4101,16 @@ public final class Main {
             }
             return;
         }
-        ui.showError("Использование: /rag on|off|status|ask <вопрос>|eval; подробности: /help /rag");
+        ui.showError("Использование: /rag on|off|status|ask <вопрос>|retrieval|eval; подробности: /help /rag");
+    }
+
+    private static String ragResultStatus(com.example.rag.RagService.Result result) {
+        return result.status().name().toLowerCase(java.util.Locale.ROOT);
+    }
+
+    private static String ragResultText(com.example.rag.RagService.Result result) {
+        return result.status() == com.example.rag.RagService.Status.OK
+                ? result.answer() : result.error();
     }
 
     private static String sourceNames(List<com.example.rag.RagRetriever.Chunk> chunks) {
@@ -4098,7 +4123,7 @@ public final class Main {
         return error.getMessage() == null ? "неизвестная ошибка" : error.getMessage();
     }
 
-    private static com.example.rag.RagService createRagService(LlmAgent agent) {
+    private static String[] ragEmbeddingConfig() {
         String baseUrl = System.getenv("EMBEDDING_BASE_URL");
         String embeddingModel = System.getenv("EMBEDDING_MODEL");
         if (baseUrl == null || baseUrl.isBlank() || embeddingModel == null
@@ -4106,29 +4131,59 @@ public final class Main {
             throw new IllegalStateException(
                     "не заданы EMBEDDING_BASE_URL и EMBEDDING_MODEL в .env");
         }
-        com.example.index.Embedder embedder =
-                new com.example.index.OpenAiEmbedder(baseUrl, embeddingModel);
-        com.example.index.IndexStore store = new com.example.index.IndexStore(
-                Path.of(System.getProperty("user.home"), ".ai-advent-agent", "index"));
-        return new com.example.rag.RagService(
-                new com.example.rag.RagRetriever(store, embedder),
-                new com.example.rag.RagPromptBuilder(), ContextBuilder.BASE_SYSTEM_PROMPT,
-                agent::askWithoutHistory);
+        return new String[]{baseUrl, embeddingModel};
     }
 
     private static final class RagRef {
         private boolean enabled;
         private com.example.rag.RagService service;
+        private final boolean injectedService;
+        private com.example.index.IndexStore store;
+        private com.example.index.Embedder embedder;
+        private com.example.rag.RagRetriever structureRetriever;
+        private com.example.rag.RagRetriever fixedRetriever;
+        private LlmAgent serviceAgent;
 
         private RagRef(com.example.rag.RagService service) {
             this.service = service;
+            this.injectedService = service != null;
         }
 
         private com.example.rag.RagService service(LlmAgent agent) {
-            if (service == null) {
-                service = createRagService(agent);
+            if (injectedService) {
+                return service;
+            }
+            ensureRetrievers();
+            if (service == null || serviceAgent != agent) {
+                service = new com.example.rag.RagService(structureRetriever,
+                        new com.example.rag.RagPromptBuilder(), ContextBuilder.BASE_SYSTEM_PROMPT,
+                        (system, user, maxOutputTokens) ->
+                                agent.askWithoutHistory(system, user, maxOutputTokens));
+                serviceAgent = agent;
             }
             return service;
+        }
+
+        private com.example.rag.RagEval.RetrievalReport retrieval()
+                throws Exception {
+            ensureRetrievers();
+            return com.example.rag.RagEval.retrieval(
+                    com.example.rag.RagEval.loadQuestions(), fixedRetriever, structureRetriever);
+        }
+
+        private void ensureRetrievers() {
+            if (structureRetriever != null) {
+                return;
+            }
+            String[] embeddingConfig = ragEmbeddingConfig();
+            embedder = new com.example.index.OpenAiEmbedder(
+                    embeddingConfig[0], embeddingConfig[1]);
+            store = new com.example.index.IndexStore(Path.of(
+                    System.getProperty("user.home"), ".ai-advent-agent", "index"));
+            structureRetriever = new com.example.rag.RagRetriever(store, embedder,
+                    com.example.rag.RagConstants.INDEX_STRATEGY);
+            fixedRetriever = new com.example.rag.RagRetriever(store, embedder,
+                    com.example.index.IndexService.STRATEGY_FIXED);
         }
     }
 

@@ -2,6 +2,7 @@ package com.example.rag;
 
 import com.example.index.Embedder;
 import com.example.index.IndexSearch;
+import com.example.index.IndexService;
 import com.example.index.IndexStore;
 
 import java.io.IOException;
@@ -17,17 +18,31 @@ public final class RagRetriever {
 
     private final IndexStore store;
     private final Embedder embedder;
+    private final String strategy;
     private final int topK;
     private IndexStore.Index cachedIndex;
     private FileTime cachedIndexTime;
 
     public RagRetriever(IndexStore store, Embedder embedder) {
-        this(store, embedder, RagConstants.DEFAULT_TOP_K);
+        this(store, embedder, RagConstants.INDEX_STRATEGY, RagConstants.DEFAULT_TOP_K);
     }
 
     public RagRetriever(IndexStore store, Embedder embedder, int topK) {
+        this(store, embedder, RagConstants.INDEX_STRATEGY, topK);
+    }
+
+    public RagRetriever(IndexStore store, Embedder embedder, String strategy) {
+        this(store, embedder, strategy, RagConstants.DEFAULT_TOP_K);
+    }
+
+    public RagRetriever(IndexStore store, Embedder embedder, String strategy, int topK) {
         this.store = Objects.requireNonNull(store, "store");
         this.embedder = Objects.requireNonNull(embedder, "embedder");
+        if (!IndexService.STRATEGY_FIXED.equals(strategy)
+                && !IndexService.STRATEGY_STRUCTURE.equals(strategy)) {
+            throw new IllegalArgumentException("Неизвестная стратегия индекса: " + strategy);
+        }
+        this.strategy = strategy;
         if (topK < 1) {
             throw new IllegalArgumentException("topK должен быть положительным");
         }
@@ -54,14 +69,14 @@ public final class RagRetriever {
     }
 
     private synchronized IndexStore.Index loadIndex() throws IOException {
-        if (!store.exists(RagConstants.INDEX_STRATEGY)) {
+        if (!store.exists(strategy)) {
             cachedIndex = null;
             cachedIndexTime = null;
             return null;
         }
-        FileTime modified = Files.getLastModifiedTime(store.file(RagConstants.INDEX_STRATEGY));
+        FileTime modified = Files.getLastModifiedTime(store.file(strategy));
         if (cachedIndex == null || !modified.equals(cachedIndexTime)) {
-            cachedIndex = store.load(RagConstants.INDEX_STRATEGY);
+            cachedIndex = store.load(strategy);
             cachedIndexTime = modified;
         }
         return cachedIndex;

@@ -200,8 +200,8 @@ public interface TerminalUi extends AutoCloseable {
                         "расход и обзор состояния"),
                 new Row("Индекс", "/index build /index stats /index search /index compare",
                         "сборка, статистика, поиск и сравнение индекса"),
-                new Row("RAG", "/rag on /rag off /rag status /rag ask /rag eval",
-                        "ответы с контекстом и сравнение качества"),
+                new Row("RAG", "/rag on /rag off /rag status /rag retrieval /rag ask /rag eval",
+                        "поиск, ответы с контекстом и сравнение качества"),
                 new Row("Прочее", "/mcp /monitor /help /exit (также exit, quit)",
                         "подключения, мониторинг и справка"),
         };
@@ -667,6 +667,7 @@ public interface TerminalUi extends AutoCloseable {
 
                     Использование
                       /rag on|off|status       — режим обычного диалога
+                      /rag retrieval           — сравнить top-5 fixed и structure без LLM
                       /rag ask <вопрос>        — сравнить один вопрос без истории
                       /rag eval                — сравнить 10 контрольных вопросов
 
@@ -675,7 +676,8 @@ public interface TerminalUi extends AutoCloseable {
                       только текущему запросу; в историю записываются обычные
                       реплики без текста чанков. Eval сравнивает факты и источники
                       без LLM-судьи; полный отчёт сохраняется в
-                      ~/.ai-advent-agent/rag-results/ и artifacts/.
+                      max_tokens=4096 и повтор пустого ответа один раз; полный
+                      отчёт сохраняется в ~/.ai-advent-agent/rag-results/ и artifacts/.
 
                     Связано: /index stats, /help all.""";
             case "/mode" -> """
