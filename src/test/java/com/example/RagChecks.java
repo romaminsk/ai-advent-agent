@@ -292,6 +292,21 @@ final class RagChecks extends SelfTestSupport {
         expect("cited проверяет упоминание ожидаемого файла, а no-answer распознаётся",
                 RagEval.citedExpectedSource("Факт [A.java]", "src/main/java/A.java")
                         && RagEval.saysNoAnswer("В базе нет ответа."));
+        List<RagRetriever.Chunk> citedChunks = List.of(
+                chunk("src/main/java/A.java", "A", "first"),
+                chunk("src/main/java/B.java", "B", "second"));
+        expect("cited отображает номер [2] на source второго используемого чанка",
+                RagEval.citedExpectedSource("Факт [2]", "src/main/java/B.java", citedChunks));
+        expect("cited принимает [source 2], имя или полный путь без учёта регистра",
+                RagEval.citedExpectedSource("Факт [source 2]", "src/main/java/B.java", citedChunks)
+                        && RagEval.citedExpectedSource("Факт [b.java]", "src/main/java/B.java",
+                        citedChunks)
+                        && RagEval.citedExpectedSource("Факт [SRC/MAIN/JAVA/B.JAVA]",
+                        "src/main/java/B.java", citedChunks));
+        expect("cited=false для ссылки на другой source или ответа без ссылки",
+                !RagEval.citedExpectedSource("Факт [2]", "src/main/java/A.java", citedChunks)
+                        && !RagEval.citedExpectedSource("Факт из B.java", "src/main/java/B.java",
+                        citedChunks));
     }
 
     private static IndexStore populatedStore(Path dir, String question, int dimension)
