@@ -13,11 +13,16 @@ import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 /** Fixed-question comparison, retrieval recall, and deterministic lexical metrics. */
 public final class RagEval {
+    private static final Pattern BRACKET_CITATION = Pattern.compile("\\[([^\\]]+)]");
+    private static final Pattern NUMBERED_CITATION = Pattern.compile("(?i)(?:source\\s+)?(\\d+)");
+
     public record Question(String id, String question, List<String> expected,
                            String expectedSources, String note) {
         public Question {
@@ -192,7 +197,7 @@ public final class RagEval {
         boolean sourceHit = !question.noAnswerExpected()
                 && sourceMatch(on.retrievedChunks(), question.expectedSources());
         boolean cited = !question.noAnswerExpected() && on.status() == RagService.Status.OK
-                && citedExpectedSource(on.answer(), question.expectedSources());
+                && citedExpectedSource(on.answer(), question.expectedSources(), on.chunks());
         boolean offInvented = question.noAnswerExpected() && off.status() == RagService.Status.OK
                 && !saysNoAnswer(off.answer());
         boolean onDeclined = question.noAnswerExpected() && on.status() == RagService.Status.OK
@@ -310,19 +315,58 @@ public final class RagEval {
     }
 
     public static boolean citedExpectedSource(String answer, String expectedSources) {
+        return citedExpectedSource(answer, expectedSources, List.of());
+    }
+
+    /** Numeric references resolve against the exact ordered chunks sent in this request. */
+    public static boolean citedExpectedSource(String answer, String expectedSources,
+                                              List<RagRetriever.Chunk> usedChunks) {
         if (answer == null || expectedSources == null || expectedSources.isBlank()) {
             return false;
         }
-        String normalized = answer.toLowerCase(Locale.ROOT);
-        for (String source : expectedSources.split("\\|")) {
-            String candidate = source.trim().toLowerCase(Locale.ROOT);
-            String basename = candidate.substring(candidate.lastIndexOf('/') + 1);
-            if (!candidate.isEmpty() && (normalized.contains(candidate)
-                    || normalized.contains(basename))) {
+        Matcher citations = BRACKET_CITATION.matcher(answer);
+        while (citations.find()) {
+            String citation = citations.group(1).trim();
+            Matcher numbered = NUMBERED_CITATION.matcher(citation);
+            if (numbered.matches()) {
+                try {
+                    int index = Integer.parseInt(numbered.group(1)) - 1;
+                    if (index >= 0 && index < usedChunks.size()
+                            && matchesAnySource(usedChunks.get(index).source(), expectedSources)) {
+                        return true;
+                    }
+                } catch (NumberFormatException ignored) {
+                    // An oversized numeric reference is not a valid citation.
+                }
+            } else {
+                String source = citation.replaceFirst("(?i)^source\\s+", "");
+                if (matchesAnySourceReference(source, expectedSources)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static boolean matchesAnySourceReference(String reference, String expectedSources) {
+        String actual = normalizeSource(reference);
+        String actualName = basename(actual);
+        for (String expected : expectedSources.split("\\|")) {
+            String candidate = normalizeSource(expected);
+            if (!candidate.isEmpty() && (actual.equals(candidate)
+                    || actualName.equals(basename(candidate)))) {
                 return true;
             }
         }
         return false;
+    }
+
+    private static String normalizeSource(String source) {
+        return source.trim().replace('\\', '/').toLowerCase(Locale.ROOT);
+    }
+
+    private static String basename(String source) {
+        return source.substring(source.lastIndexOf('/') + 1);
     }
 
     public static boolean saysNoAnswer(String answer) {
