@@ -4051,18 +4051,32 @@ public final class Main {
             }
             try {
                 com.example.rag.RagService service = ragRef.service(agent);
+                com.example.rag.RagService.Prepared prepared = service.prepare(question);
+                ui.showSystem("Поиск чанков… " + prepared.retrieveMs() + " мс");
                 com.example.rag.RagService.Result off = service.ask(question,
                         com.example.rag.RagService.Mode.OFF);
-                com.example.rag.RagService.Result on = service.ask(question,
-                        com.example.rag.RagService.Mode.ON);
-                ui.showSystem("Без RAG (" + ragResultStatus(off) + ", LLM "
-                        + off.llmMs() + " мс):\n" + ragResultText(off));
-                ui.showSystem("С RAG (retrieve " + on.retrieveMs() + " мс, LLM "
-                        + on.llmMs() + " мс, " + ragResultStatus(on) + "):\n"
-                        + ragResultText(on));
+                ui.showSystem("Ответ без RAG… " + ragSeconds(off.llmMs()) + "\n"
+                        + ragResultStatus(off) + ": " + ragResultText(off));
+                com.example.rag.RagService.Result on = service.complete(prepared);
+                ui.showSystem("Ответ с RAG… " + ragSeconds(on.llmMs()) + "\n"
+                        + ragResultStatus(on) + ": " + ragResultText(on));
                 ui.showSystem("Источники: " + sourceNames(on.chunks()));
             } catch (Exception e) {
                 ui.showError("Ошибка /rag ask: " + safeError(e));
+            }
+            return;
+        }
+        if (lower.startsWith("retrieval ")) {
+            String question = argument.substring("retrieval".length()).trim();
+            if (question.isEmpty()) {
+                ui.showError("Использование: /rag retrieval <вопрос>");
+                return;
+            }
+            try {
+                ui.showSystem(formatRagRetrieval(
+                        ragRef.service(agent).retrieveOnly(question)));
+            } catch (Exception e) {
+                ui.showError("Ошибка /rag retrieval: " + safeError(e));
             }
             return;
         }
@@ -4111,6 +4125,26 @@ public final class Main {
     private static String ragResultText(com.example.rag.RagService.Result result) {
         return result.status() == com.example.rag.RagService.Status.OK
                 ? result.answer() : result.error();
+    }
+
+    private static String ragSeconds(long millis) {
+        return String.format(java.util.Locale.ROOT, "%.1f с", millis / 1000.0);
+    }
+
+    private static String formatRagRetrieval(com.example.rag.RagService.Retrieval retrieval) {
+        StringBuilder out = new StringBuilder("Поиск чанков… ")
+                .append(retrieval.retrieveMs()).append(" мс");
+        if (retrieval.chunks().isEmpty()) {
+            return out.append("\nЧанки не найдены.").toString();
+        }
+        for (int i = 0; i < retrieval.chunks().size(); i++) {
+            com.example.rag.RagRetriever.Chunk chunk = retrieval.chunks().get(i);
+            out.append('\n').append(i + 1).append(". ").append(chunk.source())
+                    .append(" › ").append(chunk.section())
+                    .append(" | score ").append(String.format(java.util.Locale.ROOT,
+                            "%.6f", chunk.score()));
+        }
+        return out.toString();
     }
 
     private static String sourceNames(List<com.example.rag.RagRetriever.Chunk> chunks) {

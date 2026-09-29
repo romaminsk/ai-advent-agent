@@ -22,6 +22,12 @@ public final class RagService {
         }
     }
 
+    public record Retrieval(List<RagRetriever.Chunk> chunks, long retrieveMs) {
+        public Retrieval {
+            chunks = List.copyOf(chunks);
+        }
+    }
+
     public record Result(String answer, List<RagRetriever.Chunk> chunks,
                          List<RagRetriever.Chunk> retrievedChunks,
                          long retrieveMs, long llmMs, Status status, String error) {
@@ -49,6 +55,11 @@ public final class RagService {
         List<RagRetriever.Chunk> chunks = retriever.retrieve(question);
         RagPromptBuilder.Prompt prompt = promptBuilder.build(question, chunks);
         return new Prepared(question, prompt, chunks, elapsedMs(start));
+    }
+
+    public Retrieval retrieveOnly(String question) throws Exception {
+        long start = System.nanoTime();
+        return new Retrieval(retriever.retrieve(question), elapsedMs(start));
     }
 
     public Result complete(Prepared prepared) {

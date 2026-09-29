@@ -37,7 +37,7 @@
 - Полный прогон: `mvn -q test-compile exec:java@self-test`; выполнять один раз в конце задачи перед слиянием, если это требуется.
 - Группы используют локальные HTTPS/MCP stubs и `expect`; индекс использует fake embedder.
 - Контрольные RAG-вопросы находятся в `src/test/resources/rag/questions.json`; ресурс также включается в CLI JAR для `/rag eval`.
-- `/rag on|off|status` управляет RAG в обычном диалоге; `/rag retrieval` сравнивает fixed/structure top-5 без LLM; `/rag ask <вопрос>` сравнивает один stateless-запрос, `/rag eval` запускает 10 вопросов.
+- `/rag on|off|status` управляет RAG в обычном диалоге; `/rag retrieval [вопрос]` показывает structure top-5 одного запроса либо сравнивает fixed/structure по 9 контрольным вопросам без LLM; `/rag ask <вопрос>` печатает поиск и ответы off/on по мере готовности, `/rag eval` запускает 10 вопросов.
 - RAG-запросы используют `max_tokens=4096` независимо от общего лимита и повторяют пустой ответ один раз.
 - Отчёты eval: `~/.ai-advent-agent/rag-results/rag-eval-<дата>.md`; локальная копия — `artifacts/rag-eval-<дата>.md` (не коммитить).
 
