@@ -115,8 +115,14 @@ public final class Main {
      *  Пока активен режим измерения токенов (/demo tokens), сообщения и просмотр
      *  статистики относятся к временной беседе измерений, а не к основной. */
     static int runLoop(TerminalUi ui, LlmAgent agent, String model) {
+        return runLoop(ui, agent, model, null);
+    }
+
+    static int runLoop(TerminalUi ui, LlmAgent agent, String model,
+                       com.example.rag.RagService ragService) {
         DemoRef demoRef = new DemoRef();
         McpSnapshotRef mcpSnapshot = new McpSnapshotRef();
+        RagRef ragRef = new RagRef(ragService);
         try {
             // Онбординг — только на первом запуске: нет профиля и нет истории;
             // повторный запуск получает текущую короткую статусную строку.
@@ -209,7 +215,8 @@ public final class Main {
                             if (demoRef.demo != null && normalized.equals("/reset")) {
                                 demoRef.demo.clearLog(); // новая беседа измерений
                             }
-                            if (handleCommand(ui, activeAgent, model, input.text(), demoRef, mcpSnapshot)) {
+                            if (handleCommand(ui, activeAgent, model, input.text(), demoRef,
+                                    mcpSnapshot, ragRef)) {
                                 return 0;
                             }
                         }
@@ -254,8 +261,30 @@ public final class Main {
                             ui.showSystem(warn(budgetWarning));
                         }
                         try (TerminalUi.ProgressIndicator progress = ui.startProgress()) {
-                            String answer = activeAgent.ask(input.text());
+                            String answer;
+                            List<String> ragSources = List.of();
+                            if (ragRef.enabled) {
+                                com.example.rag.RagService.Prepared prepared;
+                                try {
+                                    prepared = ragRef.service(activeAgent).prepare(input.text());
+                                } catch (Exception e) {
+                                    throw new AgentException("Ошибка поиска RAG: "
+                                            + (e.getMessage() == null ? "неизвестная ошибка"
+                                            : e.getMessage()), e);
+                                }
+                                answer = activeAgent.askWithRagContext(input.text(),
+                                        prepared.prompt().system(), prepared.prompt().user());
+                                ragSources = prepared.prompt().chunks().stream()
+                                        .map(com.example.rag.RagRetriever.Chunk::source)
+                                        .distinct().toList();
+                            } else {
+                                answer = activeAgent.ask(input.text());
+                            }
                             ui.showMessage(answer);
+                            if (ragRef.enabled) {
+                                ui.showSystem("Источники: " + (ragSources.isEmpty()
+                                        ? "нет" : String.join(", ", ragSources)));
+                            }
                             if (demoRef.demo != null) {
                                 demoRef.demo.logSuccess();
                                 ui.showSystem(demoRef.demo.metricsAfterAnswer());
@@ -3153,7 +3182,8 @@ public final class Main {
      * Служебные команды не вызывают API.
      */
     private static boolean handleCommand(TerminalUi ui, LlmAgent agent, String model,
-                                         String command, DemoRef demoRef, McpSnapshotRef mcpSnapshot) {
+                                         String command, DemoRef demoRef,
+                                         McpSnapshotRef mcpSnapshot, RagRef ragRef) {
         String normalized = command.toLowerCase(java.util.Locale.ROOT);
         switch (normalized) {
             case "/exit", "exit", "quit" -> {
@@ -3218,6 +3248,8 @@ public final class Main {
                     }
                 } else if (normalized.equals("/index") || normalized.startsWith("/index ")) {
                     handleIndexCommand(ui, command);
+                } else if (normalized.equals("/rag") || normalized.startsWith("/rag ")) {
+                    handleRagCommand(ui, agent, command, ragRef);
                 } else if (normalized.equals("/mode") || normalized.startsWith("/mode ")) {
                     handleModeCommand(ui, agent, normalized);
                 } else if (normalized.equals("/limit") || normalized.startsWith("/limit ")) {
@@ -3982,6 +4014,176 @@ public final class Main {
             ui.showSystem(commands.handle(argument));
         } catch (Exception e) {
             ui.showError("Ошибка /index: " + e.getMessage());
+        }
+    }
+
+    private static void handleRagCommand(TerminalUi ui, LlmAgent agent, String raw,
+                                        RagRef ragRef) {
+        String argument = raw.length() > "/rag".length()
+                ? raw.substring("/rag".length()).trim() : "";
+        String lower = argument.toLowerCase(java.util.Locale.ROOT);
+        if (lower.isEmpty() || lower.equals("status")) {
+            ui.showSystem("Режим RAG: " + (ragRef.enabled ? "включён" : "выключен")
+                    + " (индекс structure, top-" + com.example.rag.RagConstants.DEFAULT_TOP_K + ").");
+            return;
+        }
+        if (lower.equals("on") || lower.equals("off")) {
+            if (lower.equals("on")) {
+                try {
+                    ragRef.service(agent);
+                    ragRef.enabled = true;
+                } catch (RuntimeException e) {
+                    ui.showError("RAG не включён: " + e.getMessage());
+                    return;
+                }
+            } else {
+                ragRef.enabled = false;
+            }
+            ui.showSystem("✓ RAG " + (ragRef.enabled ? "включён" : "выключен")
+                    + " для обычного диалога.");
+            return;
+        }
+        if (lower.startsWith("ask ")) {
+            String question = argument.substring(4).trim();
+            if (question.isEmpty()) {
+                ui.showError("Использование: /rag ask <вопрос>");
+                return;
+            }
+            try {
+                com.example.rag.RagService service = ragRef.service(agent);
+                com.example.rag.RagService.Result off = service.ask(question,
+                        com.example.rag.RagService.Mode.OFF);
+                com.example.rag.RagService.Result on = service.ask(question,
+                        com.example.rag.RagService.Mode.ON);
+                ui.showSystem("Без RAG (" + ragResultStatus(off) + ", LLM "
+                        + off.llmMs() + " мс):\n" + ragResultText(off));
+                ui.showSystem("С RAG (retrieve " + on.retrieveMs() + " мс, LLM "
+                        + on.llmMs() + " мс, " + ragResultStatus(on) + "):\n"
+                        + ragResultText(on));
+                ui.showSystem("Источники: " + sourceNames(on.chunks()));
+            } catch (Exception e) {
+                ui.showError("Ошибка /rag ask: " + safeError(e));
+            }
+            return;
+        }
+        if (lower.equals("retrieval")) {
+            try {
+                com.example.rag.RagEval.RetrievalReport report = ragRef.retrieval();
+                ui.showSystem(report.format());
+            } catch (Exception e) {
+                ui.showError("Ошибка /rag retrieval: " + safeError(e));
+            }
+            return;
+        }
+        if (lower.equals("eval")) {
+            try {
+                java.time.LocalDate date = java.time.LocalDate.now();
+                Path homeReport = com.example.rag.RagEval.reportPath(
+                        Path.of(System.getProperty("user.home")), date);
+                Path artifactReport = com.example.rag.RagEval.artifactPath(
+                        Path.of(".").toAbsolutePath().normalize(), date);
+                com.example.rag.RagEval.Report report = com.example.rag.RagEval.run(
+                        ragRef.service(agent), ui::showSystem, snapshot -> {
+                            try {
+                                com.example.rag.RagEval.writeReport(homeReport, snapshot.markdown());
+                                com.example.rag.RagEval.writeReport(artifactReport, snapshot.markdown());
+                            } catch (java.io.IOException e) {
+                                throw new java.io.UncheckedIOException(e);
+                            }
+                        });
+                for (String line : report.summaryLines()) {
+                    ui.showSystem(line);
+                }
+                ui.showSystem("Отчёт: " + homeReport);
+                ui.showSystem("Копия: " + artifactReport);
+            } catch (Exception e) {
+                ui.showError("Ошибка /rag eval: " + safeError(e));
+            }
+            return;
+        }
+        ui.showError("Использование: /rag on|off|status|ask <вопрос>|retrieval|eval; подробности: /help /rag");
+    }
+
+    private static String ragResultStatus(com.example.rag.RagService.Result result) {
+        return result.status().name().toLowerCase(java.util.Locale.ROOT);
+    }
+
+    private static String ragResultText(com.example.rag.RagService.Result result) {
+        return result.status() == com.example.rag.RagService.Status.OK
+                ? result.answer() : result.error();
+    }
+
+    private static String sourceNames(List<com.example.rag.RagRetriever.Chunk> chunks) {
+        List<String> sources = chunks.stream().map(com.example.rag.RagRetriever.Chunk::source)
+                .distinct().toList();
+        return sources.isEmpty() ? "нет" : String.join(", ", sources);
+    }
+
+    private static String safeError(Exception error) {
+        return error.getMessage() == null ? "неизвестная ошибка" : error.getMessage();
+    }
+
+    private static String[] ragEmbeddingConfig() {
+        String baseUrl = System.getenv("EMBEDDING_BASE_URL");
+        String embeddingModel = System.getenv("EMBEDDING_MODEL");
+        if (baseUrl == null || baseUrl.isBlank() || embeddingModel == null
+                || embeddingModel.isBlank()) {
+            throw new IllegalStateException(
+                    "не заданы EMBEDDING_BASE_URL и EMBEDDING_MODEL в .env");
+        }
+        return new String[]{baseUrl, embeddingModel};
+    }
+
+    private static final class RagRef {
+        private boolean enabled;
+        private com.example.rag.RagService service;
+        private final boolean injectedService;
+        private com.example.index.IndexStore store;
+        private com.example.index.Embedder embedder;
+        private com.example.rag.RagRetriever structureRetriever;
+        private com.example.rag.RagRetriever fixedRetriever;
+        private LlmAgent serviceAgent;
+
+        private RagRef(com.example.rag.RagService service) {
+            this.service = service;
+            this.injectedService = service != null;
+        }
+
+        private com.example.rag.RagService service(LlmAgent agent) {
+            if (injectedService) {
+                return service;
+            }
+            ensureRetrievers();
+            if (service == null || serviceAgent != agent) {
+                service = new com.example.rag.RagService(structureRetriever,
+                        new com.example.rag.RagPromptBuilder(), ContextBuilder.BASE_SYSTEM_PROMPT,
+                        (system, user, maxOutputTokens) ->
+                                agent.askWithoutHistory(system, user, maxOutputTokens));
+                serviceAgent = agent;
+            }
+            return service;
+        }
+
+        private com.example.rag.RagEval.RetrievalReport retrieval()
+                throws Exception {
+            ensureRetrievers();
+            return com.example.rag.RagEval.retrieval(
+                    com.example.rag.RagEval.loadQuestions(), fixedRetriever, structureRetriever);
+        }
+
+        private void ensureRetrievers() {
+            if (structureRetriever != null) {
+                return;
+            }
+            String[] embeddingConfig = ragEmbeddingConfig();
+            embedder = new com.example.index.OpenAiEmbedder(
+                    embeddingConfig[0], embeddingConfig[1]);
+            store = new com.example.index.IndexStore(Path.of(
+                    System.getProperty("user.home"), ".ai-advent-agent", "index"));
+            structureRetriever = new com.example.rag.RagRetriever(store, embedder,
+                    com.example.rag.RagConstants.INDEX_STRATEGY);
+            fixedRetriever = new com.example.rag.RagRetriever(store, embedder,
+                    com.example.index.IndexService.STRATEGY_FIXED);
         }
     }
 

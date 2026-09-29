@@ -16,9 +16,11 @@
 - Monitor: `MonitorStore`, `MonitorRunner`, `MonitorWorker`, `MonitorSchedule`, `MonitorAggregator`.
 - Pipeline utilities: `FileSearcher`, `SearchSummarizer`, `ResultFileWriter`, `PipelineCanonicalJson`.
 - `com.example.index` — загрузка документов, chunking, embeddings, кэш, JSON-индекс, поиск и сравнение.
+- `DocumentLoader` исключает `src/test/**`, `target/`, `artifacts/`, `.idea/`, `.git/`, скрытые каталоги и `.env*` из корпуса.
+- `com.example.rag` — retrieval по structure-индексу, ограничение контекста, prompt и сравнение RAG/off.
 - `src/test/java/com/example` — локальные self-tests без платных запросов к LLM.
 - `SelfTest.java` — короткий runner и реестр групп; `SelfTestSupport.java` — expect, counters, stores, stubs, локальные серверы и process helpers.
-- Group files: `DialogChecks`, `StoreChecks`, `TaskStateChecks`, `ContextChecks`, `ContextStrategyChecks`, `CommandChecks`, `InvariantGuardChecks`, `UxChecks`, `McpChecks`, `McpPipelineChecks`, `OrchestrationChecks`, `OrchestrationLiveChecks`, `WorkerSchedulerChecks`, `WorkerProcessChecks`, `StoreFailureChecks`, `MeasurementChecks`, `QuietOutputChecks`, `IntegrationChecks`, `IndexChecks`.
+- Group files: `DialogChecks`, `StoreChecks`, `TaskStateChecks`, `ContextChecks`, `ContextStrategyChecks`, `CommandChecks`, `InvariantGuardChecks`, `UxChecks`, `McpChecks`, `McpPipelineChecks`, `OrchestrationChecks`, `OrchestrationLiveChecks`, `WorkerSchedulerChecks`, `WorkerProcessChecks`, `StoreFailureChecks`, `MeasurementChecks`, `QuietOutputChecks`, `IntegrationChecks`, `IndexChecks`, `RagChecks`.
 - Другие test support: `McpStubServer`, `SelfTestStoreWriter`.
 
 ## Run And Build
@@ -28,12 +30,16 @@
 
 ## Tests
 - Группа: `mvn -q test-compile exec:java@self-test -Dexec.args=<group[,group]>`; `-Dexec.args=list` печатает реестр.
-- Группы полного suite: `dialog`, `stores`, `task-state`, `context`, `commands`, `invariant-guard`, `ux`, `mcp`, `mcp-pipeline`, `orchestration`, `worker-scheduler`, `worker-process`, `store-failures`, `measurements`, `quiet-output`, `integration`, `index`.
+- Группы полного suite: `dialog`, `stores`, `task-state`, `context`, `commands`, `invariant-guard`, `ux`, `mcp`, `mcp-pipeline`, `orchestration`, `worker-scheduler`, `worker-process`, `store-failures`, `measurements`, `quiet-output`, `integration`, `index`, `rag`.
 - `mcp` — совместимый алиас для `mcp,mcp-pipeline`; `mcp-pipeline` можно запускать отдельно.
 - `orchestration-live` запускается только явно и обращается к настроенному провайдеру; не включать его в обычный полный suite.
 - После каждой группы runner печатает `group | passed | failed | ms`; targeted selectors принимают список через запятую.
 - Полный прогон: `mvn -q test-compile exec:java@self-test`; выполнять один раз в конце задачи перед слиянием, если это требуется.
 - Группы используют локальные HTTPS/MCP stubs и `expect`; индекс использует fake embedder.
+- Контрольные RAG-вопросы находятся в `src/test/resources/rag/questions.json`; ресурс также включается в CLI JAR для `/rag eval`.
+- `/rag on|off|status` управляет RAG в обычном диалоге; `/rag retrieval` сравнивает fixed/structure top-5 без LLM; `/rag ask <вопрос>` сравнивает один stateless-запрос, `/rag eval` запускает 10 вопросов.
+- RAG-запросы используют `max_tokens=4096` независимо от общего лимита и повторяют пустой ответ один раз.
+- Отчёты eval: `~/.ai-advent-agent/rag-results/rag-eval-<дата>.md`; локальная копия — `artifacts/rag-eval-<дата>.md` (не коммитить).
 
 ## Safety And Fast Mode
 - Секреты хранить только в `.env`; права файла — `600` (`chmod 600 .env`). Не печатать ключи в логах, выводе команд, коде или индексах.

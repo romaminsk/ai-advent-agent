@@ -175,6 +175,7 @@ public final class SelfTest extends SelfTestSupport {
         groups.put("quiet-output", new TestGroup("Тихий вывод", true, QuietOutputChecks::run));
         groups.put("integration", new TestGroup("Интеграция", true, IntegrationChecks::run));
         groups.put("index", new TestGroup("Индексация", true, IndexChecks::run));
+        groups.put("rag", new TestGroup("RAG", true, RagChecks::run));
         groups.put("orchestration-live", new TestGroup("Orchestration live", false,
                 SelfTest::runLiveOrchestration));
         return groups;

@@ -717,7 +717,7 @@ public final class LlmAgent {
             return null;
         }
         int projected = projectedContextTokens(tokenCounter.countMessages(
-                buildOutgoingMessages(userMessage)));
+                buildOutgoingMessages(userMessage, null, null)));
         if (projected <= settings.contextWindowTokens()) {
             return null;
         }
@@ -817,6 +817,30 @@ public final class LlmAgent {
      * история не меняется, полученный ответ доставляется вызывающему коду.
      */
     public String ask(String userMessage) {
+        return askInternal(userMessage, null, null, settings.maxOutputTokens());
+    }
+
+    /** Sends RAG instructions and retrieved context without archiving either one. */
+    public String askWithRagContext(String userMessage, String systemInstruction,
+                                    String outboundUserMessage) {
+        if (systemInstruction == null || systemInstruction.isBlank()
+                || outboundUserMessage == null || outboundUserMessage.isBlank()) {
+            throw new AgentException("Пустой RAG-контекст запроса.");
+        }
+        for (int attempt = 0; ; attempt++) {
+            try {
+                return askInternal(userMessage, systemInstruction, outboundUserMessage,
+                        com.example.rag.RagConstants.RAG_MAX_OUTPUT_TOKENS);
+            } catch (EmptyLlmAnswerException empty) {
+                if (attempt >= com.example.rag.RagConstants.EMPTY_RESPONSE_RETRIES) {
+                    throw empty;
+                }
+            }
+        }
+    }
+
+    private String askInternal(String userMessage, String supplementalSystemPrompt,
+                               String outboundUserMessage, int maxOutputTokens) {
         if (userMessage == null || userMessage.isBlank()) {
             // Пустой запрос не отправляем — API не вызываем вовсе.
             throw new AgentException("Пустой запрос: нечего отправлять модели.");
@@ -857,7 +881,8 @@ public final class LlmAgent {
         // Локальные оценки (≈): новое сообщение и окончательный список messages
         // (system + выбранная история + новое сообщение) непосредственно перед HTTP.
         int userMessageTokens = tokenCounter.count(userMessage);
-        List<ChatMessage> outgoing = buildOutgoingMessages(userMessage);
+        List<ChatMessage> outgoing = buildOutgoingMessages(userMessage,
+                supplementalSystemPrompt, outboundUserMessage);
         int sentVerbatimCount = outgoing.size() - 2;
         int requestTokens = tokenCounter.countMessages(outgoing);
 
@@ -865,7 +890,7 @@ public final class LlmAgent {
         // Равенство бюджету не считается превышением; превышение — строго больше.
         boolean budgetExceeded = false;
         if (settings.contextWindowTokens() != null) {
-            int projected = projectedContextTokens(requestTokens);
+            int projected = projectedContextTokens(requestTokens, maxOutputTokens);
             budgetExceeded = projected > settings.contextWindowTokens();
             if (budgetExceeded && settings.overflowPolicy() == ContextOverflowPolicy.BLOCK) {
                 // Локальная блокировка по оценке: HTTP не выполняется, история
@@ -873,7 +898,7 @@ public final class LlmAgent {
                 throw new ContextBudgetBlockedException(
                         "Запрос заблокирован локально (LLM_CONTEXT_OVERFLOW_POLICY=block): "
                                 + "оценка входа ≈" + requestTokens + " токенов + резерв выхода "
-                                + settings.maxOutputTokens() + " = ≈" + projected
+                                + maxOutputTokens + " = ≈" + projected
                                 + " превышает контекстный бюджет " + settings.contextWindowTokens()
                                 + " (LLM_CONTEXT_WINDOW_TOKENS, источник: ручная настройка). "
                                 + "Это локальная оценка, а не отказ провайдера. HTTP-запрос "
@@ -884,7 +909,7 @@ public final class LlmAgent {
             }
         }
 
-        HttpRequest request = buildRequest(outgoing, settings.maxOutputTokens(), null, true);
+        HttpRequest request = buildRequest(outgoing, maxOutputTokens, null, true);
         long prepareNanos = System.nanoTime() - totalStart;
 
         // Попытка обращения к API засчитывается ровно один раз на запрос:
@@ -932,7 +957,7 @@ public final class LlmAgent {
             if (notice != null) {
                 pendingSessionLimitNotice = notice;
             }
-            throw emptyAnswerError(parsed.finishReason());
+            throw emptyAnswerError(parsed.finishReason(), maxOutputTokens);
         }
         // Ответ обезвреживается один раз до сохранения: в историю и в файл
         // попадает чистый текст без управляющих последовательностей.
@@ -1011,7 +1036,7 @@ public final class LlmAgent {
                 omittedPairs, settings, workingMemory.factsView(), branches.active()));
         lastDiagnostics = new RequestDiagnostics(
                 settings.profile(),
-                settings.maxOutputTokens(),
+                maxOutputTokens,
                 settings.temperature(),
                 outgoing.size(),
                 includedPairs,
@@ -1039,14 +1064,27 @@ public final class LlmAgent {
 
     /** Выполняет служебный запрос без добавления сообщений в историю чата. */
     public String askWithoutHistory(String systemPrompt, String userMessage) {
+        return askWithoutHistory(systemPrompt, userMessage, settings.maxOutputTokens(), false);
+    }
+
+    /** RAG/stateless call with an explicit output ceiling and current sampling parameters. */
+    public String askWithoutHistory(String systemPrompt, String userMessage, int maxOutputTokens) {
+        return askWithoutHistory(systemPrompt, userMessage, maxOutputTokens, true);
+    }
+
+    private String askWithoutHistory(String systemPrompt, String userMessage,
+                                     int maxOutputTokens, boolean applyTemperature) {
         if (systemPrompt == null || systemPrompt.isBlank() || userMessage == null || userMessage.isBlank()) {
             throw new AgentException("Пустой запрос оркестрации.");
         }
+        if (maxOutputTokens < 1) {
+            throw new IllegalArgumentException("maxOutputTokens должен быть положительным");
+        }
         ParsedAnswer parsed = executeCall(List.of(new ChatMessage("system", systemPrompt),
-                new ChatMessage("user", userMessage)), settings.maxOutputTokens(),
-                UUID.randomUUID().toString(), false, SessionTokenStats.Purpose.REGULAR);
+                new ChatMessage("user", userMessage)), maxOutputTokens,
+                UUID.randomUUID().toString(), applyTemperature, SessionTokenStats.Purpose.REGULAR);
         if (parsed.content() == null) {
-            throw emptyAnswerError(parsed.finishReason());
+            throw emptyAnswerError(parsed.finishReason(), maxOutputTokens);
         }
         return AnsiSanitizer.sanitize(parsed.content());
     }
@@ -1054,6 +1092,10 @@ public final class LlmAgent {
     /** Прогноз контекстного бюджета: оценка входа плюс резерв выхода (max_tokens). */
     private int projectedContextTokens(int estimatedRequestTokens) {
         return estimatedRequestTokens + settings.maxOutputTokens();
+    }
+
+    private static int projectedContextTokens(int estimatedRequestTokens, int maxOutputTokens) {
+        return estimatedRequestTokens + maxOutputTokens;
     }
 
     // ================= Факты: обновление и отображение =================
@@ -2802,17 +2844,17 @@ public final class LlmAgent {
     }
 
     /** Понятная ошибка пустого видимого ответа (с подсказкой при лимите генерации). */
-    private AgentException emptyAnswerError(String finishReason) {
+    private EmptyLlmAnswerException emptyAnswerError(String finishReason, int maxOutputTokens) {
         String message = "Модель вернула пустой итоговый ответ "
                 + "(choices[0].message.content отсутствует или пуст).";
         if ("length".equals(finishReason)) {
             // Лимит мог быть израсходован на внутренние рассуждения модели.
-            message += " Лимит генерации (max_tokens=" + settings.maxOutputTokens()
+            message += " Лимит генерации (max_tokens=" + maxOutputTokens
                     + ") мог быть израсходован до видимого текста. Увеличьте лимит: "
                     + "/mode detailed или переменная LLM_MAX_OUTPUT_TOKENS "
-                    + "(например, " + (settings.maxOutputTokens() * 2) + ").";
+                    + "(например, " + (maxOutputTokens * 2) + ").";
         }
-        return new AgentException(message);
+        return new EmptyLlmAnswerException(message);
     }
 
     /**
@@ -2851,9 +2893,17 @@ public final class LlmAgent {
      * LLM_CONTEXT_MAX_TURNS ограничивает только отправку: файл истории
      * и память сохраняют всю существующую политику хранения.
      */
-    private List<ChatMessage> buildOutgoingMessages(String userMessage) {
-        List<ChatMessage> outgoing = buildContextMessages(userMessage);
-        outgoing.add(new ChatMessage("user", userMessage));
+    private List<ChatMessage> buildOutgoingMessages(String userMessage,
+                                                    String supplementalSystemPrompt,
+                                                    String outboundUserMessage) {
+        List<ChatMessage> outgoing = new ArrayList<>(buildContextMessages(userMessage));
+        if (supplementalSystemPrompt != null && !supplementalSystemPrompt.isBlank()) {
+            ChatMessage system = outgoing.get(0);
+            outgoing.set(0, new ChatMessage("system",
+                    system.content() + "\n\n" + supplementalSystemPrompt));
+        }
+        outgoing.add(new ChatMessage("user",
+                outboundUserMessage == null ? userMessage : outboundUserMessage));
         return outgoing;
     }
 

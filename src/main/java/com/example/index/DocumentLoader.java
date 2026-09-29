@@ -12,8 +12,8 @@ import java.util.Comparator;
 import java.util.List;
 
 /**
- * Обход корпуса документов: README*, *.md, *.txt и исходники java в src.
- * Исключаются: .env*, .git, target, artifacts, .idea, скрытые файлы и
+ * Обход корпуса документов: README*, *.md, *.txt и исходники java в src/main.
+ * Исключаются: .env*, .git, src/test, target, artifacts, .idea, скрытые файлы и
  * каталоги, бинарники по расширению и файлы больше 1 МБ.
  * Тип документа определяет структурную стратегию chunking.
  */
@@ -22,8 +22,9 @@ public final class DocumentLoader {
     /** Ограничение размера одного файла: больше не читаем. */
     public static final long MAX_FILE_BYTES = 1024 * 1024;
 
-    private static final List<String> SKIP_DIR_NAMES = List.of(
+    private static final List<String> EXCLUDED_DIRECTORY_NAMES = List.of(
             ".git", "target", "artifacts", ".idea", "node_modules", "build", "out");
+    private static final List<String> EXCLUDED_PATH_PREFIXES = List.of("src/test/");
 
     /** Считанный документ. */
     public record Document(Path path, String relativePath, String content, DocType type) {
@@ -46,7 +47,8 @@ public final class DocumentLoader {
                 if (dir.equals(root)) {
                     return FileVisitResult.CONTINUE;
                 }
-                if (name.startsWith(".") || SKIP_DIR_NAMES.contains(name.toLowerCase())) {
+                if (name.startsWith(".")
+                        || EXCLUDED_DIRECTORY_NAMES.contains(name.toLowerCase())) {
                     return FileVisitResult.SKIP_SUBTREE;
                 }
                 return FileVisitResult.CONTINUE;
@@ -90,8 +92,9 @@ public final class DocumentLoader {
         String normalized = relativePath.replace('\\', '/');
         String name = normalized.substring(normalized.lastIndexOf('/') + 1);
         String lower = name.toLowerCase();
-        String lowerPath = relativePath.toLowerCase();
-        return lower.startsWith(".env") || lowerPath.contains("/.env");
+        String lowerPath = normalized.toLowerCase();
+        return lower.startsWith(".env") || lowerPath.contains("/.env")
+                || EXCLUDED_PATH_PREFIXES.stream().anyMatch(lowerPath::startsWith);
     }
 
     /** Тип по расширению: md, java, txt; null — нетекстовый файл. */
