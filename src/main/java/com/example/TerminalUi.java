@@ -677,6 +677,7 @@ public interface TerminalUi extends AutoCloseable {
                       /rag rerank-analysis     — ранги чанков и сравнение весов без LLM
                       /rag ask <вопрос>        — ответы без RAG и с RAG
                       /rag eval A,B,C,D        — режимы; --questions ids; --resume
+                                                 --checkpoint filename.json — новый checkpoint
 
                     Эффекты
                       режим on использует настройки topKBefore/topKAfter/minScore,

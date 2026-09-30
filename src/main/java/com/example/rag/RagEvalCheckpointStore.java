@@ -45,9 +45,11 @@ public final class RagEvalCheckpointStore {
         JsonNode rewriteNode = root.path("rewrites");
         rewriteNode.fields().forEachRemaining(entry -> {
             JsonNode node = entry.getValue();
+            boolean fallback = node.path("fallback").asBoolean(false);
             rewrites.put(entry.getKey(), new RagQueryRewriter.Result(
                     node.path("query").asText(entry.getKey()),
-                    node.path("fallback").asBoolean(false), node.path("rewriteMs").asLong(0)));
+                    fallback, node.path("rewriteMs").asLong(0),
+                    node.path("rewriteStatus").asText(fallback ? "fallback:legacy" : "ok")));
         });
         JsonNode resultsNode = root.path("results");
         var questions = resultsNode.fields();
@@ -122,6 +124,7 @@ public final class RagEvalCheckpointStore {
             node.put("query", RagQueryRewriter.redactSecrets(rewrite.query()));
             node.put("fallback", rewrite.rewriteFallback());
             node.put("rewriteMs", rewrite.rewriteMs());
+            node.put("rewriteStatus", rewrite.rewriteStatus());
         });
         ObjectNode resultRoot = root.putObject("results");
         results.forEach((id, modes) -> {
@@ -155,6 +158,7 @@ public final class RagEvalCheckpointStore {
         node.put("rewriteFallback", result.rewriteFallback());
         node.put("rewriteQuery", RagQueryRewriter.redactSecrets(result.rewriteQuery()));
         node.put("rewriteMs", result.rewriteMs());
+        node.put("rewriteStatus", result.rewriteStatus());
         writeChunks(node.putArray("chunks"), result.chunks());
         writeChunks(node.putArray("retrievedChunks"), result.retrievedChunks());
     }
@@ -184,7 +188,9 @@ public final class RagEvalCheckpointStore {
                 nullableText(node.path("error")), node.path("filteredCount").asInt(0),
                 node.path("filteredAll").asBoolean(false),
                 node.path("rewriteFallback").asBoolean(false),
-                node.path("rewriteQuery").asText(""), node.path("rewriteMs").asLong(0));
+                node.path("rewriteQuery").asText(""), node.path("rewriteMs").asLong(0),
+                node.path("rewriteStatus").asText(
+                        node.path("rewriteFallback").asBoolean(false) ? "fallback:legacy" : "ok"));
     }
 
     private static List<RagRetriever.Chunk> readChunks(JsonNode array) {

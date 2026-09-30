@@ -480,20 +480,45 @@ final class RagChecks extends SelfTestSupport {
     }
 
     private static void checkRewriteFallbackAndSettingsStore() throws Exception {
-        for (String label : List.of("ошибка", "пусто", "длинный")) {
+        for (String label : List.of("ошибка", "пусто", "provider-empty", "длинный")) {
             RagQueryRewriter.Client client = (system, question) -> switch (label) {
                 case "ошибка" -> throw new IOException("rewrite failure");
+                case "provider-empty" -> throw new EmptyLlmAnswerException("empty rewrite");
                 case "пусто" -> "   ";
                 default -> "x".repeat(301);
             };
             RagQueryRewriter.Result result = new RagQueryRewriter(client).rewrite("исходный вопрос");
             expect("rewrite fallback при " + label,
-                    result.query().equals("исходный вопрос") && result.rewriteFallback());
+                    result.query().equals("исходный вопрос") && result.rewriteFallback()
+                            && result.rewriteStatus().equals(switch (label) {
+                                case "ошибка" -> "fallback:error";
+                                case "пусто", "provider-empty" -> "fallback:empty";
+                                default -> "fallback:too-long";
+                            }));
         }
         RagQueryRewriter.Result good = new RagQueryRewriter((system, question) ->
                 "McpOrchestrator\n git.get-repository-status").rewrite("mcp status");
         expect("rewrite возвращает одну нормализованную строку",
-                !good.rewriteFallback() && good.query().equals("McpOrchestrator git.get-repository-status"));
+                !good.rewriteFallback() && good.rewriteStatus().equals("ok")
+                        && good.query().equals("McpOrchestrator git.get-repository-status"));
+        RagQueryRewriter.Result fencedJson = new RagQueryRewriter((system, question) ->
+                "Результат:\n```json\n{\"query\":\"ContextBuilder profile facts\"}\n```")
+                .rewrite("Какие слои контекста?");
+        expect("rewrite извлекает query из JSON fenced block с окружающим текстом",
+                !fencedJson.rewriteFallback() && fencedJson.rewriteStatus().equals("ok")
+                        && fencedJson.query().equals("ContextBuilder profile facts"));
+        RagQueryRewriter.Result malformedJson = new RagQueryRewriter((system, question) ->
+                "```json\n{\"query\":\n```").rewrite("исходный вопрос");
+        expect("ошибка разбора JSON фиксируется отдельной причиной fallback",
+                malformedJson.rewriteFallback()
+                        && malformedJson.rewriteStatus().equals("fallback:invalid-json"));
+        RagQueryRewriter.Result timedRewrite = new RagQueryRewriter((system, question) -> {
+            Thread.sleep(5_000);
+            return "late";
+        }, 1).rewrite("исходный вопрос");
+        expect("rewrite помечает таймаут и не ждёт завершения клиента",
+                timedRewrite.rewriteFallback() && timedRewrite.rewriteStatus().equals("fallback:timeout")
+                        && timedRewrite.rewriteMs() < 3_000);
 
         boolean invalidTopK = false;
         boolean invalidThreshold = false;
@@ -510,7 +535,8 @@ final class RagChecks extends SelfTestSupport {
         expect("RagSettings валидирует границы и содержит откалиброванные defaults",
                 invalidTopK && invalidThreshold
                         && new RagSettings(5, 5, 0.35, true, true).minScore() == 0.35
-                        && RagSettings.DEFAULT.minScore() == 0.55
+                        && RagSettings.DEFAULT.minScore() == 0.50
+                        && RagSettings.DEFAULT.relativeDelta() == 0.15
                         && RagSettings.DEFAULT.rerankVectorWeight() == 1.0
                         && RagSettings.DEFAULT.rerankLexicalWeight() == 0.0
                         && !RagSettings.DEFAULT.diversityEnabled());
@@ -572,6 +598,9 @@ final class RagChecks extends SelfTestSupport {
                         && report.markdown().contains("B baseline")
                         && report.markdown().contains("C filter")
                         && report.markdown().contains("D full")
+                        && report.markdown().contains("D rewriteStatus")
+                        && report.markdown().contains("Threshold-фильтр сам по себе не считается отказом")
+                        && report.markdown().contains("rewriteStatus=ok")
                         && report.summaries().size() == 4);
     }
 
@@ -626,7 +655,9 @@ final class RagChecks extends SelfTestSupport {
                 loaded.completedPairs(ids, List.of("A", "B", "C", "D")) == 40
                         && afterCdCalls == 40
                         && cd.missingPairs().values().stream().allMatch(value -> value == 0)
-                        && cd.markdown().contains("Недостающие пары"));
+                        && cd.markdown().contains("Недостающие пары")
+                        && cd.markdown().contains("D rewriteStatus")
+                        && loaded.result("history-lock", "D").rewriteStatus().equals("ok"));
         RagEval.runResumable(service, RagSettings.DEFAULT, List.of("C", "D"), ids,
                 true, checkpointPath, ignored -> { }, ignored -> { });
         expect("--resume сохраняет A-ответы и rewrite cache между процессными запусками",
@@ -649,11 +680,17 @@ final class RagChecks extends SelfTestSupport {
                         && elapsed < 3_000 && timeout.error().contains("Таймаут LLM-вызова"));
 
         Main.RagEvalCommand parsed = Main.parseRagEvalCommand(
-                "C,D --questions history-lock,context-layers --resume");
-        expect("парсер eval принимает режимы, список вопросов и --resume",
+                "C,D --questions history-lock,context-layers --resume "
+                        + "--checkpoint rag-eval-checkpoint-new.json");
+        expect("eval parser принимает режимы, вопросы, --resume и безопасное имя checkpoint",
                 parsed.modes().equals(List.of("C", "D"))
                         && parsed.questionIds().equals(List.of("history-lock", "context-layers"))
-                        && parsed.resume());
+                        && parsed.resume()
+                        && parsed.checkpointName().equals("rag-eval-checkpoint-new.json")
+                        && Main.ragEvalCheckpointPath(Path.of("/home/test"),
+                        java.time.LocalDate.of(2026, 9, 30), parsed.checkpointName())
+                        .equals(Path.of("/home/test/.ai-advent-agent/rag-results/"
+                                + "rag-eval-checkpoint-new.json")));
     }
 
     private static void checkDetailedThresholdScan() throws Exception {
