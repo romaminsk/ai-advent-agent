@@ -264,6 +264,14 @@ public final class LlmAgent {
                                boolean contextOverflow) {
     }
 
+    /** Stateless provider response details for an explicitly requested RAG rewrite diagnostic. */
+    public record StatelessCallDiagnostic(String model, int maxOutputTokens,
+                                          String finishReason, String content,
+                                          int contentLength, int reasoningLength,
+                                          boolean reasoningFieldPresent,
+                                          Integer reasoningTokens, long durationMs) {
+    }
+
     /**
      * Порог лимита сессии, по которому уведомление уже показано. Используется,
      * чтобы одно превышение не повторялось на каждом запросе и повторная
@@ -442,6 +450,10 @@ public final class LlmAgent {
     /** Текущие настройки модели (профиль, лимит, таймаут, диагностика). */
     public ModelSettings currentSettings() {
         return settings;
+    }
+
+    public String modelName() {
+        return config.model();
     }
 
     /**
@@ -1089,6 +1101,28 @@ public final class LlmAgent {
     /** RAG/stateless call with an explicit output ceiling and current sampling parameters. */
     public String askWithoutHistory(String systemPrompt, String userMessage, int maxOutputTokens) {
         return askWithoutHistory(systemPrompt, userMessage, maxOutputTokens, true);
+    }
+
+    /** Makes a stateless call while retaining only safe-to-inspect response diagnostics. */
+    public StatelessCallDiagnostic diagnoseWithoutHistory(String systemPrompt, String userMessage,
+                                                           int maxOutputTokens) {
+        if (systemPrompt == null || systemPrompt.isBlank()
+                || userMessage == null || userMessage.isBlank()) {
+            throw new AgentException("Пустой запрос диагностики rewrite.");
+        }
+        if (maxOutputTokens < 1) {
+            throw new IllegalArgumentException("maxOutputTokens должен быть положительным");
+        }
+        long started = System.nanoTime();
+        ParsedAnswer parsed = executeCall(List.of(new ChatMessage("system", systemPrompt),
+                        new ChatMessage("user", userMessage)), maxOutputTokens,
+                UUID.randomUUID().toString(), true, SessionTokenStats.Purpose.REGULAR);
+        return new StatelessCallDiagnostic(config.model(), maxOutputTokens,
+                parsed.finishReason(), parsed.rawContent(),
+                parsed.rawContent() == null ? 0 : parsed.rawContent().length(),
+                parsed.reasoningLength(), parsed.reasoningFieldPresent(),
+                parsed.usage() == null ? null : parsed.usage().reasoningTokens(),
+                Math.max(0, (System.nanoTime() - started) / 1_000_000));
     }
 
     private String askWithoutHistory(String systemPrompt, String userMessage,
@@ -3033,14 +3067,17 @@ public final class LlmAgent {
     }
 
     /** Результат разбора ответа: видимый текст, finish_reason и usage (если есть). */
-    private record ParsedAnswer(String content, String finishReason, Usage usage) {
+    private record ParsedAnswer(String content, String finishReason, Usage usage,
+                                String rawContent, int reasoningLength,
+                                boolean reasoningFieldPresent) {
     }
 
     /**
      * Использование токенов по стандартным полям OpenAI-совместимого ответа.
      * null — поле отсутствует (нет данных), а не ноль.
      */
-    private record Usage(Integer promptTokens, Integer completionTokens, Integer totalTokens) {
+    private record Usage(Integer promptTokens, Integer completionTokens, Integer totalTokens,
+                         Integer reasoningTokens) {
     }
 
     /**
@@ -3074,12 +3111,20 @@ public final class LlmAgent {
                 ? finishReasonNode.asText()
                 : null;
 
-        JsonNode contentNode = choice.path("message").path("content");
-        String content = contentNode.isTextual() && !contentNode.asText().isBlank()
-                ? contentNode.asText().trim()
+        JsonNode message = choice.path("message");
+        JsonNode contentNode = message.path("content");
+        String rawContent = contentNode.isTextual() ? contentNode.asText() : null;
+        String content = rawContent != null && !rawContent.isBlank()
+                ? rawContent.trim()
                 : null;
+        JsonNode reasoningNode = message.has("reasoning_content")
+                ? message.get("reasoning_content") : message.get("reasoning");
+        int reasoningLength = reasoningNode == null || reasoningNode.isNull() ? 0
+                : reasoningNode.isTextual() ? reasoningNode.asText().length()
+                : reasoningNode.toString().length();
 
-        return new ParsedAnswer(content, finishReason, parseUsage(root.get("usage")));
+        return new ParsedAnswer(content, finishReason, parseUsage(root.get("usage")),
+                rawContent, reasoningLength, reasoningNode != null && !reasoningNode.isNull());
     }
 
     /** Разбирает usage по стандартным полям; отсутствующие поля — null. */
@@ -3087,10 +3132,12 @@ public final class LlmAgent {
         if (usageNode == null || !usageNode.isObject()) {
             return null;
         }
-        return new Usage(
-                intValueOrNull(usageNode.get("prompt_tokens")),
+        JsonNode details = usageNode.path("completion_tokens_details");
+        Integer reasoningTokens = intValueOrNull(details.get("reasoning_tokens"));
+        if (reasoningTokens == null) reasoningTokens = intValueOrNull(usageNode.get("reasoning_tokens"));
+        return new Usage(intValueOrNull(usageNode.get("prompt_tokens")),
                 intValueOrNull(usageNode.get("completion_tokens")),
-                intValueOrNull(usageNode.get("total_tokens")));
+                intValueOrNull(usageNode.get("total_tokens")), reasoningTokens);
     }
 
     private static Integer intValueOrNull(JsonNode node) {

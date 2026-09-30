@@ -38,6 +38,7 @@ final class RagChecks extends SelfTestSupport {
         checkQuestionsAndMetrics();
         checkFilterRerankAndDiversity();
         checkRewriteFallbackAndSettingsStore();
+        checkRewriteDiagnosticClientResponse();
         checkRagConfigurationCommandsAndEvalModes();
         checkEvalCheckpointResumeAndLlmTimeout();
         checkDetailedThresholdScan();
@@ -480,7 +481,7 @@ final class RagChecks extends SelfTestSupport {
     }
 
     private static void checkRewriteFallbackAndSettingsStore() throws Exception {
-        for (String label : List.of("ошибка", "пусто", "provider-empty", "длинный")) {
+        for (String label : List.of("ошибка", "пусто", "provider-empty")) {
             RagQueryRewriter.Client client = (system, question) -> switch (label) {
                 case "ошибка" -> throw new IOException("rewrite failure");
                 case "provider-empty" -> throw new EmptyLlmAnswerException("empty rewrite");
@@ -493,14 +494,25 @@ final class RagChecks extends SelfTestSupport {
                             && result.rewriteStatus().equals(switch (label) {
                                 case "ошибка" -> "fallback:error";
                                 case "пусто", "provider-empty" -> "fallback:empty";
-                                default -> "fallback:too-long";
+                                default -> "fallback:unknown";
                             }));
         }
-        RagQueryRewriter.Result good = new RagQueryRewriter((system, question) ->
-                "McpOrchestrator\n git.get-repository-status").rewrite("mcp status");
+        String longQuery = "ContextBuilder ".repeat(40);
+        RagQueryRewriter.Result truncated = new RagQueryRewriter((system, question) -> longQuery)
+                .rewrite("Какие данные контекста?");
+        expect("слишком длинный rewrite режется до 300 символов по границе слова",
+                !truncated.rewriteFallback() && truncated.rewriteStatus().equals("ok-truncated")
+                        && truncated.query().length() <= 300
+                        && truncated.query().endsWith("ContextBuilder"));
+        AtomicReference<String> rewritePrompt = new AtomicReference<>();
+        RagQueryRewriter.Result good = new RagQueryRewriter((system, question) -> {
+            rewritePrompt.set(system);
+            return "McpOrchestrator\n git.get-repository-status";
+        }).rewrite("mcp status");
         expect("rewrite возвращает одну нормализованную строку",
                 !good.rewriteFallback() && good.rewriteStatus().equals("ok")
-                        && good.query().equals("McpOrchestrator git.get-repository-status"));
+                        && good.query().equals("McpOrchestrator git.get-repository-status")
+                        && rewritePrompt.get().contains("Не более 15 слов, не длиннее 200 символов, без пояснений"));
         RagQueryRewriter.Result fencedJson = new RagQueryRewriter((system, question) ->
                 "Результат:\n```json\n{\"query\":\"ContextBuilder profile facts\"}\n```")
                 .rewrite("Какие слои контекста?");
@@ -519,6 +531,24 @@ final class RagChecks extends SelfTestSupport {
         expect("rewrite помечает таймаут и не ждёт завершения клиента",
                 timedRewrite.rewriteFallback() && timedRewrite.rewriteStatus().equals("fallback:timeout")
                         && timedRewrite.rewriteMs() < 3_000);
+        Path diagnosticLog = Files.createTempDirectory(baseTempDir, "rewrite-diagnostics-")
+                .resolve("rewrite-diagnostics.log");
+        RagQueryRewriter.appendDiagnostic(diagnosticLog,
+                new RagQueryRewriter.Diagnostic("history-lock", "test-model", 128, 20,
+                        19, "length", 0, 42, true, 42, "fallback:empty",
+                        RagQueryRewriter.INSTRUCTION, "Bearer abcdefghijklmnop"));
+        String diagnosticText = Files.readString(diagnosticLog);
+        expect("rewrite diagnostic пишет причины/метаданные и не пишет секрет, файл owner-only",
+                diagnosticText.contains("finish_reason=length")
+                        && diagnosticText.contains("content_length=0")
+                        && diagnosticText.contains("reasoning_length=42")
+                        && diagnosticText.contains("fallback:empty")
+                        && !diagnosticText.contains("abcdefghijklmnop")
+                        && Files.getPosixFilePermissions(diagnosticLog).equals(
+                        java.util.EnumSet.of(java.nio.file.attribute.PosixFilePermission.OWNER_READ,
+                                java.nio.file.attribute.PosixFilePermission.OWNER_WRITE))
+                        && RagQueryRewriter.DEFAULT_MAX_OUTPUT_TOKENS == 2048
+                        && RagQueryRewriter.DEFAULT_TIMEOUT_SECONDS == 45);
 
         boolean invalidTopK = false;
         boolean invalidThreshold = false;
@@ -549,6 +579,45 @@ final class RagChecks extends SelfTestSupport {
         persistence.save(state);
         expect("настройки и флаг режима сохраняются и загружаются",
                 persistence.load().equals(state));
+    }
+
+    private static void checkRewriteDiagnosticClientResponse() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        List<String> requestBodies = new ArrayList<>();
+        var server = startHttpsServer(keyStore, (body, session, auth) -> {
+            requestBodies.add(body);
+            return json(200, "{\"choices\":[{\"message\":{\"role\":\"assistant\","
+                    + "\"content\":\"\",\"reasoning_content\":\"hidden thought\"},"
+                    + "\"finish_reason\":\"length\"}],\"usage\":{"
+                    + "\"prompt_tokens\":10,\"completion_tokens\":20,\"total_tokens\":30,"
+                    + "\"completion_tokens_details\":{\"reasoning_tokens\":19}}}");
+        });
+        JsonConversationStore store = tempStore();
+        try {
+            Config config = new Config("test-key", "https://127.0.0.1:"
+                    + server.getAddress().getPort() + "/v1/chat/completions", "glm-5.3-flash");
+            LlmAgent agent = new LlmAgent(config, ModelSettings.defaults(),
+                    trustedHttpClient(keyStore), store, tempMemoryStore());
+            LlmAgent.StatelessCallDiagnostic diagnostic = agent.diagnoseWithoutHistory(
+                    "rewrite system", "rewrite query", 512);
+            expect("stateless rewrite diagnostic preserves finish_reason, empty content and reasoning length",
+                    diagnostic.model().equals("glm-5.3-flash")
+                            && diagnostic.maxOutputTokens() == 512
+                            && diagnostic.finishReason().equals("length")
+                            && diagnostic.contentLength() == 0
+                            && diagnostic.reasoningLength() == "hidden thought".length()
+                            && diagnostic.reasoningFieldPresent()
+                            && diagnostic.reasoningTokens() == 19
+                            && diagnostic.content() != null && diagnostic.content().isEmpty()
+                            && diagnostic.durationMs() >= 0
+                            && requestBodies.size() == 1 && requestBodies.get(0).contains("\"max_tokens\":512")
+                            && !requestBodies.get(0).contains("reasoning_effort")
+                            && agent.getHistory().isEmpty());
+        } finally {
+            store.close();
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
     }
 
     private static void checkRagConfigurationCommandsAndEvalModes() throws Exception {

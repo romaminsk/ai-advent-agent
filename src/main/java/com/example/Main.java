@@ -4036,6 +4036,23 @@ public final class Main {
             ui.showSystem(formatRagConfig(ragRef));
             return;
         }
+        if (lower.startsWith("rewrite-test ")) {
+            String[] parts = argument.substring("rewrite-test".length()).trim().split("\\s+");
+            if (parts.length < 1 || parts[0].isBlank() || parts.length > 3) {
+                ui.showError("Использование: /rag rewrite-test <question-id> [max_tokens timeout_s]");
+                return;
+            }
+            try {
+                int maxTokens = parts.length >= 2 ? Integer.parseInt(parts[1])
+                        : com.example.rag.RagQueryRewriter.DEFAULT_MAX_OUTPUT_TOKENS;
+                long timeoutSeconds = parts.length >= 3 ? Long.parseLong(parts[2])
+                        : com.example.rag.RagQueryRewriter.DEFAULT_TIMEOUT_SECONDS;
+                ui.showSystem(ragRef.rewriteDiagnostic(agent, parts[0], maxTokens, timeoutSeconds));
+            } catch (Exception e) {
+                ui.showError("Ошибка /rag rewrite-test: " + safeError(e));
+            }
+            return;
+        }
         if (lower.equals("on") || lower.equals("off")) {
             try {
                 if (lower.equals("on")) {
@@ -4382,6 +4399,54 @@ public final class Main {
             settingsStore.save(new com.example.rag.RagSettingsStore.State(enabled, settings, strategy));
         }
 
+        private String rewriteDiagnostic(LlmAgent agent, String questionId,
+                                         int maxTokens, long timeoutSeconds) throws Exception {
+            com.example.rag.RagEval.Question question = com.example.rag.RagEval.loadQuestions().stream()
+                    .filter(item -> item.id().equals(questionId)).findFirst()
+                    .orElseThrow(() -> new IllegalArgumentException("Неизвестный question id: "
+                            + questionId));
+            java.util.concurrent.atomic.AtomicReference<LlmAgent.StatelessCallDiagnostic> observed =
+                    new java.util.concurrent.atomic.AtomicReference<>();
+            com.example.rag.RagQueryRewriter rewriter = new com.example.rag.RagQueryRewriter(
+                    (system, user) -> {
+                        LlmAgent.StatelessCallDiagnostic call = agent.diagnoseWithoutHistory(
+                                system, user, maxTokens);
+                        observed.set(call);
+                        return call.content();
+                    }, timeoutSeconds);
+            long started = System.nanoTime();
+            com.example.rag.RagQueryRewriter.Result result = rewriter.rewrite(question.question());
+            long durationMs = Math.max(0, (System.nanoTime() - started) / 1_000_000);
+            LlmAgent.StatelessCallDiagnostic call = observed.get();
+            String model = call == null ? agent.modelName() : call.model();
+            String finishReason = call == null ? "not-received" : call.finishReason();
+            int contentLength = call == null ? 0 : call.contentLength();
+            int reasoningLength = call == null ? 0 : call.reasoningLength();
+            boolean reasoningPresent = call != null && call.reasoningFieldPresent();
+            Integer reasoningTokens = call == null ? null : call.reasoningTokens();
+            String content = call == null ? "" : call.content();
+            com.example.rag.RagQueryRewriter.appendDiagnostic(
+                    com.example.rag.RagQueryRewriter.diagnosticLogPath(
+                            Path.of(System.getProperty("user.home"))),
+                    new com.example.rag.RagQueryRewriter.Diagnostic(questionId, model,
+                            maxTokens, timeoutSeconds,
+                            call == null ? durationMs : call.durationMs(), finishReason,
+                            contentLength, reasoningLength, reasoningPresent, reasoningTokens,
+                            result.rewriteStatus(), com.example.rag.RagQueryRewriter.INSTRUCTION,
+                            content));
+            return "Rewrite diagnostic: question=" + questionId + ", model=" + model
+                    + ", max_tokens=" + maxTokens + ", timeout=" + timeoutSeconds + "s"
+                    + ", duration=" + (call == null ? durationMs : call.durationMs()) + "ms"
+                    + ", finish_reason=" + (finishReason == null ? "unavailable" : finishReason)
+                    + ", content_length=" + contentLength
+                    + ", reasoning_length=" + reasoningLength
+                    + ", reasoning_field_present=" + reasoningPresent
+                    + ", reasoning_tokens=" + (reasoningTokens == null ? "unavailable" : reasoningTokens)
+                    + ", status=" + result.rewriteStatus()
+                    + ", log=" + com.example.rag.RagQueryRewriter.diagnosticLogPath(
+                    Path.of(System.getProperty("user.home")));
+        }
+
         private com.example.rag.RagService service(LlmAgent agent) {
             if (injectedService) {
                 return service;
@@ -4395,7 +4460,8 @@ public final class Main {
                         (system, user, maxOutputTokens) ->
                                 agent.askWithoutHistory(system, user, maxOutputTokens), settings,
                         new com.example.rag.RagQueryRewriter((system, question) ->
-                                agent.askWithoutHistory(system, question, 128)));
+                                agent.askWithoutHistory(system, question,
+                                        com.example.rag.RagQueryRewriter.DEFAULT_MAX_OUTPUT_TOKENS)));
                 serviceAgent = agent;
                 serviceStrategy = strategy;
             }
