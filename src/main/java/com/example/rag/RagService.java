@@ -30,7 +30,8 @@ public final class RagService {
     public record Prepared(String question, RagPromptBuilder.Prompt prompt,
                            List<RagRetriever.Chunk> retrievedChunks, long retrieveMs,
                            RagReranker.Result ranking, RagSettings settings,
-                           String rewriteQuery, boolean rewriteFallback, long rewriteMs) {
+                           String rewriteQuery, boolean rewriteFallback, long rewriteMs,
+                           String rewriteStatus) {
         public Prepared {
             retrievedChunks = List.copyOf(retrievedChunks);
         }
@@ -38,7 +39,7 @@ public final class RagService {
 
     public record Retrieval(List<RagRetriever.Chunk> chunks, long retrieveMs,
                             RagReranker.Result ranking, String rewriteQuery,
-                            boolean rewriteFallback, long rewriteMs) {
+                            boolean rewriteFallback, long rewriteMs, String rewriteStatus) {
         public Retrieval {
             chunks = List.copyOf(chunks);
         }
@@ -46,9 +47,19 @@ public final class RagService {
 
     public record Result(String answer, List<RagRetriever.Chunk> chunks,
                          List<RagRetriever.Chunk> retrievedChunks,
-                         long retrieveMs, long llmMs, Status status, String error,
-                         int filteredCount, boolean filteredAll, boolean rewriteFallback,
-                         String rewriteQuery, long rewriteMs) {
+                          long retrieveMs, long llmMs, Status status, String error,
+                          int filteredCount, boolean filteredAll, boolean rewriteFallback,
+                          String rewriteQuery, long rewriteMs, String rewriteStatus) {
+        public Result(String answer, List<RagRetriever.Chunk> chunks,
+                      List<RagRetriever.Chunk> retrievedChunks,
+                      long retrieveMs, long llmMs, Status status, String error,
+                      int filteredCount, boolean filteredAll, boolean rewriteFallback,
+                      String rewriteQuery, long rewriteMs) {
+            this(answer, chunks, retrievedChunks, retrieveMs, llmMs, status, error,
+                    filteredCount, filteredAll, rewriteFallback, rewriteQuery, rewriteMs,
+                    rewriteFallback ? "fallback:unknown" : "ok");
+        }
+
         public Result {
             chunks = List.copyOf(chunks);
             retrievedChunks = List.copyOf(retrievedChunks);
@@ -107,7 +118,7 @@ public final class RagService {
                 .map(RagReranker.ScoredChunk::chunk).toList();
         RagPromptBuilder.Prompt prompt = promptBuilder.build(question, selected);
         return new Prepared(question, prompt, chunks, elapsedMs(searchStart), ranking,
-                requestSettings, rewrite.query(), rewrite.fallback(), rewrite.ms());
+                requestSettings, rewrite.query(), rewrite.fallback(), rewrite.ms(), rewrite.status());
     }
 
     public Retrieval retrieveOnly(String question) throws Exception {
@@ -123,11 +134,12 @@ public final class RagService {
                 requestSettings.topKBefore());
         return new Retrieval(chunks, elapsedMs(searchStart),
                 reranker.process(question, chunks, requestSettings), rewrite.query(),
-                rewrite.fallback(), rewrite.ms());
+                rewrite.fallback(), rewrite.ms(), rewrite.status());
     }
 
     public RagQueryRewriter.Result rewriteQuery(String question) {
-        if (rewriter == null) return new RagQueryRewriter.Result(question, false, 0);
+        if (rewriter == null) return new RagQueryRewriter.Result(question, true, 0,
+                "fallback:no-client");
         return rewriter.rewrite(question);
     }
 
@@ -136,7 +148,8 @@ public final class RagService {
             return new Result(RagConstants.NO_ANSWER, List.of(), prepared.retrievedChunks(),
                     prepared.retrieveMs(), 0, Status.OK, null,
                     prepared.ranking().filteredCount(), prepared.ranking().filteredAll(),
-                    prepared.rewriteFallback(), prepared.rewriteQuery(), prepared.rewriteMs());
+                    prepared.rewriteFallback(), prepared.rewriteQuery(), prepared.rewriteMs(),
+                    prepared.rewriteStatus());
         }
         long start = System.nanoTime();
         try {
@@ -144,22 +157,26 @@ public final class RagService {
             return new Result(answer, prepared.prompt().chunks(), prepared.retrievedChunks(),
                     prepared.retrieveMs(), elapsedMs(start), Status.OK, null,
                     prepared.ranking().filteredCount(), prepared.ranking().filteredAll(),
-                    prepared.rewriteFallback(), prepared.rewriteQuery(), prepared.rewriteMs());
+                    prepared.rewriteFallback(), prepared.rewriteQuery(), prepared.rewriteMs(),
+                    prepared.rewriteStatus());
         } catch (EmptyLlmAnswerException empty) {
             return new Result("", prepared.prompt().chunks(), prepared.retrievedChunks(),
                     prepared.retrieveMs(), elapsedMs(start), Status.EMPTY, errorText(empty),
                     prepared.ranking().filteredCount(), prepared.ranking().filteredAll(),
-                    prepared.rewriteFallback(), prepared.rewriteQuery(), prepared.rewriteMs());
+                    prepared.rewriteFallback(), prepared.rewriteQuery(), prepared.rewriteMs(),
+                    prepared.rewriteStatus());
         } catch (LlmCallTimeoutException timeout) {
             return new Result("", prepared.prompt().chunks(), prepared.retrievedChunks(),
                     prepared.retrieveMs(), elapsedMs(start), Status.TIMEOUT, errorText(timeout),
                     prepared.ranking().filteredCount(), prepared.ranking().filteredAll(),
-                    prepared.rewriteFallback(), prepared.rewriteQuery(), prepared.rewriteMs());
+                    prepared.rewriteFallback(), prepared.rewriteQuery(), prepared.rewriteMs(),
+                    prepared.rewriteStatus());
         } catch (Exception error) {
             return new Result("", prepared.prompt().chunks(), prepared.retrievedChunks(),
                     prepared.retrieveMs(), elapsedMs(start), Status.ERROR, errorText(error),
                     prepared.ranking().filteredCount(), prepared.ranking().filteredAll(),
-                    prepared.rewriteFallback(), prepared.rewriteQuery(), prepared.rewriteMs());
+                    prepared.rewriteFallback(), prepared.rewriteQuery(), prepared.rewriteMs(),
+                    prepared.rewriteStatus());
         }
     }
 
@@ -174,16 +191,16 @@ public final class RagService {
             try {
                 String answer = completeWithRetry(offSystemPrompt, question);
                 return new Result(answer, List.of(), List.of(), 0, elapsedMs(start),
-                        Status.OK, null, 0, false, false, question, 0);
+                        Status.OK, null, 0, false, false, question, 0, "off");
             } catch (EmptyLlmAnswerException empty) {
                 return new Result("", List.of(), List.of(), 0, elapsedMs(start),
-                        Status.EMPTY, errorText(empty), 0, false, false, question, 0);
+                        Status.EMPTY, errorText(empty), 0, false, false, question, 0, "off");
             } catch (LlmCallTimeoutException timeout) {
                 return new Result("", List.of(), List.of(), 0, elapsedMs(start),
-                        Status.TIMEOUT, errorText(timeout), 0, false, false, question, 0);
+                        Status.TIMEOUT, errorText(timeout), 0, false, false, question, 0, "off");
             } catch (Exception error) {
                 return new Result("", List.of(), List.of(), 0, elapsedMs(start),
-                        Status.ERROR, errorText(error), 0, false, false, question, 0);
+                        Status.ERROR, errorText(error), 0, false, false, question, 0, "off");
             }
         }
         long retrieveStart = System.nanoTime();
@@ -192,20 +209,22 @@ public final class RagService {
             prepared = prepare(question, requestSettings, rewriteOverride);
         } catch (Exception error) {
             return new Result("", List.of(), List.of(), elapsedMs(retrieveStart), 0,
-                    Status.ERROR, errorText(error), 0, false, false, question, 0);
+                    Status.ERROR, errorText(error), 0, false, false, question, 0,
+                    requestSettings.rewriteEnabled() ? "fallback:retrieval-error" : "off");
         }
         return complete(prepared);
     }
 
     private Rewrite rewrite(String question, RagSettings requestSettings, String override) {
-        if (!requestSettings.rewriteEnabled()) return new Rewrite(question, false, 0);
-        if (override != null) return new Rewrite(override, false, 0);
-        if (rewriter == null) return new Rewrite(question, false, 0);
+        if (!requestSettings.rewriteEnabled()) return new Rewrite(question, false, 0, "off");
+        if (override != null) return new Rewrite(override, false, 0, "ok");
+        if (rewriter == null) return new Rewrite(question, true, 0, "fallback:no-client");
         RagQueryRewriter.Result result = rewriter.rewrite(question);
-        return new Rewrite(result.query(), result.rewriteFallback(), result.rewriteMs());
+        return new Rewrite(result.query(), result.rewriteFallback(), result.rewriteMs(),
+                result.rewriteStatus());
     }
 
-    private record Rewrite(String query, boolean fallback, long ms) {
+    private record Rewrite(String query, boolean fallback, long ms, String status) {
     }
 
     private String completeWithRetry(String system, String user) throws Exception {

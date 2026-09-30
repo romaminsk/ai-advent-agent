@@ -5,12 +5,13 @@ public record RagSettings(int topKBefore, int topKAfter, double minScore,
                           boolean rerankEnabled, boolean rewriteEnabled,
                           double rerankVectorWeight, double rerankLexicalWeight,
                           Double relativeDelta, boolean diversityEnabled) {
-    public static final double DEFAULT_MIN_SCORE = 0.55;
+    public static final double DEFAULT_MIN_SCORE = 0.50;
+    public static final double DEFAULT_RELATIVE_DELTA = 0.15;
     public static final double DEFAULT_VECTOR_WEIGHT = 1.00;
     public static final double DEFAULT_LEXICAL_WEIGHT = 0.00;
     public static final boolean DEFAULT_DIVERSITY_ENABLED = false;
     public static final RagSettings DEFAULT = new RagSettings(20, 5, DEFAULT_MIN_SCORE,
-            true, true, DEFAULT_VECTOR_WEIGHT, DEFAULT_LEXICAL_WEIGHT, null,
+            true, true, DEFAULT_VECTOR_WEIGHT, DEFAULT_LEXICAL_WEIGHT, DEFAULT_RELATIVE_DELTA,
             DEFAULT_DIVERSITY_ENABLED);
 
     public RagSettings(int topKBefore, int topKAfter, double minScore,

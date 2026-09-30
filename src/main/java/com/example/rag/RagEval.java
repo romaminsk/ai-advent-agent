@@ -295,7 +295,7 @@ public final class RagEval {
                     filterSettings, question.question());
             RagQueryRewriter.Result rewrite = rewriteCache.computeIfAbsent(question.id(), ignored ->
                     fullSettings.rewriteEnabled() ? service.rewriteQuery(question.question())
-                            : new RagQueryRewriter.Result(question.question(), false, 0));
+                            : new RagQueryRewriter.Result(question.question(), false, 0, "off"));
             RagService.Result full = service.ask(question.question(), RagService.Mode.ON,
                     fullSettings, rewrite.query());
             full = withRewrite(full, rewrite);
@@ -451,7 +451,7 @@ public final class RagEval {
         return new RagService.Result(result.answer(), result.chunks(), result.retrievedChunks(),
                 result.retrieveMs(), result.llmMs(), result.status(), result.error(),
                 result.filteredCount(), result.filteredAll(), rewrite.rewriteFallback(),
-                rewrite.query(), rewrite.rewriteMs());
+                rewrite.query(), rewrite.rewriteMs(), rewrite.rewriteStatus());
     }
 
     private static ComparisonReport comparisonReport(List<ComparisonRow> rows) {
@@ -497,16 +497,27 @@ public final class RagEval {
                     .append(" |\n");
         }
         out.append("\n| # | вопрос | A факты/status | B факты/sourceHit/precision/cited | "
-                + "C факты/sourceHit/precision/cited/filtered | D факты/sourceHit/precision/cited/filtered |\n")
-                .append("|---:|---|---|---|---|---|\n");
+                + "C факты/sourceHit/precision/cited/filtered | D факты/sourceHit/precision/cited/filtered | D rewriteStatus |\n")
+                .append("|---:|---|---|---|---|---|---|\n");
         for (int i = 0; i < rows.size(); i++) {
             ComparisonRow row = rows.get(i);
             out.append("| ").append(i + 1).append(" | ").append(table(row.question().question()))
                     .append(" | ").append(cellText(row.noRag()))
                     .append(" | ").append(cellText(row.baseline()))
                     .append(" | ").append(cellText(row.filter()))
-                    .append(" | ").append(cellText(row.full())).append(" |\n");
+                    .append(" | ").append(cellText(row.full()))
+                    .append(" | ").append(row.full() == null ? "missing"
+                            : table(row.full().result().rewriteStatus())).append(" |\n");
         }
+        rows.stream().filter(row -> row.question().noAnswerExpected()).findFirst().ifPresent(trap ->
+                out.append("\nТелефонная ловушка: B отказ модели=")
+                        .append(trap.baseline() != null && trap.baseline().refusal() ? "да" : "нет")
+                        .append(", C=")
+                        .append(trap.filter() != null && trap.filter().refusal() ? "да" : "нет")
+                        .append(", D=")
+                        .append(trap.full() != null && trap.full().refusal() ? "да" : "нет")
+                        .append(". Threshold-фильтр сам по себе не считается отказом; "
+                                + "ловушка пройдена только при отказе модели.\n"));
         for (int i = 0; i < rows.size(); i++) {
             ComparisonRow row = rows.get(i);
             out.append("\n## ").append(i + 1).append(". ").append(row.question().id())
@@ -586,6 +597,7 @@ public final class RagEval {
                 .append(", precision=").append(String.format(Locale.ROOT, "%.2f", cell.chunkPrecision()))
                 .append(", filtered=").append(cell.filteredCandidates())
                 .append(", rewriteFallback=").append(result.rewriteFallback())
+                .append(", rewriteStatus=").append(table(result.rewriteStatus()))
                 .append(", время=").append(formatMs(result.retrieveMs() + result.rewriteMs()
                         + result.llmMs()))
                 .append(".\n\n");

@@ -52,7 +52,9 @@ public final class RagSettingsStore {
                 node.path("rewriteEnabled").asBoolean(true),
                 node.path("rerankVectorWeight").asDouble(RagSettings.DEFAULT_VECTOR_WEIGHT),
                 node.path("rerankLexicalWeight").asDouble(RagSettings.DEFAULT_LEXICAL_WEIGHT),
-                node.hasNonNull("relativeDelta") ? node.path("relativeDelta").asDouble() : null,
+                node.has("relativeDelta")
+                        ? (node.hasNonNull("relativeDelta") ? node.path("relativeDelta").asDouble() : null)
+                        : RagSettings.DEFAULT_RELATIVE_DELTA,
                 node.path("diversityEnabled").asBoolean(RagSettings.DEFAULT_DIVERSITY_ENABLED));
         String strategy = root.path("indexStrategy").asText(RagConstants.INDEX_STRATEGY);
         if (!strategy.equals("fixed") && !strategy.equals("structure")) {

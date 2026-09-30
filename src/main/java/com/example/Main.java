@@ -4144,8 +4144,8 @@ public final class Main {
                         Path.of(System.getProperty("user.home")), date);
                 Path artifactReport = com.example.rag.RagEval.artifactPath(
                         Path.of(".").toAbsolutePath().normalize(), date);
-                Path checkpoint = com.example.rag.RagEval.checkpointPath(
-                        Path.of(System.getProperty("user.home")), date);
+                Path checkpoint = ragEvalCheckpointPath(Path.of(System.getProperty("user.home")),
+                        date, evalCommand.checkpointName());
                 com.example.rag.RagEval.ComparisonReport report =
                         com.example.rag.RagEval.runResumable(ragRef.service(agent),
                         ragRef.settings, evalCommand.modes(), evalCommand.questionIds(),
@@ -4171,7 +4171,8 @@ public final class Main {
             return;
         }
         ui.showError("Использование: /rag on|off|status|config|set|ask <вопрос>|retrieval <вопрос>"
-                + "|threshold-scan|rerank-analysis|eval [режимы] [--questions ids] [--resume];"
+                + "|threshold-scan|rerank-analysis|eval [режимы] [--questions ids] [--resume]"
+                + " [--checkpoint filename.json];"
                 + " подробности: /help /rag");
     }
 
@@ -4193,17 +4194,19 @@ public final class Main {
         throw new IllegalArgumentException("неизвестная команда");
     }
 
-    record RagEvalCommand(List<String> modes, List<String> questionIds, boolean resume) {
+    record RagEvalCommand(List<String> modes, List<String> questionIds, boolean resume,
+                          String checkpointName) {
     }
 
     static RagEvalCommand parseRagEvalCommand(String arguments) {
         if (arguments == null || arguments.isBlank()) {
-            return new RagEvalCommand(List.of("A", "B", "C", "D"), List.of(), false);
+            return new RagEvalCommand(List.of("A", "B", "C", "D"), List.of(), false, null);
         }
         String[] tokens = arguments.split("\\s+");
         List<String> modes = null;
         List<String> questionIds = List.of();
         boolean resume = false;
+        String checkpointName = null;
         for (int i = 0; i < tokens.length; i++) {
             String token = tokens[i];
             if (token.equals("--resume")) {
@@ -4213,6 +4216,15 @@ public final class Main {
                     throw new IllegalArgumentException("--questions требует список question id");
                 }
                 questionIds = parseRagEvalCsv(tokens[i], "question id");
+            } else if (token.equals("--checkpoint")) {
+                if (++i >= tokens.length || tokens[i].isBlank()) {
+                    throw new IllegalArgumentException("--checkpoint требует имя JSON-файла");
+                }
+                Path fileName = Path.of(tokens[i]);
+                if (fileName.getNameCount() != 1 || !tokens[i].endsWith(".json")) {
+                    throw new IllegalArgumentException("--checkpoint принимает только имя файла .json");
+                }
+                checkpointName = tokens[i];
             } else if (token.startsWith("--")) {
                 throw new IllegalArgumentException("Неизвестная опция: " + token);
             } else if (modes == null) {
@@ -4222,7 +4234,14 @@ public final class Main {
             }
         }
         if (modes == null) throw new IllegalArgumentException("Укажите режимы A,B,C,D");
-        return new RagEvalCommand(modes, questionIds, resume);
+        return new RagEvalCommand(modes, questionIds, resume, checkpointName);
+    }
+
+    static Path ragEvalCheckpointPath(Path home, java.time.LocalDate date, String checkpointName) {
+        if (checkpointName == null) return com.example.rag.RagEval.checkpointPath(home, date);
+        Path directory = home.resolve(".ai-advent-agent").resolve("rag-results")
+                .toAbsolutePath().normalize();
+        return directory.resolve(checkpointName).normalize();
     }
 
     private static List<String> parseRagEvalCsv(String value, String label) {
