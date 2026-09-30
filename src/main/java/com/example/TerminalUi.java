@@ -675,6 +675,7 @@ public interface TerminalUi extends AutoCloseable {
                       /rag retrieval           — сравнение fixed/structure
                       /rag threshold-scan      — калибровка порога без чат-модели
                       /rag rerank-analysis     — ранги чанков и сравнение весов без LLM
+                      /rag rewrite-test <id>  — диагностика одного rewrite-вызова
                       /rag ask <вопрос>        — ответы без RAG и с RAG
                       /rag eval A,B,C,D        — режимы; --questions ids; --resume
                                                  --checkpoint filename.json — новый checkpoint

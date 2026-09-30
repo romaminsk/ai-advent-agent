@@ -5,6 +5,14 @@ import com.example.JsonSupport;
 import com.fasterxml.jackson.databind.JsonNode;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.time.Instant;
+import java.util.EnumSet;
 import java.util.Objects;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -19,10 +27,12 @@ import java.util.regex.Pattern;
 public final class RagQueryRewriter {
     public static final String INSTRUCTION = "Перепиши вопрос в поисковый запрос для базы кода и документации проекта: "
             + "раскрой сокращения, добавь вероятные имена классов, методов и терминов, "
-            + "сохрани смысл, не добавляй фактов, не отвечай на вопрос. Верни одну строку";
+            + "сохрани смысл, не добавляй фактов, не отвечай на вопрос. "
+            + "Не более 15 слов, не длиннее 200 символов, без пояснений. Верни одну строку";
     private static final Pattern FENCED = Pattern.compile(
             "(?is).*?```(?:json)?\\s*(.*?)\\s*```.*");
-    private static final long DEFAULT_TIMEOUT_SECONDS = 20;
+    public static final int DEFAULT_MAX_OUTPUT_TOKENS = 2048;
+    public static final long DEFAULT_TIMEOUT_SECONDS = 45;
     private static final ExecutorService EXECUTOR = Executors.newCachedThreadPool(task -> {
         Thread thread = new Thread(task, "rag-query-rewrite");
         thread.setDaemon(true);
@@ -40,6 +50,13 @@ public final class RagQueryRewriter {
             this(query, rewriteFallback, rewriteMs,
                     rewriteFallback ? "fallback:unknown" : "ok");
         }
+    }
+
+    public record Diagnostic(String questionId, String model, int maxTokens,
+                             long timeoutSeconds, long durationMs, String finishReason,
+                             int contentLength, int reasoningLength,
+                             boolean reasoningFieldPresent, Integer reasoningTokens,
+                             String rewriteStatus, String prompt, String rawContent) {
     }
 
     private final Client client;
@@ -89,11 +106,28 @@ public final class RagQueryRewriter {
             return fallback(question, started, invalid.reason);
         }
         if (query == null || query.isBlank()) return fallback(question, started, "empty");
-        String oneLine = query.strip().replaceAll("\\s*\\R+\\s*", " ");
+        String oneLine = query.strip().replaceAll("\\s+", " ");
         if (oneLine.isBlank()) return fallback(question, started, "empty");
-        if (oneLine.length() > 300) return fallback(question, started, "too-long");
         if (looksSecret(oneLine)) return fallback(question, started, "secret");
+        if (oneLine.length() > 300) {
+            String truncated = truncateAtWordBoundary(oneLine, 300);
+            if (truncated.isBlank()) return fallback(question, started, "empty");
+            return new Result(truncated, false, elapsed(started), "ok-truncated");
+        }
         return new Result(oneLine, false, elapsed(started), "ok");
+    }
+
+    private static String truncateAtWordBoundary(String value, int maxLength) {
+        if (value.length() <= maxLength) return value;
+        int boundary = value.lastIndexOf(' ', maxLength);
+        if (boundary <= 0) {
+            java.text.BreakIterator words = java.text.BreakIterator.getWordInstance(java.util.Locale.ROOT);
+            words.setText(value);
+            boundary = words.preceding(maxLength + 1);
+        }
+        if (boundary <= 0) boundary = value.offsetByCodePoints(0,
+                Math.min(maxLength, value.codePointCount(0, value.length())));
+        return value.substring(0, boundary).stripTrailing();
     }
 
     private static String unwrapQuery(String raw) throws InvalidRewriteFormat {
@@ -117,6 +151,67 @@ public final class RagQueryRewriter {
 
     private static Result fallback(String question, long started, String reason) {
         return new Result(question, true, elapsed(started), "fallback:" + reason);
+    }
+
+    public static Path diagnosticLogPath(Path home) {
+        return home.resolve(".ai-advent-agent").resolve("rag-results")
+                .resolve("rewrite-diagnostics-2026-09-30.log");
+    }
+
+    /** Appends one owner-only diagnostic record; raw model text is redacted and capped at 500 chars. */
+    public static void appendDiagnostic(Path file, Diagnostic diagnostic) throws IOException {
+        Path absolute = file.toAbsolutePath().normalize();
+        Files.createDirectories(absolute.getParent());
+        if (!Files.exists(absolute)) {
+            try {
+                Files.createFile(absolute, PosixFilePermissions.asFileAttribute(
+                        EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE)));
+            } catch (UnsupportedOperationException unsupported) {
+                Files.createFile(absolute);
+            } catch (java.nio.file.FileAlreadyExistsException raced) {
+                // Another diagnostic writer created the file first.
+            }
+        }
+        setOwnerOnly(absolute);
+        String raw = safeRawPreview(diagnostic.rawContent());
+        String entry = "time=" + Instant.now() + "\n"
+                + "question=" + diagnostic.questionId() + "\n"
+                + "model=" + diagnostic.model() + "\n"
+                + "max_tokens=" + diagnostic.maxTokens() + "\n"
+                + "timeout_seconds=" + diagnostic.timeoutSeconds() + "\n"
+                + "duration_ms=" + diagnostic.durationMs() + "\n"
+                + "finish_reason=" + printable(diagnostic.finishReason()) + "\n"
+                + "content_length=" + diagnostic.contentLength() + "\n"
+                + "reasoning_length=" + diagnostic.reasoningLength() + "\n"
+                + "reasoning_field_present=" + diagnostic.reasoningFieldPresent() + "\n"
+                + "reasoning_tokens=" + (diagnostic.reasoningTokens() == null
+                ? "unavailable" : diagnostic.reasoningTokens()) + "\n"
+                + "rewrite_status=" + diagnostic.rewriteStatus() + "\n"
+                + "prompt=" + diagnostic.prompt() + "\n"
+                + "raw_content_begin\n" + raw + "\nraw_content_end\n---\n";
+        Files.writeString(absolute, entry, StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.APPEND);
+        setOwnerOnly(absolute);
+    }
+
+    private static String safeRawPreview(String rawContent) {
+        if (rawContent == null || rawContent.isEmpty()) return "";
+        if (looksSecret(rawContent)) return "[скрыт: похож на секрет]";
+        String redacted = redactSecrets(rawContent);
+        return redacted.length() <= 500 ? redacted : redacted.substring(0, 500) + "…";
+    }
+
+    private static String printable(String value) {
+        return value == null || value.isBlank() ? "unavailable" : value.replaceAll("[\\r\\n]", " ");
+    }
+
+    private static void setOwnerOnly(Path file) throws IOException {
+        try {
+            Files.setPosixFilePermissions(file, EnumSet.of(PosixFilePermission.OWNER_READ,
+                    PosixFilePermission.OWNER_WRITE));
+        } catch (UnsupportedOperationException ignored) {
+            // POSIX file permissions are not available on every supported filesystem.
+        }
     }
 
     private static final class InvalidRewriteFormat extends Exception {
