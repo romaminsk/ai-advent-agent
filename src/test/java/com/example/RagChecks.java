@@ -5,7 +5,11 @@ import com.example.index.IndexStore;
 import com.example.rag.RagConstants;
 import com.example.rag.RagEval;
 import com.example.rag.RagPromptBuilder;
+import com.example.rag.RagQueryRewriter;
 import com.example.rag.RagRetriever;
+import com.example.rag.RagReranker;
+import com.example.rag.RagSettings;
+import com.example.rag.RagSettingsStore;
 import com.example.rag.RagService;
 
 import java.net.http.HttpClient;
@@ -31,6 +35,9 @@ final class RagChecks extends SelfTestSupport {
         checkModeCommands();
         checkAskProgressAndSingleRetrieval();
         checkQuestionsAndMetrics();
+        checkFilterRerankAndDiversity();
+        checkRewriteFallbackAndSettingsStore();
+        checkRagConfigurationCommandsAndEvalModes();
     }
 
     private static void checkPromptAndRetriever() throws Exception {
@@ -361,6 +368,152 @@ final class RagChecks extends SelfTestSupport {
                 !RagEval.citedExpectedSource("Факт [2]", "src/main/java/A.java", citedChunks)
                         && !RagEval.citedExpectedSource("Факт из B.java", "src/main/java/B.java",
                         citedChunks));
+    }
+
+    private static void checkFilterRerankAndDiversity() throws Exception {
+        RagReranker reranker = new RagReranker();
+        RagSettings filterOnly = new RagSettings(10, 5, 0.35, false, false);
+        List<RagRetriever.Chunk> candidates = List.of(
+                new RagRetriever.Chunk("a.java", "A", "low", 0.34, "low"),
+                new RagRetriever.Chunk("a.java", "A", "edge", 0.35, "edge"),
+                new RagRetriever.Chunk("b.java", "B", "tie-1", 0.50, "tie"),
+                new RagRetriever.Chunk("c.java", "C", "tie-2", 0.50, "tie"));
+        RagReranker.Result filtered = reranker.process("question", candidates, filterOnly);
+        expect("фильтр отсекает только score ниже порога, equality проходит, порядок ties стабилен",
+                filtered.filteredCount() == 1 && !filtered.candidates().get(0).kept()
+                        && filtered.selected().stream().map(item -> item.chunk().chunkId()).toList()
+                        .equals(List.of("tie-1", "tie-2", "edge")));
+
+        RagSettings rerankSettings = new RagSettings(10, 5, 0, true, false);
+        List<RagRetriever.Chunk> identifiers = List.of(
+                new RagRetriever.Chunk("plain.java", "plain", "plain", 0.80, "unrelated text"),
+                new RagRetriever.Chunk("McpOrchestrator.java", "orchestration", "identifier",
+                        0.70, "McpOrchestrator git.get-repository-status"));
+        RagReranker.Result reranked = reranker.process(
+                "McpOrchestrator git.get-repository-status", identifiers, rerankSettings);
+        expect("лексические совпадения identifier поднимают чанк над более высоким vectorScore",
+                reranked.selected().get(0).chunk().chunkId().equals("identifier")
+                        && reranked.selected().get(0).lexicalScore() > 0);
+
+        List<RagRetriever.Chunk> diversity = List.of(
+                new RagRetriever.Chunk("A.java", "1", "a1", 0.99, "alpha query"),
+                new RagRetriever.Chunk("A.java", "2", "a2", 0.98, "alpha query"),
+                new RagRetriever.Chunk("A.java", "3", "a3", 0.97, "alpha query"),
+                new RagRetriever.Chunk("B.java", "1", "b1", 0.60, "alpha query"));
+        RagReranker.Result diverse = reranker.process("alpha query", diversity,
+                new RagSettings(10, 4, 0, true, false));
+        expect("в итоговом топе не больше двух чанков одного файла при наличии альтернатив",
+                diverse.selected().stream().filter(item -> item.chunk().source().equals("A.java"))
+                        .count() == 2 && diverse.selected().stream().anyMatch(item ->
+                        item.chunk().source().equals("B.java")));
+
+        Path dir = Files.createTempDirectory(baseTempDir, "rag-filter-all-");
+        IndexStore store = new IndexStore(dir);
+        store.save(new IndexStore.Index("structure", "fake", 8, Instant.now(), "tmp", 0,
+                0, 0, List.of(indexedChunk("zero", "noise.java", "structure",
+                RagEval.loadQuestions().get(0), new float[8]))));
+        AtomicInteger llmCalls = new AtomicInteger();
+        RagService noContext = new RagService(new RagRetriever(store, new CountingEmbedder(8)),
+                new RagPromptBuilder(), ContextBuilder.BASE_SYSTEM_PROMPT,
+                (system, user, tokens) -> {
+                    llmCalls.incrementAndGet();
+                    return "should not be called";
+                }, new RagSettings(5, 5, 0.35, true, false), null);
+        RagService.Result absent = noContext.ask("a question not matching", RagService.Mode.ON);
+        expect("после фильтрации в ноль возвращается отказ, filteredAll и 0 вызовов LLM",
+                absent.answer().equals(RagConstants.NO_ANSWER) && absent.filteredAll()
+                        && llmCalls.get() == 0);
+    }
+
+    private static void checkRewriteFallbackAndSettingsStore() throws Exception {
+        for (String label : List.of("ошибка", "пусто", "длинный")) {
+            RagQueryRewriter.Client client = (system, question) -> switch (label) {
+                case "ошибка" -> throw new IOException("rewrite failure");
+                case "пусто" -> "   ";
+                default -> "x".repeat(301);
+            };
+            RagQueryRewriter.Result result = new RagQueryRewriter(client).rewrite("исходный вопрос");
+            expect("rewrite fallback при " + label,
+                    result.query().equals("исходный вопрос") && result.rewriteFallback());
+        }
+        RagQueryRewriter.Result good = new RagQueryRewriter((system, question) ->
+                "McpOrchestrator\n git.get-repository-status").rewrite("mcp status");
+        expect("rewrite возвращает одну нормализованную строку",
+                !good.rewriteFallback() && good.query().equals("McpOrchestrator git.get-repository-status"));
+
+        boolean invalidTopK = false;
+        boolean invalidThreshold = false;
+        try {
+            new RagSettings(4, 5, 0.35, true, true);
+        } catch (IllegalArgumentException expected) {
+            invalidTopK = true;
+        }
+        try {
+            new RagSettings(5, 3, 1.1, true, true);
+        } catch (IllegalArgumentException expected) {
+            invalidThreshold = true;
+        }
+        expect("RagSettings валидирует topKAfter и minScore",
+                invalidTopK && invalidThreshold
+                        && new RagSettings(5, 5, 0.35, true, true).minScore() == 0.35);
+
+        Path file = Files.createTempDirectory(baseTempDir, "rag-settings-").resolve("rag.json");
+        RagSettingsStore persistence = new RagSettingsStore(file);
+        RagSettingsStore.State state = new RagSettingsStore.State(true,
+                new RagSettings(25, 4, 0.42, false, true));
+        persistence.save(state);
+        expect("настройки и флаг режима сохраняются и загружаются",
+                persistence.load().equals(state));
+    }
+
+    private static void checkRagConfigurationCommandsAndEvalModes() throws Exception {
+        String question = "unique question";
+        IndexStore store = populatedStore(
+                Files.createTempDirectory(baseTempDir, "rag-config-index-"), question, 8);
+        RagService service = new RagService(new RagRetriever(store, new CountingEmbedder(8)),
+                new RagPromptBuilder(), ContextBuilder.BASE_SYSTEM_PROMPT,
+                (system, user, tokens) -> "answer [DocumentLoader.java]");
+        LlmAgent agent = newMemoryAgent(new Config("test-key",
+                        "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash"),
+                HttpClient.newHttpClient(), Map.of());
+        FakeUi ui = new FakeUi(TerminalUi.Input.command("/rag config"),
+                TerminalUi.Input.command("/rag set topk 12 3"),
+                TerminalUi.Input.command("/rag set threshold 0.4"),
+                TerminalUi.Input.command("/rag set rerank off"),
+                TerminalUi.Input.command("/rag set rewrite off"),
+                TerminalUi.Input.command("/rag retrieval " + question),
+                TerminalUi.Input.command("/exit"));
+        Main.runLoop(ui, agent, "glm-5.3-flash", service);
+        String output = String.join("\n", ui.systems);
+        expect("/rag config, set и retrieval разбирают значения, сохраняют их и выводят две таблицы",
+                output.contains("topKBefore=20") && output.contains("topKBefore=12")
+                        && output.contains("minScore=0.40") && output.contains("rerank=off")
+                        && output.contains("rewrite=off") && output.contains("До фильтра/реранкинга")
+                        && output.contains("После (top-3)") && ui.errors.isEmpty());
+
+        List<RagEval.Question> questions = RagEval.loadQuestions();
+        CountingEmbedder embedder = new CountingEmbedder(8);
+        List<IndexStore.IndexedChunk> chunks = new ArrayList<>();
+        for (RagEval.Question q : questions) {
+            chunks.add(indexedChunk(q.id(), q.noAnswerExpected() ? "Other.java"
+                    : q.expectedSources().split("\\|")[0], "structure", q,
+                    embedder.vector(q.question())));
+        }
+        IndexStore evalStore = new IndexStore(Files.createTempDirectory(baseTempDir, "rag-modes-"));
+        evalStore.save(new IndexStore.Index("structure", "fake", 8, Instant.now(), "tmp", 0,
+                0, 0, chunks));
+        RagService evalService = new RagService(new RagRetriever(evalStore, embedder),
+                new RagPromptBuilder(), ContextBuilder.BASE_SYSTEM_PROMPT,
+                (system, user, tokens) -> "В базе нет ответа", RagSettings.DEFAULT,
+                new RagQueryRewriter((system, q) -> "code " + q));
+        RagEval.ComparisonReport report = RagEval.runModes(evalService, RagSettings.DEFAULT,
+                ignored -> { }, ignored -> { });
+        expect("eval-отчёт сравнивает все режимы A/B/C/D",
+                report.rows().size() == 10 && report.markdown().contains("A no-rag")
+                        && report.markdown().contains("B baseline")
+                        && report.markdown().contains("C filter")
+                        && report.markdown().contains("D full")
+                        && report.summaries().size() == 4);
     }
 
     private static IndexStore populatedStore(Path dir, String question, int dimension)

@@ -37,7 +37,9 @@
 - Полный прогон: `mvn -q test-compile exec:java@self-test`; выполнять один раз в конце задачи перед слиянием, если это требуется.
 - Группы используют локальные HTTPS/MCP stubs и `expect`; индекс использует fake embedder.
 - Контрольные RAG-вопросы находятся в `src/test/resources/rag/questions.json`; ресурс также включается в CLI JAR для `/rag eval`.
-- `/rag on|off|status` управляет RAG в обычном диалоге; `/rag retrieval [вопрос]` показывает structure top-5 одного запроса либо сравнивает fixed/structure по 9 контрольным вопросам без LLM; `/rag ask <вопрос>` печатает поиск и ответы off/on по мере готовности, `/rag eval` запускает 10 вопросов.
+- `/rag on|off|status` управляет режимом обычного диалога; `/rag config` показывает настройки из `~/.ai-advent-agent/rag-settings.json`; `/rag set topk <до> <после>`, `/rag set threshold <0..1>`, `/rag set rerank on|off` и `/rag set rewrite on|off` меняют их атомарно. Начальные значения: topKBefore=20, topKAfter=5, minScore=0.35, rerank=on, rewrite=on, индекс structure.
+- `/rag retrieval <вопрос>` выводит кандидатов до фильтра и итог после реранкинга без финальной LLM; `/rag retrieval` сравнивает fixed/structure по 9 вопросам; `/rag threshold-scan` калибрует порог по сетке 0.25–0.50 на обоих индексах, выбирает минимум с потерей не более одного ожидаемого чанка и отсечённой ловушкой и сохраняет выбранный порог/индекс в настройках.
+- `/rag ask <вопрос>` показывает поиск, этапы и ответы off/on по мере готовности; `/rag eval` запускает 10 вопросов в режимах no-rag, baseline, filter и full, считает факты/sourceHit/cited/precision/filtered/refusals и сохраняет сравнительный Markdown.
 - RAG-запросы используют `max_tokens=4096` независимо от общего лимита и повторяют пустой ответ один раз.
 - Отчёты eval: `~/.ai-advent-agent/rag-results/rag-eval-<дата>.md`; локальная копия — `artifacts/rag-eval-<дата>.md` (не коммитить).
 
