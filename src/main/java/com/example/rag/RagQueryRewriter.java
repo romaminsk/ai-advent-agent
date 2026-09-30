@@ -44,6 +44,9 @@ public final class RagQueryRewriter {
             if (oneLine.isBlank() || oneLine.length() > 300) {
                 return new Result(question, true, elapsed(started));
             }
+            if (looksSecret(oneLine)) {
+                return new Result(question, true, elapsed(started));
+            }
             return new Result(oneLine, false, elapsed(started));
         } catch (Exception failure) {
             future.cancel(true);

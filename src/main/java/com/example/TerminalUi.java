@@ -200,7 +200,7 @@ public interface TerminalUi extends AutoCloseable {
                         "расход и обзор состояния"),
                 new Row("Индекс", "/index build /index stats /index search /index compare",
                         "сборка, статистика, поиск и сравнение индекса"),
-                new Row("RAG", "/rag on /rag off /rag config /rag set /rag retrieval /rag ask /rag eval",
+                new Row("RAG", "/rag on/off/config/set/retrieval/ask/eval/threshold-scan/rerank-analysis",
                         "ответы с контекстом; фильтрация, реранкинг и сравнение режимов"),
                 new Row("Прочее", "/mcp /monitor /help /exit (также exit, quit)",
                         "подключения, мониторинг и справка"),
@@ -674,16 +674,19 @@ public interface TerminalUi extends AutoCloseable {
                       /rag retrieval <вопрос>  — таблицы кандидатов до/после без LLM
                       /rag retrieval           — сравнение fixed/structure
                       /rag threshold-scan      — калибровка порога без чат-модели
+                      /rag rerank-analysis     — ранги чанков и сравнение весов без LLM
                       /rag ask <вопрос>        — ответы без RAG и с RAG
-                      /rag eval                — сравнение no-rag/baseline/filter/full
+                      /rag eval A,B,C,D        — режимы; --questions ids; --resume
 
                     Эффекты
                       режим on использует настройки topKBefore/topKAfter/minScore,
                       heuristic rerank и query rewrite; при пустом контексте LLM не
                       вызывается. В историю записываются обычные реплики без чанков.
-                      Eval сравнивает 4 режима без LLM-судьи; ответы используют
-                      max_tokens=4096 и повторяют пустой ответ один раз. Отчёт:
-                      ~/.ai-advent-agent/rag-results/ и artifacts/.
+                      Eval сохраняет каждую пару в JSON checkpoint; --resume
+                      пропускает готовое, no-rag и rewrite кэшируются.
+                      Порог и ранги без LLM: /rag threshold-scan и /rag rerank-analysis.
+                      Финальная генерация: max_tokens=4096, пустой ответ повторяется один раз.
+                      Отчёты: ~/.ai-advent-agent/rag-results/ и artifacts/.
 
                     Связано: /index stats, /help all.""";
             case "/mode" -> """

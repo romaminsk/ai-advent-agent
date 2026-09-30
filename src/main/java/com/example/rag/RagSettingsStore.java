@@ -49,7 +49,11 @@ public final class RagSettingsStore {
         RagSettings settings = new RagSettings(node.path("topKBefore").asInt(20),
                 node.path("topKAfter").asInt(5), node.path("minScore").asDouble(
                 RagSettings.DEFAULT_MIN_SCORE), node.path("rerankEnabled").asBoolean(true),
-                node.path("rewriteEnabled").asBoolean(true));
+                node.path("rewriteEnabled").asBoolean(true),
+                node.path("rerankVectorWeight").asDouble(RagSettings.DEFAULT_VECTOR_WEIGHT),
+                node.path("rerankLexicalWeight").asDouble(RagSettings.DEFAULT_LEXICAL_WEIGHT),
+                node.hasNonNull("relativeDelta") ? node.path("relativeDelta").asDouble() : null,
+                node.path("diversityEnabled").asBoolean(RagSettings.DEFAULT_DIVERSITY_ENABLED));
         String strategy = root.path("indexStrategy").asText(RagConstants.INDEX_STRATEGY);
         if (!strategy.equals("fixed") && !strategy.equals("structure")) {
             throw new IOException("Неизвестная стратегия RAG-индекса: " + strategy);
@@ -69,6 +73,11 @@ public final class RagSettingsStore {
         settings.put("minScore", state.settings().minScore());
         settings.put("rerankEnabled", state.settings().rerankEnabled());
         settings.put("rewriteEnabled", state.settings().rewriteEnabled());
+        settings.put("rerankVectorWeight", state.settings().rerankVectorWeight());
+        settings.put("rerankLexicalWeight", state.settings().rerankLexicalWeight());
+        if (state.settings().relativeDelta() == null) settings.putNull("relativeDelta");
+        else settings.put("relativeDelta", state.settings().relativeDelta());
+        settings.put("diversityEnabled", state.settings().diversityEnabled());
         Path temporary = Files.createTempFile(absolute.getParent(), "rag-settings.", ".tmp");
         try {
             Files.writeString(temporary, JsonSupport.MAPPER.writerWithDefaultPrettyPrinter()

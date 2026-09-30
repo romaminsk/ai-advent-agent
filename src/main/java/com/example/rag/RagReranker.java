@@ -13,6 +13,19 @@ import java.util.regex.Pattern;
 
 /** Deterministic score filter, lexical reranker, and per-file diversity limit. */
 public final class RagReranker {
+    public record Weights(double vector, double lexical) {
+        public Weights {
+            if (!Double.isFinite(vector) || !Double.isFinite(lexical)
+                    || vector < 0 || lexical < 0
+                    || Math.abs(vector + lexical - 1.0) > 0.000001) {
+                throw new IllegalArgumentException("Вес vector и lexical должен суммироваться в 1");
+            }
+        }
+    }
+
+    public static final Weights DEFAULT_WEIGHTS = new Weights(
+            RagSettings.DEFAULT_VECTOR_WEIGHT, RagSettings.DEFAULT_LEXICAL_WEIGHT);
+    public static final double METADATA_BONUS = 0.05;
     private static final Pattern TOKEN = Pattern.compile("[\\p{L}\\p{N}]+(?:[._-][\\p{L}\\p{N}]+)*");
     private static final Pattern CAMEL = Pattern.compile("[a-zа-яё0-9]+|[A-ZА-ЯЁ]?[a-zа-яё0-9]+|[A-ZА-ЯЁ]+(?=[A-ZА-ЯЁ][a-zа-яё]|$)");
     private static final Set<String> STOP_WORDS = Set.of("и", "в", "во", "на", "по", "для", "как",
@@ -33,17 +46,36 @@ public final class RagReranker {
     }
 
     public Result process(String question, List<RagRetriever.Chunk> chunks, RagSettings settings) {
+        return process(question, chunks, settings, settings.rerankWeights());
+    }
+
+    public Result process(String question, List<RagRetriever.Chunk> chunks, RagSettings settings,
+                          Weights weights) {
+        return process(question, chunks, settings, weights, settings.diversityEnabled());
+    }
+
+    public Result process(String question, List<RagRetriever.Chunk> chunks, RagSettings settings,
+                          Weights weights, boolean diversityEnabled) {
         List<ScoredChunk> scored = new ArrayList<>();
-        boolean filterEnabled = settings.minScore() > 0 || settings.rerankEnabled();
+        double vectorMaximum = chunks.stream().mapToDouble(RagRetriever.Chunk::score).max().orElse(0);
+        boolean relative = settings.relativeDelta() != null;
+        double cutoff = relative
+                ? Math.max(settings.minScore(), vectorMaximum - settings.relativeDelta())
+                : settings.minScore();
+        boolean filterEnabled = relative || settings.minScore() > 0 || settings.rerankEnabled();
         for (RagRetriever.Chunk chunk : chunks) {
             double vector = chunk.score();
-            if (filterEnabled && vector < settings.minScore()) {
+            if (filterEnabled && vector < cutoff) {
+                String reason = relative
+                        ? "score ниже относительного порога " + format(cutoff)
+                        : "score ниже порога " + format(cutoff);
                 scored.add(new ScoredChunk(chunk, vector, 0, vector, false,
-                        "score ниже порога " + format(settings.minScore())));
+                        reason));
                 continue;
             }
             double lexical = lexicalScore(question, chunk);
-            double score = settings.rerankEnabled() ? 0.7 * vector + 0.3 * lexical : vector;
+            double score = settings.rerankEnabled()
+                    ? weights.vector() * vector + weights.lexical() * lexical : vector;
             scored.add(new ScoredChunk(chunk, vector, lexical, score, true, "проходит порог"));
         }
 
@@ -55,7 +87,7 @@ public final class RagReranker {
         long sourceCount = passing.stream().map(item -> item.chunk().source()).distinct().count();
         for (ScoredChunk candidate : passing) {
             int count = perFile.getOrDefault(candidate.chunk().source(), 0);
-            if (settings.rerankEnabled() && sourceCount > 1 && count >= 2) continue;
+            if (settings.rerankEnabled() && diversityEnabled && sourceCount > 1 && count >= 2) continue;
             selected.add(candidate);
             perFile.put(candidate.chunk().source(), count + 1);
             if (selected.size() == settings.topKAfter()) break;
@@ -68,7 +100,7 @@ public final class RagReranker {
                 item.finalScore(), false, "не вошёл в итоговый top-" + settings.topKAfter())
                 : item).toList();
         int filtered = (int) diagnostics.stream().filter(item -> item.reason()
-                .startsWith("score ниже порога")).count();
+                .startsWith("score ниже ")).count();
         return new Result(diagnostics, selected, filtered, passing.isEmpty());
     }
 
@@ -86,7 +118,7 @@ public final class RagReranker {
             if (metadata.containsKey(term.getKey())) metadataMatch = true;
         }
         double score = total == 0 ? 0 : (double) found / total;
-        if (metadataMatch) score += 0.05;
+        if (metadataMatch) score += METADATA_BONUS;
         return Math.min(1.0, score);
     }
 
