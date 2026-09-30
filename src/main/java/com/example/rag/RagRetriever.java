@@ -50,8 +50,16 @@ public final class RagRetriever {
     }
 
     public List<Chunk> retrieve(String question) throws IOException, InterruptedException {
+        return retrieve(question, topK);
+    }
+
+    public List<Chunk> retrieve(String question, int requestedTopK)
+            throws IOException, InterruptedException {
         if (question == null || question.isBlank()) {
             throw new IllegalArgumentException("Вопрос не должен быть пустым");
+        }
+        if (requestedTopK < 1) {
+            throw new IllegalArgumentException("topK должен быть положительным");
         }
         IndexStore.Index index = loadIndex();
         if (index == null || index.chunks().isEmpty()) {
@@ -61,7 +69,7 @@ public final class RagRetriever {
         if (vectors.isEmpty()) {
             return List.of();
         }
-        return IndexSearch.topK(index, vectors.get(0), topK).stream()
+        return IndexSearch.topK(index, vectors.get(0), requestedTopK).stream()
                 .map(hit -> new Chunk(hit.chunk().meta().source(),
                         hit.chunk().meta().section(), hit.chunk().meta().chunkId(),
                         hit.score(), hit.chunk().text()))

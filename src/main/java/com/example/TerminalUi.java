@@ -200,8 +200,8 @@ public interface TerminalUi extends AutoCloseable {
                         "расход и обзор состояния"),
                 new Row("Индекс", "/index build /index stats /index search /index compare",
                         "сборка, статистика, поиск и сравнение индекса"),
-                new Row("RAG", "/rag on /rag off /rag status /rag retrieval /rag ask /rag eval",
-                        "поиск, ответы с контекстом и сравнение качества"),
+                new Row("RAG", "/rag on /rag off /rag config /rag set /rag retrieval /rag ask /rag eval",
+                        "ответы с контекстом; фильтрация, реранкинг и сравнение режимов"),
                 new Row("Прочее", "/mcp /monitor /help /exit (также exit, quit)",
                         "подключения, мониторинг и справка"),
         };
@@ -667,18 +667,23 @@ public interface TerminalUi extends AutoCloseable {
 
                     Использование
                       /rag on|off|status       — режим обычного диалога
-                      /rag retrieval [вопрос]  — top-5 source › section, score без LLM
-                                                   без вопроса — сравнение 10 вопросов
-                      /rag ask <вопрос>        — сравнить один вопрос без истории
-                      /rag eval                — сравнить 10 контрольных вопросов
+                      /rag config              — настройки и путь к их JSON
+                      /rag set topk <до> <после> — глубина поиска и размер контекста
+                      /rag set threshold <0..1> — порог cosine similarity
+                      /rag set rerank|rewrite on|off
+                      /rag retrieval <вопрос>  — таблицы кандидатов до/после без LLM
+                      /rag retrieval           — сравнение fixed/structure
+                      /rag threshold-scan      — калибровка порога без чат-модели
+                      /rag ask <вопрос>        — ответы без RAG и с RAG
+                      /rag eval                — сравнение no-rag/baseline/filter/full
 
                     Эффекты
-                      режим on ищет до 5 чанков в structure-индексе и передаёт их
-                      только текущему запросу; в историю записываются обычные
-                      реплики без текста чанков. Eval сравнивает факты и источники
-                      без LLM-судьи; полный отчёт сохраняется в
-                      max_tokens=4096 и повтор пустого ответа один раз; полный
-                      отчёт сохраняется в ~/.ai-advent-agent/rag-results/ и artifacts/.
+                      режим on использует настройки topKBefore/topKAfter/minScore,
+                      heuristic rerank и query rewrite; при пустом контексте LLM не
+                      вызывается. В историю записываются обычные реплики без чанков.
+                      Eval сравнивает 4 режима без LLM-судьи; ответы используют
+                      max_tokens=4096 и повторяют пустой ответ один раз. Отчёт:
+                      ~/.ai-advent-agent/rag-results/ и artifacts/.
 
                     Связано: /index stats, /help all.""";
             case "/mode" -> """

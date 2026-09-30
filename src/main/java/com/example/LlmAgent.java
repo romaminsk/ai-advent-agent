@@ -839,6 +839,25 @@ public final class LlmAgent {
         }
     }
 
+    /** Saves a deterministic local answer without making an API request. */
+    public String recordLocalAnswer(String userMessage, String answer) {
+        if (userMessage == null || userMessage.isBlank() || answer == null || answer.isBlank()) {
+            throw new AgentException("Пустое локальное сообщение или ответ.");
+        }
+        List<ChatMessage> updated = new ArrayList<>(history);
+        updated.add(new ChatMessage("user", userMessage));
+        updated.add(new ChatMessage("assistant", answer));
+        try {
+            store.save(stateWithMeta(sessionId, updated, this.summary,
+                    factsForSave(), persistentBranches(updated)));
+        } catch (ConversationStoreException e) {
+            throw new ConversationSaveException(answer, e.getMessage(), e);
+        }
+        history.clear();
+        history.addAll(updated);
+        return answer;
+    }
+
     private String askInternal(String userMessage, String supplementalSystemPrompt,
                                String outboundUserMessage, int maxOutputTokens) {
         if (userMessage == null || userMessage.isBlank()) {
