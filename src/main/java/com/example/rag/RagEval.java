@@ -11,10 +11,12 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.LocalDate;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.function.Consumer;
@@ -22,6 +24,7 @@ import java.util.stream.Collectors;
 
 /** Fixed-question comparison, retrieval recall, and deterministic lexical metrics. */
 public final class RagEval {
+    private static final double RERANK_PRECISION_FLOOR = 0.43;
     private static final Pattern BRACKET_CITATION = Pattern.compile("\\[([^\\]]+)]");
     private static final Pattern NUMBERED_CITATION = Pattern.compile("(?i)(?:source\\s+)?(\\d+)");
 
@@ -138,27 +141,35 @@ public final class RagEval {
 
     public record ModeSummary(String mode, int facts, int sourceHits, int answerable,
                               double precision, int cited, int filtered, int refusals,
-                              double averageMs, int errors, int empty) {
+                              double averageMs, int errors, int timeouts, int empty,
+                              int missingPairs) {
         public double recallAt5() {
             return answerable == 0 ? 0 : (double) sourceHits / answerable;
         }
     }
 
     public record ComparisonReport(List<ComparisonRow> rows, List<ModeSummary> summaries,
-                                  String markdown) {
+                                  String markdown, Map<String, Integer> missingPairs,
+                                  Path checkpointPath) {
+        public ComparisonReport(List<ComparisonRow> rows, List<ModeSummary> summaries,
+                                String markdown) {
+            this(rows, summaries, markdown, Map.of(), null);
+        }
+
         public ComparisonReport {
             rows = List.copyOf(rows);
             summaries = List.copyOf(summaries);
+            missingPairs = Map.copyOf(missingPairs);
         }
 
         public List<String> summaryLines() {
             return summaries.stream().map(summary -> String.format(Locale.ROOT,
                     "%s: факты %d, recall@5 %d/%d (%.0f%%), precision %.2f, cited %d, "
-                            + "filtered %d, refusals %d, среднее %.1f с, error/empty %d/%d",
+                            + "filtered %d, refusals %d, среднее %.1f с, error/timeout/empty %d/%d/%d, missing %d",
                     summary.mode(), summary.facts(), summary.sourceHits(), summary.answerable(),
                     summary.recallAt5() * 100, summary.precision(), summary.cited(),
                     summary.filtered(), summary.refusals(), summary.averageMs() / 1000.0,
-                    summary.errors(), summary.empty())).toList();
+                    summary.errors(), summary.timeouts(), summary.empty(), summary.missingPairs())).toList();
         }
     }
 
@@ -170,8 +181,28 @@ public final class RagEval {
                                     int junkDropped, int noContext, boolean trapFiltered) {
     }
 
+    private record RelativeMetrics(double floor, double delta, int neededKept, int neededTotal,
+                                   int junkDropped, int noContext, boolean trapFiltered) {
+    }
+
     public record ThresholdScanReport(String markdown, double selectedThreshold,
-                                      String selectedStrategy, boolean calibrated) {
+                                      String selectedStrategy, boolean calibrated,
+                                      Double relativeDelta) {
+    }
+
+    public record RerankAnalysisReport(String markdown, RagReranker.Weights selectedWeights,
+                                       boolean selectedDiversity,
+                                       double baselinePrecision, double selectedPrecision,
+                                       int baselineSourceHits, int selectedSourceHits,
+                                       int answerableQuestions, boolean constraintsMet) {
+    }
+
+    private record AnalysisQuestion(String id, String question, String expectedSources) {
+    }
+
+    private record WeightMetric(RagReranker.Weights weights, int sourceHits,
+                                int noWorseQuestions, double precision, boolean valid,
+                                boolean diversity) {
     }
 
     private RagEval() {
@@ -246,9 +277,11 @@ public final class RagEval {
         List<Question> questions = loadQuestions();
         RagSettings baselineSettings = new RagSettings(5, 5, 0, false, false);
         RagSettings filterSettings = new RagSettings(Math.max(5, settings.topKBefore()), 5,
-                settings.minScore(), true, false);
+                settings.minScore(), true, false, settings.rerankVectorWeight(),
+                settings.rerankLexicalWeight(), settings.relativeDelta(), settings.diversityEnabled());
         RagSettings fullSettings = new RagSettings(Math.max(5, settings.topKBefore()), 5,
-                settings.minScore(), true, true);
+                settings.minScore(), true, true, settings.rerankVectorWeight(),
+                settings.rerankLexicalWeight(), settings.relativeDelta(), settings.diversityEnabled());
         Map<String, RagService.Result> noRagCache = new LinkedHashMap<>();
         Map<String, RagQueryRewriter.Result> rewriteCache = new LinkedHashMap<>();
         List<ComparisonRow> rows = new ArrayList<>();
@@ -282,6 +315,116 @@ public final class RagEval {
         return comparisonReport(rows);
     }
 
+    /** Resumable A/B/C/D run with one durable result per question/mode pair. */
+    public static ComparisonReport runResumable(RagService service, RagSettings settings,
+                                                List<String> requestedModes,
+                                                List<String> requestedQuestionIds,
+                                                boolean resume, Path checkpointPath,
+                                                Consumer<String> progress,
+                                                Consumer<ComparisonReport> checkpoint)
+            throws IOException {
+        List<String> modes = validateModes(requestedModes);
+        List<Question> allQuestions = loadQuestions();
+        List<Question> questions = requestedQuestionIds == null || requestedQuestionIds.isEmpty()
+                ? allQuestions : selectQuestions(allQuestions, requestedQuestionIds);
+        RagEvalCheckpointStore store = new RagEvalCheckpointStore(checkpointPath);
+        if (resume && store.exists()) {
+            store.load();
+        } else {
+            store.clear();
+            store.initialize();
+        }
+
+        RagSettings baseline = new RagSettings(5, 5, 0, false, false);
+        RagSettings filter = new RagSettings(Math.max(5, settings.topKBefore()), 5,
+                settings.minScore(), true, false, settings.rerankVectorWeight(),
+                settings.rerankLexicalWeight(), settings.relativeDelta(), settings.diversityEnabled());
+        RagSettings full = new RagSettings(Math.max(5, settings.topKBefore()), 5,
+                settings.minScore(), true, true, settings.rerankVectorWeight(),
+                settings.rerankLexicalWeight(), settings.relativeDelta(), settings.diversityEnabled());
+        for (Question question : questions) {
+            for (String mode : modes) {
+                if (resume && store.hasResult(question.id(), mode)) {
+                    progress.accept(question.id() + "/" + mode + " — уже в checkpoint, пропуск");
+                    continue;
+                }
+                RagService.Result result;
+                switch (mode) {
+                    case "A" -> result = service.ask(question.question(), RagService.Mode.OFF);
+                    case "B" -> result = service.ask(question.question(), RagService.Mode.ON,
+                            baseline, question.question());
+                    case "C" -> result = service.ask(question.question(), RagService.Mode.ON,
+                            filter, question.question());
+                    case "D" -> {
+                        RagQueryRewriter.Result rewrite = store.rewrite(question.id());
+                        if (rewrite == null) {
+                            rewrite = service.rewriteQuery(question.question());
+                            store.putRewrite(question.id(), rewrite);
+                        }
+                        result = withRewrite(service.ask(question.question(), RagService.Mode.ON,
+                                full, rewrite.query()), rewrite);
+                    }
+                    default -> throw new IllegalStateException("Неизвестный режим: " + mode);
+                }
+                store.putResult(question.id(), mode, result);
+                progress.accept(question.id() + "/" + mode + " — "
+                        + result.status().name().toLowerCase(Locale.ROOT)
+                        + ", search=" + formatMs(result.retrieveMs())
+                        + ", rewrite=" + formatMs(result.rewriteMs())
+                        + ", llm=" + formatMs(result.llmMs())
+                        + ", total=" + formatMs(result.retrieveMs() + result.rewriteMs()
+                        + result.llmMs()));
+                ComparisonReport snapshot = checkpointReport(questions, store, checkpointPath);
+                checkpoint.accept(snapshot);
+            }
+        }
+        return checkpointReport(questions, store, checkpointPath);
+    }
+
+    private static List<String> validateModes(List<String> modes) throws IOException {
+        if (modes == null || modes.isEmpty()) throw new IOException("Укажите режимы A,B,C,D");
+        List<String> normalized = modes.stream().map(value -> value.toUpperCase(Locale.ROOT)).toList();
+        if (normalized.stream().anyMatch(mode -> !Set.of("A", "B", "C", "D").contains(mode))
+                || normalized.stream().distinct().count() != normalized.size()) {
+            throw new IOException("Режимы задаются без повторов из A,B,C,D");
+        }
+        return normalized;
+    }
+
+    private static List<Question> selectQuestions(List<Question> all, List<String> ids)
+            throws IOException {
+        Map<String, Question> byId = all.stream().collect(Collectors.toMap(
+                Question::id, question -> question, (left, right) -> left, LinkedHashMap::new));
+        List<Question> selected = new ArrayList<>();
+        Set<String> seen = new java.util.HashSet<>();
+        for (String id : ids) {
+            if (!seen.add(id)) throw new IOException("Повтор question id: " + id);
+            Question question = byId.get(id);
+            if (question == null) throw new IOException("Неизвестный question id: " + id);
+            selected.add(question);
+        }
+        return List.copyOf(selected);
+    }
+
+    private static ComparisonReport checkpointReport(List<Question> questions,
+                                                      RagEvalCheckpointStore store,
+                                                      Path checkpointPath) {
+        List<ComparisonRow> rows = new ArrayList<>();
+        for (Question question : questions) {
+            rows.add(new ComparisonRow(question,
+                    checkpointCell(question, store.result(question.id(), "A"), false),
+                    checkpointCell(question, store.result(question.id(), "B"), true),
+                    checkpointCell(question, store.result(question.id(), "C"), true),
+                    checkpointCell(question, store.result(question.id(), "D"), true)));
+        }
+        return comparisonReport(rows, questions.size(), checkpointPath);
+    }
+
+    private static ModeCell checkpointCell(Question question, RagService.Result result,
+                                           boolean withRag) {
+        return result == null ? null : cell(question, result, withRag);
+    }
+
     private static ModeCell cell(Question question, RagService.Result result, boolean withRag) {
         int facts = result.status() == RagService.Status.OK
                 ? factsHit(result.answer(), question.expected()) : 0;
@@ -312,17 +455,35 @@ public final class RagEval {
     }
 
     private static ComparisonReport comparisonReport(List<ComparisonRow> rows) {
+        return comparisonReport(rows, 10, null);
+    }
+
+    private static ComparisonReport comparisonReport(List<ComparisonRow> rows,
+                                                      int expectedQuestionCount,
+                                                      Path checkpointPath) {
+        Map<String, java.util.function.Function<ComparisonRow, ModeCell>> selectors = Map.of(
+                "A", ComparisonRow::noRag, "B", ComparisonRow::baseline,
+                "C", ComparisonRow::filter, "D", ComparisonRow::full);
+        Map<String, Integer> missing = new LinkedHashMap<>();
+        selectors.forEach((mode, selector) -> missing.put(mode,
+                (int) rows.stream().filter(row -> selector.apply(row) == null).count()));
         List<ModeSummary> summaries = List.of(
-                summarize("A no-rag", rows, ComparisonRow::noRag, false),
-                summarize("B baseline", rows, ComparisonRow::baseline, true),
-                summarize("C filter", rows, ComparisonRow::filter, true),
-                summarize("D full", rows, ComparisonRow::full, true));
+                summarize("A no-rag", rows, ComparisonRow::noRag, false, missing.get("A")),
+                summarize("B baseline", rows, ComparisonRow::baseline, true, missing.get("B")),
+                summarize("C filter", rows, ComparisonRow::filter, true, missing.get("C")),
+                summarize("D full", rows, ComparisonRow::full, true, missing.get("D")));
         StringBuilder out = new StringBuilder("# RAG comparison eval — ").append(LocalDate.now())
                 .append("\n\nВопросов: ").append(rows.size())
                 .append("/10. Поиск D объединяет исходный и переписанный запрос в одну строку; "
-                        + "ответная модель всегда получает исходный вопрос.\n\n")
-                .append("| Режим | факты | recall@5/sourceHit | precision чанков | cited | filtered | refusals на ловушке | среднее, с | error/empty |\n")
-                .append("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+                        + "ответная модель всегда получает исходный вопрос.\n")
+                .append("Чекпойнт: ").append(checkpointPath == null ? "in-memory" : checkpointPath)
+                .append("\nВопросов в текущем срезе / questions.json: ").append(rows.size())
+                .append('/').append(expectedQuestionCount)
+                .append("\nНедостающие пары A/B/C/D: ").append(missing.get("A")).append('/')
+                .append(missing.get("B")).append('/').append(missing.get("C")).append('/')
+                .append(missing.get("D")).append(".\n\n")
+                .append("| Режим | факты | recall@5/sourceHit | precision чанков | cited | filtered | refusals на ловушке | среднее, с | error/timeout/empty | missing |\n")
+                .append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
         for (ModeSummary summary : summaries) {
             out.append("| ").append(summary.mode()).append(" | ").append(summary.facts())
                     .append(" | ").append(summary.sourceHits()).append('/').append(summary.answerable())
@@ -330,7 +491,9 @@ public final class RagEval {
                     .append(" | ").append(summary.cited()).append(" | ").append(summary.filtered())
                     .append(" | ").append(summary.refusals()).append(" | ")
                     .append(String.format(Locale.ROOT, "%.2f", summary.averageMs() / 1000.0))
-                    .append(" | ").append(summary.errors()).append('/').append(summary.empty())
+                    .append(" | ").append(summary.errors()).append('/').append(summary.timeouts())
+                    .append('/').append(summary.empty())
+                    .append(" | ").append(summary.missingPairs())
                     .append(" |\n");
         }
         out.append("\n| # | вопрос | A факты/status | B факты/sourceHit/precision/cited | "
@@ -339,7 +502,7 @@ public final class RagEval {
         for (int i = 0; i < rows.size(); i++) {
             ComparisonRow row = rows.get(i);
             out.append("| ").append(i + 1).append(" | ").append(table(row.question().question()))
-                    .append(" | ").append(row.noRag().facts()).append('/').append(row.noRag().status())
+                    .append(" | ").append(cellText(row.noRag()))
                     .append(" | ").append(cellText(row.baseline()))
                     .append(" | ").append(cellText(row.filter()))
                     .append(" | ").append(cellText(row.full())).append(" |\n");
@@ -356,27 +519,41 @@ public final class RagEval {
             appendModeAnswer(out, "C filter", row.filter());
             appendModeAnswer(out, "D full", row.full());
         }
-        return new ComparisonReport(rows, summaries, out.toString());
+        out.append("\n## Недостающие пары\n\n");
+        for (ComparisonRow row : rows) {
+            String[] modes = {"A", "B", "C", "D"};
+            ModeCell[] cells = {row.noRag(), row.baseline(), row.filter(), row.full()};
+            for (int i = 0; i < modes.length; i++) {
+                if (cells[i] == null) out.append("- ").append(row.question().id())
+                        .append('/').append(modes[i]).append('\n');
+            }
+        }
+        return new ComparisonReport(rows, summaries, out.toString(), missing, checkpointPath);
     }
 
     private static ModeSummary summarize(String name, List<ComparisonRow> rows,
                                          java.util.function.Function<ComparisonRow, ModeCell> get,
-                                         boolean withRag) {
-        List<ModeCell> cells = rows.stream().map(get).toList();
+                                         boolean withRag, int missingPairs) {
+        List<ModeCell> cells = rows.stream().map(get).filter(java.util.Objects::nonNull).toList();
         int answerable = withRag ? (int) rows.stream()
                 .filter(row -> !row.question().noAnswerExpected()).count() : 0;
         int sourceHits = (int) rows.stream().filter(row -> !row.question().noAnswerExpected())
-                .filter(row -> get.apply(row).sourceHit()).count();
-        long relevantChunks = withRag ? rows.stream()
-                .filter(row -> !row.question().noAnswerExpected())
-                .mapToLong(row -> get.apply(row).result().chunks().stream().filter(chunk ->
-                        matchesAnySource(chunk.source(), row.question().expectedSources())).count())
-                .sum() : 0;
-        long totalChunks = withRag ? rows.stream()
-                .filter(row -> !row.question().noAnswerExpected())
-                .mapToLong(row -> get.apply(row).result().chunks().size()).sum() : 0;
+                .map(get).filter(java.util.Objects::nonNull).filter(ModeCell::sourceHit).count();
+        long relevantChunks = 0;
+        long totalChunks = 0;
+        if (withRag) {
+            for (ComparisonRow row : rows) {
+                if (row.question().noAnswerExpected()) continue;
+                ModeCell cell = get.apply(row);
+                if (cell == null) continue;
+                totalChunks += cell.result().chunks().size();
+                relevantChunks += cell.result().chunks().stream().filter(chunk ->
+                        matchesAnySource(chunk.source(), row.question().expectedSources())).count();
+            }
+        }
         double precision = totalChunks == 0 ? 0 : (double) relevantChunks / totalChunks;
         int errors = (int) cells.stream().filter(cell -> "error".equals(cell.status())).count();
+        int timeouts = (int) cells.stream().filter(cell -> "timeout".equals(cell.status())).count();
         int empty = (int) cells.stream().filter(cell -> "empty".equals(cell.status())).count();
         return new ModeSummary(name, cells.stream().mapToInt(ModeCell::facts).sum(), sourceHits,
                 answerable, precision, (int) cells.stream().filter(ModeCell::cited).count(),
@@ -384,10 +561,11 @@ public final class RagEval {
                 (int) cells.stream().filter(ModeCell::refusal).count(),
                 cells.stream().mapToLong(cell -> cell.result().retrieveMs()
                         + cell.result().rewriteMs() + cell.result().llmMs()).average().orElse(0),
-                errors, empty);
+                errors, timeouts, empty, missingPairs);
     }
 
     private static String cellText(ModeCell cell) {
+        if (cell == null) return "missing";
         return cell.facts() + "/" + (cell.sourceHit() ? "hit" : "miss") + "/"
                 + String.format(Locale.ROOT, "%.2f", cell.chunkPrecision()) + "/"
                 + (cell.cited() ? "cited" : "uncited") + "/f=" + cell.filteredCandidates()
@@ -395,6 +573,10 @@ public final class RagEval {
     }
 
     private static void appendModeAnswer(StringBuilder out, String title, ModeCell cell) {
+        if (cell == null) {
+            out.append("### ").append(title).append("\n\nРезультат отсутствует (пара не выполнена).\n\n");
+            return;
+        }
         RagService.Result result = cell.result();
         out.append("### ").append(title).append("\n\n")
                 .append(result.status() == RagService.Status.OK ? fenced(result.answer())
@@ -423,38 +605,99 @@ public final class RagEval {
         Calibration fixedData = calibrate("fixed", questions, fixed);
         Calibration structureData = calibrate("structure", questions, structure);
         StringBuilder out = new StringBuilder("# Калибровка порога cosine similarity\n\n")
-                .append("| Индекс | вопрос | best score | expected-source score |\n")
-                .append("|---|---|---:|---:|\n");
+                .append("| Индекс | вопрос | лучший score | expected-source score | ранг expected | "
+                        + "кандидатов | min | median | max |\n")
+                .append("|---|---|---:|---:|---:|---:|---:|---:|---:|\n");
         appendCalibrationRows(out, fixedData);
         appendCalibrationRows(out, structureData);
         List<ThresholdMetrics> fixedMetrics = scanMetrics(fixedData);
         List<ThresholdMetrics> structureMetrics = scanMetrics(structureData);
-        out.append("\n| Индекс | порог | нужные сохранены | мусор отсечён | вопросов без контекста | ловушка отсечена |\n")
+        out.append("\nМетрики считают чанки top-20: нужные — из expectedSources, мусорные — остальные; "
+                + "потеря по правилу выбора не более одного нужного чанка на весь набор.\n\n")
+                .append("| Индекс | порог | нужных сохранено | мусорных отсечено | вопросов без контекста | ловушка отсечена |\n")
                 .append("|---|---:|---:|---:|---:|:---:|\n");
         appendMetrics(out, "fixed", fixedMetrics);
         appendMetrics(out, "structure", structureMetrics);
         ThresholdMetrics selectedFixed = selectThreshold(fixedMetrics);
         ThresholdMetrics selectedStructure = selectThreshold(structureMetrics);
-        boolean calibrated = selectedFixed != null || selectedStructure != null;
-        boolean structureWins = selectedFixed == null || (selectedStructure != null
-                && selectedStructure.junkDropped() >= selectedFixed.junkDropped());
-        ThresholdMetrics selected = structureWins ? selectedStructure : selectedFixed;
-        String selectedStrategy = structureWins ? "structure" : "fixed";
-        double threshold = selected == null ? RagSettings.DEFAULT_MIN_SCORE : selected.threshold();
-        out.append("\nВыбор: порог ").append(String.format(Locale.ROOT, "%.2f", threshold))
-                .append(", индекс по умолчанию — ").append(selectedStrategy).append(". ");
-        if (selected == null) {
-            out.append("Для сетки не нашлось порога, одновременно удовлетворяющего правилам; "
-                            + "оставлено стартовое значение ")
-                    .append(String.format(Locale.ROOT, "%.2f", threshold)).append(".\n");
+        String selectedStrategy;
+        double threshold;
+        Double relativeDelta = null;
+        int selectedJunk;
+        int selectedLoss;
+        int selectedNeededKept;
+        int selectedNeededTotal;
+        boolean selectedTrapFiltered;
+        boolean calibrated;
+        if (selectedFixed != null || selectedStructure != null) {
+            boolean structureWins = selectedFixed == null || (selectedStructure != null
+                    && selectedStructure.junkDropped() >= selectedFixed.junkDropped());
+            ThresholdMetrics selected = structureWins ? selectedStructure : selectedFixed;
+            selectedStrategy = structureWins ? "structure" : "fixed";
+            threshold = selected.threshold();
+            selectedJunk = selected.junkDropped();
+            selectedLoss = selected.neededTotal() - selected.neededKept();
+            selectedNeededKept = selected.neededKept();
+            selectedNeededTotal = selected.neededTotal();
+            selectedTrapFiltered = selected.trapFiltered();
+            calibrated = true;
         } else {
-            out.append("Правило: максимум отсечённого мусора при потере не более одного "
-                            + "нужного чанка и обязательном отсечении ловушки. ")
-                    .append("Выбрано отсечение мусора ").append(selected.junkDropped())
-                    .append("; потеря нужных — ").append(selected.neededTotal() - selected.neededKept())
-                    .append(" из ").append(selected.neededTotal()).append(".\n");
+            List<RelativeMetrics> fixedRelative = scanRelativeMetrics(fixedData);
+            List<RelativeMetrics> structureRelative = scanRelativeMetrics(structureData);
+            out.append("\nАбсолютный порог не удовлетворил одновременно сохранению нужных чанков "
+                    + "и отсечению ловушки; проверяю relative score >= max_score − delta.\n\n")
+                    .append("| Индекс | floor | delta | нужных сохранено | мусорных отсечено | "
+                            + "вопросов без контекста | ловушка отсечена |\n")
+                    .append("|---|---:|---:|---:|---:|---:|:---:|\n");
+            appendRelativeMetrics(out, "fixed", fixedRelative);
+            appendRelativeMetrics(out, "structure", structureRelative);
+            RelativeMetrics fixedChoice = selectRelative(fixedRelative);
+            RelativeMetrics structureChoice = selectRelative(structureRelative);
+            calibrated = fixedChoice != null || structureChoice != null;
+            boolean fixedStrict = fixedChoice != null;
+            boolean structureStrict = structureChoice != null;
+            if (fixedChoice == null) fixedChoice = selectRelativeCompromise(fixedRelative);
+            if (structureChoice == null) structureChoice = selectRelativeCompromise(structureRelative);
+            int comparison = fixedStrict != structureStrict ? Boolean.compare(structureStrict, fixedStrict)
+                    : fixedStrict ? compareRelativeValid(structureChoice, fixedChoice)
+                    : compareRelativeCompromise(structureChoice, fixedChoice);
+            boolean structureWins = comparison >= 0;
+            RelativeMetrics choice = structureWins ? structureChoice : fixedChoice;
+            selectedStrategy = structureWins ? "structure" : "fixed";
+            threshold = choice.floor();
+            relativeDelta = choice.delta();
+            selectedJunk = choice.junkDropped();
+            selectedLoss = choice.neededTotal() - choice.neededKept();
+            selectedNeededKept = choice.neededKept();
+            selectedNeededTotal = choice.neededTotal();
+            selectedTrapFiltered = choice.trapFiltered();
         }
-        return new ThresholdScanReport(out.toString(), threshold, selectedStrategy, calibrated);
+        out.append("\nВыбор: порог ").append(String.format(Locale.ROOT, "%.2f", threshold))
+                .append(", индекс по умолчанию — ").append(selectedStrategy);
+        if (relativeDelta != null) out.append(", relativeDelta=")
+                .append(String.format(Locale.ROOT, "%.2f", relativeDelta));
+        out.append(". ");
+        if (!calibrated) {
+            out.append("Ни один абсолютный и относительный порог не удовлетворяет правилу. "
+                    + "Лучший компромисс (он будет применён): сохранено нужных чанков ")
+                    .append(selectedNeededKept).append('/').append(selectedNeededTotal)
+                    .append(", потеря нужных — ").append(selectedLoss)
+                    .append(", ловушка отсечена — ")
+                    .append(selectedTrapFiltered ? "да" : "нет")
+                    .append(", отсечено мусорных — ").append(selectedJunk)
+                    .append(". Применён relative score >= max_score − delta с floor=")
+                    .append(String.format(Locale.ROOT, "%.2f", threshold))
+                    .append(", delta=").append(String.format(Locale.ROOT, "%.2f", relativeDelta))
+                    .append(", index=").append(selectedStrategy).append(".\n");
+        } else {
+            out.append(relativeDelta == null ? "Абсолютное правило" : "Относительный компромисс")
+                    .append(": максимум отсечённого мусора при потере не более одного "
+                            + "нужного чанка и обязательном отсечении ловушки. ")
+                    .append("Отсечено мусорных ").append(selectedJunk)
+                    .append("; потеря нужных — ").append(selectedLoss).append(".\n");
+        }
+        return new ThresholdScanReport(out.toString(), threshold, selectedStrategy,
+                calibrated, relativeDelta);
     }
 
     private static Calibration calibrate(String name, List<Question> questions,
@@ -470,22 +713,35 @@ public final class RagEval {
         for (Question question : calibration.questions()) {
             List<RagRetriever.Chunk> chunks = calibration.chunks().get(question.id());
             double best = chunks.stream().mapToDouble(RagRetriever.Chunk::score).max().orElse(0);
-            double expected = chunks.stream().filter(chunk -> !question.noAnswerExpected()
-                    && matchesAnySource(chunk.source(), question.expectedSources()))
-                    .mapToDouble(RagRetriever.Chunk::score).max().orElse(0);
+            int expectedRank = 0;
+            double expected = 0;
+            for (int i = 0; i < chunks.size(); i++) {
+                if (!question.noAnswerExpected()
+                        && matchesAnySource(chunks.get(i).source(), question.expectedSources())) {
+                    expectedRank = i + 1;
+                    expected = chunks.get(i).score();
+                    break;
+                }
+            }
+            List<Double> scores = chunks.stream().map(RagRetriever.Chunk::score).sorted().toList();
+            String minimum = scores.isEmpty() ? "—" : score(scores.get(0));
+            String median = scores.isEmpty() ? "—" : score(median(scores));
+            String maximum = scores.isEmpty() ? "—" : score(scores.get(scores.size() - 1));
             out.append("| ").append(calibration.name()).append(" | ").append(table(question.id()))
-                    .append(" | ").append(String.format(Locale.ROOT, "%.6f", best))
-                    .append(" | ").append(question.noAnswerExpected() ? "—"
-                            : String.format(Locale.ROOT, "%.6f", expected)).append(" |\n");
+                    .append(" | ").append(score(best))
+                    .append(" | ").append(question.noAnswerExpected() || expectedRank == 0 ? "—"
+                            : score(expected)).append(" | ").append(expectedRank == 0 ? "—" : expectedRank)
+                    .append(" | ").append(chunks.size()).append(" | ").append(minimum)
+                    .append(" | ").append(median).append(" | ").append(maximum).append(" |\n");
         }
     }
 
     private static List<ThresholdMetrics> scanMetrics(Calibration calibration) {
         List<ThresholdMetrics> result = new ArrayList<>();
-        int neededTotal = (int) calibration.questions().stream()
-                .filter(question -> !question.noAnswerExpected()).count();
-        for (double threshold : List.of(0.25, 0.30, 0.35, 0.40, 0.45, 0.50)) {
+        for (int step = 25; step <= 70; step += 5) {
+            double threshold = step / 100.0;
             int neededKept = 0;
+            int neededTotal = 0;
             int junkDropped = 0;
             int noContext = 0;
             boolean trapFiltered = false;
@@ -499,9 +755,12 @@ public final class RagEval {
                     junkDropped += (int) chunks.stream().filter(chunk -> chunk.score() < threshold).count();
                     continue;
                 }
-                boolean expectedKept = kept.stream().anyMatch(chunk ->
-                        matchesAnySource(chunk.source(), question.expectedSources()));
-                if (expectedKept) neededKept++;
+                int expectedChunks = (int) chunks.stream().filter(chunk ->
+                        matchesAnySource(chunk.source(), question.expectedSources())).count();
+                int expectedKept = (int) kept.stream().filter(chunk ->
+                        matchesAnySource(chunk.source(), question.expectedSources())).count();
+                neededTotal += expectedChunks;
+                neededKept += expectedKept;
                 junkDropped += (int) chunks.stream().filter(chunk -> chunk.score() < threshold)
                         .filter(chunk -> !matchesAnySource(chunk.source(), question.expectedSources())).count();
             }
@@ -527,6 +786,264 @@ public final class RagEval {
                         && metric.trapFiltered())
                 .max(java.util.Comparator.comparingInt(ThresholdMetrics::junkDropped)
                         .thenComparingDouble(ThresholdMetrics::threshold)).orElse(null);
+    }
+
+    private static List<RelativeMetrics> scanRelativeMetrics(Calibration calibration) {
+        List<RelativeMetrics> metrics = new ArrayList<>();
+        for (int floorStep = 25; floorStep <= 70; floorStep += 5) {
+            double floor = floorStep / 100.0;
+            for (int deltaStep = 5; deltaStep <= 50; deltaStep += 5) {
+                double delta = deltaStep / 100.0;
+                int neededKept = 0;
+                int neededTotal = 0;
+                int junkDropped = 0;
+                int noContext = 0;
+                boolean trapFiltered = false;
+                for (Question question : calibration.questions()) {
+                    List<RagRetriever.Chunk> chunks = calibration.chunks().get(question.id());
+                    double best = chunks.stream().mapToDouble(RagRetriever.Chunk::score).max().orElse(0);
+                    double cutoff = Math.max(floor, best - delta);
+                    List<RagRetriever.Chunk> kept = best < floor ? List.of()
+                            : chunks.stream().filter(chunk -> chunk.score() >= cutoff).toList();
+                    if (kept.isEmpty()) noContext++;
+                    if (question.noAnswerExpected()) {
+                        trapFiltered = kept.isEmpty();
+                        junkDropped += chunks.size() - kept.size();
+                        continue;
+                    }
+                    int expectedChunks = (int) chunks.stream().filter(chunk ->
+                            matchesAnySource(chunk.source(), question.expectedSources())).count();
+                    int expectedKept = (int) kept.stream().filter(chunk ->
+                            matchesAnySource(chunk.source(), question.expectedSources())).count();
+                    neededTotal += expectedChunks;
+                    neededKept += expectedKept;
+                    junkDropped += (int) chunks.stream().filter(chunk -> !kept.contains(chunk))
+                            .filter(chunk -> !matchesAnySource(chunk.source(), question.expectedSources()))
+                            .count();
+                }
+                metrics.add(new RelativeMetrics(floor, delta, neededKept, neededTotal,
+                        junkDropped, noContext, trapFiltered));
+            }
+        }
+        return metrics;
+    }
+
+    private static void appendRelativeMetrics(StringBuilder out, String name,
+                                              List<RelativeMetrics> metrics) {
+        for (RelativeMetrics metric : metrics) {
+            out.append("| ").append(name).append(" | ")
+                    .append(String.format(Locale.ROOT, "%.2f", metric.floor())).append(" | ")
+                    .append(String.format(Locale.ROOT, "%.2f", metric.delta())).append(" | ")
+                    .append(metric.neededKept()).append('/').append(metric.neededTotal()).append(" | ")
+                    .append(metric.junkDropped()).append(" | ").append(metric.noContext()).append(" | ")
+                    .append(metric.trapFiltered() ? "да" : "нет").append(" |\n");
+        }
+    }
+
+    private static RelativeMetrics selectRelative(List<RelativeMetrics> metrics) {
+        return metrics.stream().filter(metric ->
+                        metric.neededTotal() - metric.neededKept() <= 1 && metric.trapFiltered())
+                .max(Comparator.comparingInt(RelativeMetrics::junkDropped)
+                        .thenComparingDouble(RelativeMetrics::floor)
+                        .thenComparing(metric -> -metric.delta())).orElse(null);
+    }
+
+    private static RelativeMetrics selectRelativeCompromise(List<RelativeMetrics> metrics) {
+        return metrics.stream().max(Comparator
+                .comparing(RelativeMetrics::trapFiltered)
+                .thenComparingInt(metric -> -(metric.neededTotal() - metric.neededKept()))
+                .thenComparingInt(RelativeMetrics::junkDropped)
+                .thenComparingInt(metric -> -metric.noContext())
+                .thenComparingDouble(RelativeMetrics::floor)
+                .thenComparing(metric -> -metric.delta())).orElse(null);
+    }
+
+    private static int compareRelativeValid(RelativeMetrics left, RelativeMetrics right) {
+        int compare = Integer.compare(left.junkDropped(), right.junkDropped());
+        if (compare != 0) return compare;
+        compare = Double.compare(left.floor(), right.floor());
+        return compare != 0 ? compare : Double.compare(right.delta(), left.delta());
+    }
+
+    private static int compareRelativeCompromise(RelativeMetrics left, RelativeMetrics right) {
+        int compare = Boolean.compare(left.trapFiltered(), right.trapFiltered());
+        if (compare != 0) return compare;
+        compare = Integer.compare(right.neededTotal() - right.neededKept(),
+                left.neededTotal() - left.neededKept());
+        if (compare != 0) return compare;
+        compare = Integer.compare(left.junkDropped(), right.junkDropped());
+        if (compare != 0) return compare;
+        compare = Integer.compare(right.noContext(), left.noContext());
+        if (compare != 0) return compare;
+        compare = Double.compare(left.floor(), right.floor());
+        return compare != 0 ? compare : Double.compare(right.delta(), left.delta());
+    }
+
+    private static double median(List<Double> sorted) {
+        int size = sorted.size();
+        if (size % 2 == 1) return sorted.get(size / 2);
+        return (sorted.get(size / 2 - 1) + sorted.get(size / 2)) / 2.0;
+    }
+
+    private static String score(double value) {
+        return String.format(Locale.ROOT, "%.6f", value);
+    }
+
+    /** Retrieves once per question, then compares general rerank weights without LLM calls. */
+    public static RerankAnalysisReport rerankAnalysis(List<Question> questions,
+                                                       RagRetriever retriever,
+                                                       RagSettings settings)
+            throws IOException, InterruptedException {
+        List<AnalysisQuestion> benchmark = questions.stream().map(question ->
+                new AnalysisQuestion(question.id(), question.question(), question.expectedSources()))
+                .collect(Collectors.toCollection(ArrayList::new));
+        benchmark.add(new AnalysisQuestion("filter-rewrite",
+                "Как фильтр релевантности и query rewrite выбирают чанки для RAG?",
+                "src/main/java/com/example/rag/RagReranker.java"
+                        + "|src/main/java/com/example/rag/RagQueryRewriter.java"));
+
+        Map<String, List<RagRetriever.Chunk>> candidatesById = new LinkedHashMap<>();
+        for (AnalysisQuestion question : benchmark) {
+            candidatesById.put(question.id(), retriever.retrieve(question.question(), 20));
+        }
+
+        List<RagReranker.Weights> weightGrid = List.of(
+                new RagReranker.Weights(0.70, 0.30),
+                new RagReranker.Weights(0.80, 0.20),
+                new RagReranker.Weights(0.85, 0.15),
+                new RagReranker.Weights(0.90, 0.10),
+                new RagReranker.Weights(0.95, 0.05),
+                new RagReranker.Weights(1.00, 0.00));
+        RagSettings compareSettings = new RagSettings(Math.max(20, settings.topKBefore()), 5,
+                settings.minScore(), true, false, settings.rerankVectorWeight(),
+                settings.rerankLexicalWeight(), settings.relativeDelta(), settings.diversityEnabled());
+        List<Question> answerable = questions.stream().filter(q -> !q.noAnswerExpected()).toList();
+        int baselineHits = 0;
+        long baselineRelevant = 0;
+        long baselineTotal = 0;
+        Map<String, Boolean> baselineHitByQuestion = new LinkedHashMap<>();
+        for (Question question : answerable) {
+            List<RagRetriever.Chunk> baseline = candidatesById.get(question.id()).stream()
+                    .limit(5).toList();
+            boolean hit = sourceMatch(baseline, question.expectedSources());
+            baselineHitByQuestion.put(question.id(), hit);
+            if (hit) baselineHits++;
+            baselineRelevant += baseline.stream().filter(chunk ->
+                    matchesAnySource(chunk.source(), question.expectedSources())).count();
+            baselineTotal += baseline.size();
+        }
+        double baselinePrecision = baselineTotal == 0 ? 0
+                : (double) baselineRelevant / baselineTotal;
+
+        RagReranker reranker = new RagReranker();
+        List<WeightMetric> metrics = new ArrayList<>();
+        for (RagReranker.Weights weights : weightGrid) {
+            for (boolean diversity : List.of(true, false)) {
+                int hits = 0;
+                int noWorse = 0;
+                long relevant = 0;
+                long total = 0;
+                for (Question question : answerable) {
+                    RagReranker.Result reranked = reranker.process(question.question(),
+                            candidatesById.get(question.id()), compareSettings, weights, diversity);
+                    boolean hit = sourceMatch(reranked.selected().stream()
+                            .map(RagReranker.ScoredChunk::chunk).toList(), question.expectedSources());
+                    if (hit) hits++;
+                    if (hit || !baselineHitByQuestion.get(question.id())) noWorse++;
+                    relevant += reranked.selected().stream().filter(item ->
+                            matchesAnySource(item.chunk().source(), question.expectedSources())).count();
+                    total += reranked.selected().size();
+                }
+                double precision = total == 0 ? 0 : (double) relevant / total;
+                boolean valid = precision + 1e-12 >= Math.max(RERANK_PRECISION_FLOOR, baselinePrecision)
+                        && noWorse == answerable.size();
+                metrics.add(new WeightMetric(weights, hits, noWorse, precision, valid, diversity));
+            }
+        }
+        WeightMetric chosen = metrics.stream().filter(WeightMetric::valid)
+                .max(Comparator.comparingDouble((WeightMetric metric) ->
+                        metric.weights().lexical())
+                        .thenComparing(WeightMetric::diversity)).orElse(null);
+        boolean constraintsMet = chosen != null;
+        if (chosen == null) chosen = metrics.stream().max(Comparator
+                .comparingInt(WeightMetric::noWorseQuestions)
+                .thenComparingDouble(WeightMetric::precision)
+                .thenComparingDouble(metric -> metric.weights().lexical())
+                .thenComparing(WeightMetric::diversity)).orElseThrow();
+
+        StringBuilder out = new StringBuilder("# Rerank weight analysis — ")
+                .append(LocalDate.now()).append("\n\n")
+                .append("Vector top-5 baseline: sourceHit ").append(baselineHits).append('/')
+                .append(answerable.size()).append(", precision ")
+                .append(String.format(Locale.ROOT, "%.3f", baselinePrecision))
+                .append("; required precision floor ")
+                .append(String.format(Locale.ROOT, "%.3f",
+                        Math.max(RERANK_PRECISION_FLOOR, baselinePrecision))).append(".\n\n")
+                .append("| vectorWeight | lexicalWeight | diversity cap | sourceHit | no-worse questions | precision | satisfies constraints |\n")
+                .append("|---:|---:|:---:|---:|---:|---:|:---:|\n");
+        for (WeightMetric metric : metrics) {
+            out.append("| ").append(score(metric.weights().vector())).append(" | ")
+                    .append(score(metric.weights().lexical())).append(" | ")
+                    .append(metric.diversity() ? "on" : "off").append(" | ")
+                    .append(metric.sourceHits()).append('/').append(answerable.size()).append(" | ")
+                    .append(metric.noWorseQuestions()).append('/').append(answerable.size()).append(" | ")
+                    .append(String.format(Locale.ROOT, "%.3f", metric.precision())).append(" | ")
+                    .append(metric.valid() ? "да" : "нет").append(" |\n");
+        }
+        out.append("\nВес для рабочего default: vector=")
+                .append(score(chosen.weights().vector())).append(", lexical=")
+                .append(score(chosen.weights().lexical())).append(", diversityCap=")
+                .append(chosen.diversity() ? "on" : "off").append("; ограничения ")
+                .append(constraintsMet ? "соблюдены" : "не удалось выполнить одновременно")
+                .append(".\n\n## Правила реранкера\n\n")
+                .append("- Итоговый score = vectorWeight × cosine + lexicalWeight × lexicalScore.\n")
+                .append("- Идентификаторы и camelCase-компоненты получают вес термина 2; "
+                        + "стоп-слова исключаются.\n")
+                .append("- Одно совпадение в пути/заголовке добавляет metadata bonus ")
+                .append(String.format(Locale.ROOT, "%.2f", RagReranker.METADATA_BONUS)).append(".\n")
+                .append("- Diversity cap ограничивает до двух чанков на файл при наличии "
+                        + "альтернативных файлов.\n\n## Ранги кандидатов\n");
+        Set<String> detailIds = Set.of("history-lock", "context-layers", "mcp-agent-flow",
+                "fixed-limits", "filter-rewrite");
+        for (AnalysisQuestion question : benchmark) {
+            if (!detailIds.contains(question.id())) continue;
+            List<RagRetriever.Chunk> candidates = candidatesById.get(question.id());
+            RagReranker.Result reranked = reranker.process(question.question(), candidates,
+                    compareSettings, chosen.weights(), chosen.diversity());
+            Map<String, Integer> finalRanks = new LinkedHashMap<>();
+            for (int i = 0; i < reranked.selected().size(); i++) {
+                finalRanks.put(reranked.selected().get(i).chunk().chunkId(), i + 1);
+            }
+            Map<String, Integer> scoreRanks = new LinkedHashMap<>();
+            List<RagReranker.ScoredChunk> sorted = reranked.candidates().stream()
+                    .sorted(Comparator.comparingDouble(RagReranker.ScoredChunk::finalScore).reversed())
+                    .toList();
+            for (int i = 0; i < sorted.size(); i++) {
+                scoreRanks.put(sorted.get(i).chunk().chunkId(), i + 1);
+            }
+            out.append("\n### ").append(question.id()).append(" — ")
+                    .append(question.question()).append("\n\n")
+                    .append("| Чанк | vector rank | rerank rank | lexicalScore | reason |\n")
+                    .append("|---|---:|---:|---:|---|\n");
+            for (int i = 0; i < candidates.size(); i++) {
+                RagRetriever.Chunk chunk = candidates.get(i);
+                RagReranker.ScoredChunk scored = reranked.candidates().stream()
+                        .filter(item -> item.chunk().chunkId().equals(chunk.chunkId()))
+                        .findFirst().orElseThrow();
+                boolean expected = !question.expectedSources().isBlank()
+                        && matchesAnySource(chunk.source(), question.expectedSources());
+                out.append("| ").append(table(chunk.source() + " › " + chunk.section()))
+                        .append(" | ").append(i + 1).append(" | ")
+                        .append(finalRanks.getOrDefault(chunk.chunkId(),
+                                scoreRanks.getOrDefault(chunk.chunkId(), 0)))
+                        .append(" | ").append(score(scored.lexicalScore())).append(" | ")
+                        .append(expected ? "expectedSources" : "нет")
+                        .append(finalRanks.containsKey(chunk.chunkId()) ? "; selected" : "; вне top-5")
+                        .append("; ").append(scored.reason()).append(" |\n");
+            }
+        }
+        return new RerankAnalysisReport(out.toString(), chosen.weights(), chosen.diversity(), baselinePrecision,
+                chosen.precision(), baselineHits, chosen.sourceHits(), answerable.size(), constraintsMet);
     }
 
     private static Row evaluate(Question question, RagService.Result off, RagService.Result on) {
@@ -821,6 +1338,21 @@ public final class RagEval {
     public static Path liveLogPath(Path home, LocalDate date) {
         return home.resolve(".ai-advent-agent").resolve("rag-results")
                 .resolve("rag-live-" + date + ".log");
+    }
+
+    public static Path thresholdScanPath(Path home, LocalDate date) {
+        return home.resolve(".ai-advent-agent").resolve("rag-results")
+                .resolve("threshold-scan-" + date + ".md");
+    }
+
+    public static Path rerankAnalysisPath(Path home, LocalDate date) {
+        return home.resolve(".ai-advent-agent").resolve("rag-results")
+                .resolve("rerank-analysis-" + date + ".md");
+    }
+
+    public static Path checkpointPath(Path home, LocalDate date) {
+        return home.resolve(".ai-advent-agent").resolve("rag-results")
+                .resolve("rag-eval-checkpoint-" + date + ".json");
     }
 
     public static void writeReport(Path target, String contents) throws IOException {

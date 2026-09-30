@@ -4126,15 +4126,30 @@ public final class Main {
             }
             return;
         }
-        if (lower.equals("eval")) {
+        if (lower.equals("rerank-analysis")) {
             try {
+                ui.showSystem(ragRef.rerankAnalysis());
+            } catch (Exception e) {
+                ui.showError("Ошибка /rag rerank-analysis: " + safeError(e));
+            }
+            return;
+        }
+        if (lower.equals("eval") || lower.startsWith("eval ")) {
+            try {
+                RagEvalCommand evalCommand = parseRagEvalCommand(
+                        argument.length() > "eval".length()
+                                ? argument.substring("eval".length()).trim() : "");
                 java.time.LocalDate date = java.time.LocalDate.now();
                 Path homeReport = com.example.rag.RagEval.reportPath(
                         Path.of(System.getProperty("user.home")), date);
                 Path artifactReport = com.example.rag.RagEval.artifactPath(
                         Path.of(".").toAbsolutePath().normalize(), date);
-                com.example.rag.RagEval.ComparisonReport report = com.example.rag.RagEval.runModes(
-                        ragRef.service(agent), ragRef.settings, ui::showSystem, snapshot -> {
+                Path checkpoint = com.example.rag.RagEval.checkpointPath(
+                        Path.of(System.getProperty("user.home")), date);
+                com.example.rag.RagEval.ComparisonReport report =
+                        com.example.rag.RagEval.runResumable(ragRef.service(agent),
+                        ragRef.settings, evalCommand.modes(), evalCommand.questionIds(),
+                        evalCommand.resume(), checkpoint, ui::showSystem, snapshot -> {
                             try {
                                 com.example.rag.RagEval.writeReport(homeReport, snapshot.markdown());
                                 com.example.rag.RagEval.writeReport(artifactReport, snapshot.markdown());
@@ -4142,18 +4157,22 @@ public final class Main {
                                 throw new java.io.UncheckedIOException(e);
                             }
                         });
+                com.example.rag.RagEval.writeReport(homeReport, report.markdown());
+                com.example.rag.RagEval.writeReport(artifactReport, report.markdown());
                 for (String line : report.summaryLines()) {
                     ui.showSystem(line);
                 }
                 ui.showSystem("Отчёт: " + homeReport);
                 ui.showSystem("Копия: " + artifactReport);
+                ui.showSystem("Checkpoint: " + checkpoint);
             } catch (Exception e) {
                 ui.showError("Ошибка /rag eval: " + safeError(e));
             }
             return;
         }
         ui.showError("Использование: /rag on|off|status|config|set|ask <вопрос>|retrieval <вопрос>"
-                + "|threshold-scan|eval; подробности: /help /rag");
+                + "|threshold-scan|rerank-analysis|eval [режимы] [--questions ids] [--resume];"
+                + " подробности: /help /rag");
     }
 
     private static com.example.rag.RagSettings parseRagSettings(String command,
@@ -4174,6 +4193,46 @@ public final class Main {
         throw new IllegalArgumentException("неизвестная команда");
     }
 
+    record RagEvalCommand(List<String> modes, List<String> questionIds, boolean resume) {
+    }
+
+    static RagEvalCommand parseRagEvalCommand(String arguments) {
+        if (arguments == null || arguments.isBlank()) {
+            return new RagEvalCommand(List.of("A", "B", "C", "D"), List.of(), false);
+        }
+        String[] tokens = arguments.split("\\s+");
+        List<String> modes = null;
+        List<String> questionIds = List.of();
+        boolean resume = false;
+        for (int i = 0; i < tokens.length; i++) {
+            String token = tokens[i];
+            if (token.equals("--resume")) {
+                resume = true;
+            } else if (token.equals("--questions")) {
+                if (++i >= tokens.length || tokens[i].isBlank()) {
+                    throw new IllegalArgumentException("--questions требует список question id");
+                }
+                questionIds = parseRagEvalCsv(tokens[i], "question id");
+            } else if (token.startsWith("--")) {
+                throw new IllegalArgumentException("Неизвестная опция: " + token);
+            } else if (modes == null) {
+                modes = parseRagEvalCsv(token, "режим");
+            } else {
+                throw new IllegalArgumentException("Неожиданный аргумент: " + token);
+            }
+        }
+        if (modes == null) throw new IllegalArgumentException("Укажите режимы A,B,C,D");
+        return new RagEvalCommand(modes, questionIds, resume);
+    }
+
+    private static List<String> parseRagEvalCsv(String value, String label) {
+        List<String> parsed = java.util.Arrays.stream(value.split(",", -1)).toList();
+        if (parsed.stream().anyMatch(String::isBlank)) {
+            throw new IllegalArgumentException("Пустой элемент в списке: " + label);
+        }
+        return parsed;
+    }
+
     private static boolean parseOnOff(String value) {
         if (value.equalsIgnoreCase("on")) return true;
         if (value.equalsIgnoreCase("off")) return false;
@@ -4186,7 +4245,14 @@ public final class Main {
                 + ", topKAfter=" + ref.settings.topKAfter()
                 + ", minScore=" + String.format(java.util.Locale.ROOT, "%.2f", ref.settings.minScore())
                 + ", rerank=" + (ref.settings.rerankEnabled() ? "on" : "off")
+                + " (vector=" + String.format(java.util.Locale.ROOT, "%.2f",
+                ref.settings.rerankVectorWeight()) + ", lexical="
+                + String.format(java.util.Locale.ROOT, "%.2f", ref.settings.rerankLexicalWeight()) + ")"
+                + (ref.settings.relativeDelta() == null ? ""
+                : ", relativeDelta=" + String.format(java.util.Locale.ROOT, "%.2f",
+                ref.settings.relativeDelta()))
                 + ", rewrite=" + (ref.settings.rewriteEnabled() ? "on" : "off")
+                + ", diversity=" + (ref.settings.diversityEnabled() ? "on" : "off")
                 + ", index=" + ref.strategy
                 + "\nФайл: " + ref.settingsStore.file();
     }
@@ -4329,7 +4395,11 @@ public final class Main {
             com.example.rag.RagEval.ThresholdScanReport report =
                     com.example.rag.RagEval.thresholdScanDetails(
                             com.example.rag.RagEval.loadQuestions(), fixedRetriever, structureRetriever);
-            settings = settings.withMinScore(report.selectedThreshold());
+            Path reportPath = com.example.rag.RagEval.thresholdScanPath(
+                    Path.of(System.getProperty("user.home")), java.time.LocalDate.now());
+            com.example.rag.RagEval.writeReport(reportPath, report.markdown());
+            settings = settings.withMinScore(report.selectedThreshold())
+                    .withRelativeDelta(report.relativeDelta());
             strategy = report.selectedStrategy();
             saveState();
             if (!injectedService) {
@@ -4338,7 +4408,40 @@ public final class Main {
             }
             return report.markdown() + "\nПрименено и сохранено: minScore="
                     + String.format(java.util.Locale.ROOT, "%.2f", settings.minScore())
-                    + ", index=" + strategy + ".";
+                    + (settings.relativeDelta() == null ? ""
+                    : ", relativeDelta=" + String.format(java.util.Locale.ROOT, "%.2f",
+                    settings.relativeDelta()))
+                    + ", index=" + strategy + ".\nОтчёт: " + reportPath;
+        }
+
+        private String rerankAnalysis() throws Exception {
+            ensureRetrievers();
+            com.example.rag.RagRetriever selected = "fixed".equals(strategy)
+                    ? fixedRetriever : structureRetriever;
+            com.example.rag.RagEval.RerankAnalysisReport report =
+                    com.example.rag.RagEval.rerankAnalysis(
+                            com.example.rag.RagEval.loadQuestions(), selected, settings);
+            Path reportPath = com.example.rag.RagEval.rerankAnalysisPath(
+                    Path.of(System.getProperty("user.home")), java.time.LocalDate.now());
+            com.example.rag.RagEval.writeReport(reportPath, report.markdown());
+            if (report.constraintsMet()) {
+                settings = settings.withWeights(report.selectedWeights().vector(),
+                        report.selectedWeights().lexical()).withDiversity(report.selectedDiversity());
+                saveState();
+                if (!injectedService) {
+                    service = null;
+                    serviceAgent = null;
+                }
+            }
+            String applied = report.constraintsMet()
+                    ? "Веса сохранены: vector="
+                    + String.format(java.util.Locale.ROOT, "%.2f", settings.rerankVectorWeight())
+                    + ", lexical=" + String.format(java.util.Locale.ROOT, "%.2f",
+                    settings.rerankLexicalWeight()) + ", diversity="
+                    + (settings.diversityEnabled() ? "on" : "off") + "."
+                    : "Веса не сохранены: ни один набор не выполнил ограничения. "
+                    + "Текущие настройки оставлены без изменений.";
+            return report.markdown() + "\n" + applied + "\nОтчёт: " + reportPath;
         }
 
         private void ensureRetrievers() {

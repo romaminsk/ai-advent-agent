@@ -256,7 +256,13 @@ final class OrchestrationChecks extends SelfTestSupport {
                             }
                             return retryFlow.get(Math.min(call - 2, retryFlow.size() - 1));
                         }}).run("найди TODO");
-            expect("O29 429, 429, затем успех — флоу завершён", !retryOutcome.stopped()
+            String retryDiagnostics = "stopped=" + retryOutcome.stopped()
+                    + ", reason=" + retryOutcome.stopReason()
+                    + ", calls=" + retryCalls.get()
+                    + ", steps=" + retryOutcome.steps().size()
+                    + ", fileExists=" + Files.exists(results.resolve("retry.md"));
+            expect("O29 429, 429, затем успех — флоу завершён (" + retryDiagnostics + ")",
+                    !retryOutcome.stopped()
                     && retryCalls.get() == retryFlow.size() + 2
                     && retryOutcome.answer().contains("retry.md")
                     && Files.exists(results.resolve("retry.md")));
@@ -289,7 +295,12 @@ final class OrchestrationChecks extends SelfTestSupport {
                             + "\"fileName\":\"fenced.md\"}}");
             McpOrchestrator.Outcome fencedOutcome = new McpOrchestrator(registry,
                     new SequenceModel(fencedFlow.toArray(String[]::new))).run("найди TODO");
-            expect("O31 ответ в ```json-обёртке и с текстом вокруг разбирается", !fencedOutcome.stopped()
+            String fencedDiagnostics = "stopped=" + fencedOutcome.stopped()
+                    + ", reason=" + fencedOutcome.stopReason()
+                    + ", steps=" + fencedOutcome.steps()
+                    + ", fileExists=" + Files.exists(results.resolve("fenced.md"));
+            expect("O31 ответ в ```json-обёртке и с текстом вокруг разбирается ("
+                    + fencedDiagnostics + ")", !fencedOutcome.stopped()
                     && fencedOutcome.steps().size() == 4
                     && fencedOutcome.steps().stream().noneMatch(step -> "invalid".equals(step.server()))
                     && Files.exists(results.resolve("fenced.md")));
