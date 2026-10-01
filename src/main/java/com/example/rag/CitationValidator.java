@@ -106,10 +106,14 @@ public final class CitationValidator {
                 .replaceAll("\\s+", " ").strip();
     }
 
-    /** Removes quote payloads from the answer portion; the formatter lists verified quotes below. */
+    /** Removes quote payloads and the model's own source/quote sections from the answer portion;
+     * display-only: validate() must keep quote sections, they carry the citations to check. */
     public static String answerText(String answer) {
         if (answer == null) return "";
-        return QUOTE.matcher(stripModelSources(answer)).replaceAll("").replaceAll("(?m)^[ \\t]*$", "")
+        String withoutSections = answer.replaceAll(
+                "(?isu)(?:^|\\n)\\s*(?:#{1,6}\\s*)?(?:источники|sources|цитаты|quotes)"
+                        + "[ \\t]*(?::|\\n|$).*", "");
+        return QUOTE.matcher(withoutSections).replaceAll("").replaceAll("(?m)^[ \\t]*$", "")
                 .replaceAll("\\n{3,}", "\n\n").strip();
     }
 

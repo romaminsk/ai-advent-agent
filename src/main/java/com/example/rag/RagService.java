@@ -315,9 +315,11 @@ public final class RagService {
                     throw new EmptyLlmAnswerException("Модель вернула пустой итоговый ответ.");
                 }
                 return answer;
-            } catch (EmptyLlmAnswerException empty) {
+            } catch (EmptyLlmAnswerException | LlmCallTimeoutException retriable) {
+                // Пустой ответ и таймаут повторяются один раз: разовый медленный
+                // или пустой ответ провайдера не должен ломать весь вопрос.
                 if (attempt >= RagConstants.EMPTY_RESPONSE_RETRIES) {
-                    throw empty;
+                    throw retriable;
                 }
             }
         }
