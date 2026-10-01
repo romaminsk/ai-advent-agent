@@ -4039,8 +4039,11 @@ public final class Main {
         String lower = argument.toLowerCase(java.util.Locale.ROOT);
         if (lower.isEmpty() || lower.equals("status")) {
             ui.showSystem("Режим RAG: " + (ragRef.enabled ? "включён" : "выключен")
-                    + " (индекс " + ragRef.strategy + ", top-"
-                    + ragRef.settings.topKAfter() + ").");
+                    + " (индекс " + ragRef.strategy + ", top-" + ragRef.settings.topKAfter()
+                    + ", minScore " + String.format(java.util.Locale.ROOT, "%.2f",
+                    ragRef.settings.minScore())
+                    + ", idkThreshold " + String.format(java.util.Locale.ROOT, "%.6f",
+                    ragRef.settings.idkThreshold()) + ").");
             return;
         }
         if (lower.equals("config")) {
@@ -4178,10 +4181,13 @@ public final class Main {
                         ? Path.of(System.getProperty("user.home"), ".ai-advent-agent",
                         "rag-results", "rag-citations-checkpoint-" + date + ".json")
                         : command.checkpoint();
-                Path reportPath = com.example.rag.RagCitationEval.reportPath(
-                        Path.of(System.getProperty("user.home")), date);
+                Path reportPath = command.report() == null
+                        ? com.example.rag.RagCitationEval.reportPath(
+                        Path.of(System.getProperty("user.home")), date)
+                        : command.report();
                 com.example.rag.RagCitationEval.Report report = ragRef.citationEval(agent,
-                        checkpoint, ui::showSystem, snapshot -> {
+                        checkpoint, citationEvalParameters(agent, ragRef.settings),
+                        ui::showSystem, snapshot -> {
                             try {
                                 com.example.rag.RagEval.writeReport(reportPath, snapshot.markdown());
                             } catch (java.io.IOException failure) {
@@ -4189,6 +4195,8 @@ public final class Main {
                             }
                         });
                 com.example.rag.RagEval.writeReport(reportPath, report.markdown());
+                ui.showSystem("Отвечено: " + report.answeredCount() + "/" + report.answerableTotal()
+                        + " из имеющих ответ");
                 ui.showSystem("Ответов с источниками: " + report.answersWithSources());
                 ui.showSystem("Ответов с цитатами: " + report.answersWithQuotes());
                 ui.showSystem("Средняя доля подтверждённых цитат: "
@@ -4196,7 +4204,10 @@ public final class Main {
                         report.confirmedQuoteFraction() * 100));
                 ui.showSystem("Средний cosine: "
                         + String.format(java.util.Locale.ROOT, "%.4f", report.averageCosine()));
-                ui.showSystem("Ловушка обработана: " + (report.trapHandled() ? "да" : "нет"));
+                ui.showSystem("Ловушка: " + (report.trapHandled() ? "да" : "нет"));
+                ui.showSystem("Длительность: всего "
+                        + String.format(java.util.Locale.ROOT, "%.1f с",
+                        report.totalDurationMs() / 1000.0));
                 ui.showSystem("Отчёт: " + reportPath);
                 ui.showSystem("Checkpoint: " + checkpoint);
             } catch (Exception e) {
@@ -4241,8 +4252,8 @@ public final class Main {
             return;
         }
         ui.showError("Использование: /rag on|off|status|config|set|ask <вопрос>|retrieval <вопрос>"
-                + "|threshold-scan|idk-scan|rerank-analysis|eval cite [--checkpoint файл]"
-                + "|eval [режимы] [--questions ids] [--resume]"
+                + "|threshold-scan|idk-scan|rerank-analysis|eval cite [--checkpoint файл.json]"
+                + " [--report файл.md]|eval [режимы] [--questions ids] [--resume]"
                 + " [--checkpoint filename.json];"
                 + " подробности: /help /rag");
     }
@@ -4273,29 +4284,46 @@ public final class Main {
                           String checkpointName) {
     }
 
-    record RagCitationEvalCommand(Path checkpoint) { }
+    record RagCitationEvalCommand(Path checkpoint, Path report) { }
 
     static RagCitationEvalCommand parseRagCitationEvalCommand(String arguments) {
-        if (arguments == null || arguments.isBlank()) return new RagCitationEvalCommand(null);
+        if (arguments == null || arguments.isBlank()) {
+            return new RagCitationEvalCommand(null, null);
+        }
         String[] tokens = arguments.split("\\s+");
         Path checkpoint = null;
+        Path report = null;
         for (int i = 0; i < tokens.length; i++) {
             if (tokens[i].equals("--resume")) continue;
-            if (!tokens[i].equals("--checkpoint") || ++i >= tokens.length) {
-                throw new IllegalArgumentException("Использование: /rag eval cite [--resume] [--checkpoint файл.json]");
+            if (tokens[i].equals("--checkpoint") || tokens[i].equals("--report")) {
+                boolean isCheckpoint = tokens[i].equals("--checkpoint");
+                if (++i >= tokens.length) {
+                    throw new IllegalArgumentException(
+                            "Использование: /rag eval cite [--resume] [--checkpoint файл.json]"
+                                    + " [--report файл.md]");
+                }
+                String value = tokens[i];
+                if (isCheckpoint && !value.endsWith(".json")) {
+                    throw new IllegalArgumentException("--checkpoint должен указывать JSON-файл");
+                }
+                if (!isCheckpoint && !value.endsWith(".md")) {
+                    throw new IllegalArgumentException("--report должен указывать Markdown-файл");
+                }
+                Path home = Path.of(System.getProperty("user.home")).toAbsolutePath().normalize();
+                if (value.equals("~")) value = home.toString();
+                else if (value.startsWith("~/")) value = home.resolve(value.substring(2)).toString();
+                Path parsed = Path.of(value);
+                if (!parsed.isAbsolute()) parsed = home.resolve(parsed);
+                parsed = parsed.normalize();
+                if (isCheckpoint) checkpoint = parsed;
+                else report = parsed;
+                continue;
             }
-            String value = tokens[i];
-            if (!value.endsWith(".json")) {
-                throw new IllegalArgumentException("--checkpoint должен указывать JSON-файл");
-            }
-            Path home = Path.of(System.getProperty("user.home")).toAbsolutePath().normalize();
-            if (value.equals("~")) value = home.toString();
-            else if (value.startsWith("~/")) value = home.resolve(value.substring(2)).toString();
-            checkpoint = Path.of(value);
-            if (!checkpoint.isAbsolute()) checkpoint = home.resolve(checkpoint);
-            checkpoint = checkpoint.normalize();
+            throw new IllegalArgumentException(
+                    "Использование: /rag eval cite [--resume] [--checkpoint файл.json]"
+                            + " [--report файл.md]");
         }
-        return new RagCitationEvalCommand(checkpoint);
+        return new RagCitationEvalCommand(checkpoint, report);
     }
 
     static RagEvalCommand parseRagEvalCommand(String arguments) {
@@ -4356,6 +4384,19 @@ public final class Main {
         if (value.equalsIgnoreCase("on")) return true;
         if (value.equalsIgnoreCase("off")) return false;
         throw new IllegalArgumentException("ожидается on или off");
+    }
+
+    /** Run parameters recorded in the citation eval report header. */
+    static String citationEvalParameters(LlmAgent agent, com.example.rag.RagSettings settings) {
+        Double temperature = agent.currentSettings().temperature();
+        return "model=" + agent.modelName()
+                + ", max_tokens=" + com.example.rag.RagConstants.RAG_MAX_OUTPUT_TOKENS
+                + ", temperature=" + (temperature == null ? "default" : temperature)
+                + ", topK=" + settings.topKBefore() + "/" + settings.topKAfter()
+                + ", minScore=" + String.format(java.util.Locale.ROOT, "%.2f", settings.minScore())
+                + ", idkThreshold=" + String.format(java.util.Locale.ROOT, "%.6f",
+                settings.idkThreshold())
+                + ", rewrite=off (cite eval)";
     }
 
     private static String formatRagConfig(RagRef ref) {
@@ -4625,12 +4666,13 @@ public final class Main {
         }
 
         private com.example.rag.RagCitationEval.Report citationEval(LlmAgent agent, Path checkpoint,
+                                                                     String runParameters,
                                                                      java.util.function.Consumer<String> progress,
                                                                      java.util.function.Consumer<com.example.rag.RagCitationEval.Report> snapshot)
                 throws Exception {
             ensureRetrievers();
             return com.example.rag.RagCitationEval.run(service(agent), embedder, settings,
-                    checkpoint, progress, snapshot);
+                    checkpoint, runParameters, progress, snapshot);
         }
 
         private void ensureRetrievers() {

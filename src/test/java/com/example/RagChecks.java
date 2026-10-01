@@ -965,14 +965,63 @@ final class RagChecks extends SelfTestSupport {
                 (system, user, tokens) -> { lowCalls.incrementAndGet(); return "should not run"; },
                 new RagSettings(1, 1, 0, false, false).withIdkThreshold(0.5), null)
                 .ask("weak query", RagService.Mode.ON);
-        expect("top-1 ниже idkThreshold даёт IDK_LOW_RELEVANCE без вызова модели",
-                low.answerStatus() == CitationValidator.AnswerStatus.IDK_LOW_RELEVANCE
+        expect("top-1 ниже idkThreshold даёт IDK_THRESHOLD без вызова модели",
+                low.answerStatus() == CitationValidator.AnswerStatus.IDK_THRESHOLD
                         && lowCalls.get() == 0 && low.answer().startsWith("Не знаю:"));
 
+        RagSettings thresholdSettings = new RagSettings(1, 1, 0.50, false, false)
+                .withIdkThreshold(0.578629);
+        String thresholdText = "This retrieved text supports the mocked answer correctly.";
+        IndexStore midScoreStore = scoreStore(0.56, thresholdText);
+        AtomicInteger midScoreCalls = new AtomicInteger();
+        RagService.Result midScore = new RagService(new RagRetriever(midScoreStore, lowEmbedder),
+                new RagPromptBuilder(), ContextBuilder.BASE_SYSTEM_PROMPT,
+                (system, user, tokens) -> { midScoreCalls.incrementAndGet(); return "unexpected"; },
+                thresholdSettings, null).ask("between min and idk", RagService.Mode.ON);
+        expect("score 0.56 проходит minScore 0.50, но IDK_THRESHOLD не вызывает модель",
+                midScore.answerStatus() == CitationValidator.AnswerStatus.IDK_THRESHOLD
+                        && midScoreCalls.get() == 0 && midScore.filteredCount() == 0);
+
+        IndexStore aboveThresholdStore = scoreStore(0.60, thresholdText);
+        AtomicInteger aboveThresholdCalls = new AtomicInteger();
+        RagService.Result aboveThreshold = new RagService(new RagRetriever(aboveThresholdStore,
+                lowEmbedder), new RagPromptBuilder(), ContextBuilder.BASE_SYSTEM_PROMPT,
+                (system, user, tokens) -> {
+                    aboveThresholdCalls.incrementAndGet();
+                    return "Факт [1].\n[1] «" + thresholdText + "»";
+                }, thresholdSettings, null).ask("above idk", RagService.Mode.ON);
+        expect("score выше idkThreshold вызывает модель",
+                aboveThreshold.answerStatus() == CitationValidator.AnswerStatus.ANSWERED
+                        && aboveThresholdCalls.get() == 1);
+
         Main.RagCitationEvalCommand citeCommand = Main.parseRagCitationEvalCommand(
-                "--checkpoint ~/.ai-advent-agent/rag-results/cite.json");
-        expect("cite eval принимает отдельный checkpoint и разворачивает ~",
-                citeCommand.checkpoint().endsWith(".ai-advent-agent/rag-results/cite.json"));
+                "--checkpoint ~/.ai-advent-agent/rag-results/cite.json"
+                        + " --report ~/.ai-advent-agent/rag-results/cite-report.md");
+        expect("cite eval принимает отдельный checkpoint/report и разворачивает ~",
+                citeCommand.checkpoint().endsWith(".ai-advent-agent/rag-results/cite.json")
+                        && citeCommand.report().endsWith(".ai-advent-agent/rag-results/cite-report.md"));
+        boolean rejectNotJson = false;
+        boolean rejectNotMarkdown = false;
+        boolean rejectUnknownOption = false;
+        try {
+            Main.parseRagCitationEvalCommand("--checkpoint report.md");
+        } catch (IllegalArgumentException expected) {
+            rejectNotJson = true;
+        }
+        try {
+            Main.parseRagCitationEvalCommand("--report cite.json");
+        } catch (IllegalArgumentException expected) {
+            rejectNotMarkdown = true;
+        }
+        try {
+            Main.parseRagCitationEvalCommand("--attempts 2");
+        } catch (IllegalArgumentException expected) {
+            rejectUnknownOption = true;
+        }
+        expect("cite eval отклоняет неверные расширения и посторонние опции",
+                rejectNotJson && rejectNotMarkdown && rejectUnknownOption
+                        && Main.parseRagCitationEvalCommand("").checkpoint() == null
+                        && Main.parseRagCitationEvalCommand("").report() == null);
 
         String evalQuote = "This indexed sentence is long enough to be used as a verified quotation.";
         com.example.index.Embedder commonEmbedder = new com.example.index.Embedder() {
@@ -988,29 +1037,64 @@ final class RagChecks extends SelfTestSupport {
                 "src/main/java/Citation.java", "Citation", "citation", "structure", 0,
                 evalQuote.length(), evalQuote.length()), evalQuote, new float[]{1, 0}))));
         AtomicInteger citeLlmCalls = new AtomicInteger();
+        String fixedLimitsQuestion = RagEval.loadQuestions().stream()
+                .filter(item -> item.id().equals("fixed-limits"))
+                .findFirst().orElseThrow().question();
+        String fabricatedCiteQuote = "This fabricated sentence is definitely absent from every indexed chunk.";
         RagService evalService = new RagService(new RagRetriever(evalStore, commonEmbedder),
                 new RagPromptBuilder(), ContextBuilder.BASE_SYSTEM_PROMPT,
                 (system, user, tokens) -> {
                     citeLlmCalls.incrementAndGet();
-                    return user.contains(RagEval.loadQuestions().stream()
-                            .filter(RagEval.Question::noAnswerExpected).findFirst().orElseThrow().question())
-                            ? "НЕ ЗНАЮ" : "Факт [1].\n[1] «" + evalQuote + "»";
+                    if (user.contains(RagEval.loadQuestions().stream()
+                            .filter(RagEval.Question::noAnswerExpected).findFirst().orElseThrow().question())) {
+                        return "НЕ ЗНАЮ";
+                    }
+                    if (user.contains(fixedLimitsQuestion)) {
+                        return "Факт [1].\n[1] «" + fabricatedCiteQuote + "»";
+                    }
+                    return "Факт [1].\n[1] «" + evalQuote + "»";
                 }, settings, null);
         Path citeCheckpoint = Files.createTempDirectory(baseTempDir, "rag-cite-eval-checkpoint-")
                 .resolve("citations.json");
+        List<String> citeLog = new ArrayList<>();
+        String citeParameters = "model=test-model, max_tokens=4096, temperature=default"
+                + ", topK=5/5, minScore=0.00, idkThreshold=0.500000, rewrite=off (cite eval)";
         RagCitationEval.Report citeReport = RagCitationEval.run(evalService, commonEmbedder,
-                settings, citeCheckpoint, ignored -> { }, ignored -> { });
+                settings, citeCheckpoint, citeParameters, citeLog::add, ignored -> { });
         int citeCallsAfterFirstRun = citeLlmCalls.get();
+        String citeLogText = String.join("\n", citeLog);
         RagCitationEval.Report resumedCiteReport = RagCitationEval.run(evalService, commonEmbedder,
-                settings, citeCheckpoint, ignored -> { }, ignored -> { });
+                settings, citeCheckpoint, citeParameters, citeLog::add, ignored -> { });
         expect("cite eval stub проверяет все 10 вопросов, ловушку, цитаты, cosine и resume",
                 citeCallsAfterFirstRun == 10 && citeLlmCalls.get() == citeCallsAfterFirstRun
                         && citeReport.rows().size() == 10
                         && citeReport.answersWithSources() == 9
                         && citeReport.answersWithQuotes() == 9
+                        && citeReport.answeredCount() == 8
+                        && citeReport.answerableTotal() == 9
                         && citeReport.trapHandled()
                         && resumedCiteReport.markdown().contains("Cosine — эвристика")
                         && resumedCiteReport.markdown().contains("смысл совпадает (ручная)"));
+        expect("cite eval логирует статус, top-1, сырой ответ и причины отбраковки",
+                citeLogText.contains("fixed-limits | UNVERIFIED | top-1 1.000000 | цитаты 0/1")
+                        && citeLogText.contains("сырой ответ: Факт [1].")
+                        && citeLogText.contains("отброшены: [1] not-a-verbatim-substring")
+                        && citeLogText.contains("not-in-database | IDK_MODEL")
+                        && citeLogText.contains("сырой ответ: НЕ ЗНАЮ")
+                        && citeLogText.contains("цитат нет"));
+        expect("cite eval отчёт содержит параметры, сводку статусов, отбракованные цитаты и итог",
+                citeReport.markdown().contains("Параметры прогона: model=test-model, max_tokens=4096")
+                        && citeReport.markdown().contains("## Сводка статусов (из 10)")
+                        && citeReport.markdown().contains("ANSWERED: 8")
+                        && citeReport.markdown().contains("UNVERIFIED: 1")
+                        && citeReport.markdown().contains("IDK_MODEL: 1")
+                        && citeReport.markdown().contains("| fixed-limits | 1 | not-a-verbatim-substring | "
+                        + fabricatedCiteQuote + " |")
+                        && citeReport.markdown().contains("Отвечено: 8/9 из имеющих ответ")
+                        && citeReport.markdown().contains("- Ловушка: да (корректный отказ")
+                        && citeReport.markdown().contains("Длительность: всего")
+                        && citeReport.markdown().contains("факты найдено")
+                        && citeReport.markdown().contains("| fixed-limits | UNVERIFIED |"));
     }
 
     private static RagService citationService(IndexStore store, CountingEmbedder embedder,
@@ -1021,6 +1105,16 @@ final class RagChecks extends SelfTestSupport {
                     calls.incrementAndGet();
                     return response;
                 }, settings, null);
+    }
+
+     private static IndexStore scoreStore(double score, String text)
+             throws Exception {
+        IndexStore store = new IndexStore(Files.createTempDirectory(baseTempDir, "rag-score-boundary-"));
+        store.save(new IndexStore.Index("structure", "fake", 2, Instant.now(), "tmp", 0,
+                0, 0, List.of(new IndexStore.IndexedChunk(new ChunkMeta("score", "Score.java",
+                "Score", "score", "structure", 0, text.length(), text.length()), text,
+                new float[]{(float) score, (float) Math.sqrt(1 - score * score)}))));
+        return store;
     }
 
     private static IndexStore populatedStore(Path dir, String question, int dimension)

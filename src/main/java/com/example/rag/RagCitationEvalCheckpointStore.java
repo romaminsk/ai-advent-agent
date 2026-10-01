@@ -14,12 +14,18 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-/** Separate resumable checkpoint for citation evaluation; it never stores answer/quote text. */
+/** Separate resumable checkpoint for citation evaluation; answers stay in the log,
+ * rejected quote texts are redacted and capped at 300 chars for the report table. */
 public final class RagCitationEvalCheckpointStore {
     public record Row(String id, CitationValidator.AnswerStatus status, List<String> sources,
                       int citationCount, int confirmedCount, Double cosine,
-                      int expectedFactsFound, boolean idkCorrect) {
-        public Row { sources = List.copyOf(sources); }
+                      int expectedFactsFound, int expectedFactsTotal, boolean idkCorrect,
+                      double top1Score, long durationMs,
+                      List<CitationValidator.RejectedQuote> rejectedCitations) {
+        public Row {
+            sources = List.copyOf(sources);
+            rejectedCitations = List.copyOf(rejectedCitations);
+        }
     }
 
     private final Path file;
@@ -51,10 +57,18 @@ public final class RagCitationEvalCheckpointStore {
             }
             List<String> sources = new java.util.ArrayList<>();
             if (value.path("sources").isArray()) value.path("sources").forEach(item -> sources.add(item.asText()));
+            List<CitationValidator.RejectedQuote> rejected = new java.util.ArrayList<>();
+            if (value.path("rejectedCitations").isArray()) {
+                value.path("rejectedCitations").forEach(item -> rejected.add(
+                        new CitationValidator.RejectedQuote(item.path("number").asInt(-1),
+                                item.path("text").asText(""), item.path("reason").asText("unknown"))));
+            }
             rows.put(entry.getKey(), new Row(entry.getKey(), status, sources,
                     value.path("citationCount").asInt(), value.path("confirmedCount").asInt(),
                     value.path("cosine").isNumber() ? value.path("cosine").asDouble() : null,
-                    value.path("expectedFactsFound").asInt(), value.path("idkCorrect").asBoolean()));
+                    value.path("expectedFactsFound").asInt(), value.path("expectedFactsTotal").asInt(),
+                    value.path("idkCorrect").asBoolean(), value.path("top1Score").asDouble(),
+                    value.path("durationMs").asLong(), rejected));
         }
     }
 
@@ -81,7 +95,17 @@ public final class RagCitationEvalCheckpointStore {
             if (row.cosine() == null || !Double.isFinite(row.cosine())) node.putNull("cosine");
             else node.put("cosine", row.cosine());
             node.put("expectedFactsFound", row.expectedFactsFound());
+            node.put("expectedFactsTotal", row.expectedFactsTotal());
             node.put("idkCorrect", row.idkCorrect());
+            node.put("top1Score", row.top1Score());
+            node.put("durationMs", row.durationMs());
+            ArrayNode rejected = node.putArray("rejectedCitations");
+            row.rejectedCitations().forEach(citation -> {
+                ObjectNode item = rejected.addObject();
+                item.put("number", citation.number());
+                item.put("text", RagQueryRewriter.redactSecrets(citation.text()));
+                item.put("reason", citation.reason());
+            });
         });
         Path temporary = Files.createTempFile(absolute.getParent(), absolute.getFileName() + ".", ".tmp");
         try {
