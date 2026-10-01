@@ -262,33 +262,44 @@ public final class Main {
                         }
                         try (TerminalUi.ProgressIndicator progress = ui.startProgress()) {
                             String answer;
-                            List<String> ragSources = List.of();
                             if (ragRef.enabled) {
                                 com.example.rag.RagService.Prepared prepared;
                                 try {
                                     prepared = ragRef.service(activeAgent).prepare(input.text(),
-                                            ragRef.settings, null);
+                                            ragRef.settings.withRewrite(false), null);
                                 } catch (Exception e) {
                                     throw new AgentException("Ошибка поиска RAG: "
                                             + (e.getMessage() == null ? "неизвестная ошибка"
                                             : e.getMessage()), e);
                                 }
-                                answer = prepared.prompt().chunks().isEmpty()
-                                        ? activeAgent.recordLocalAnswer(input.text(),
-                                        com.example.rag.RagConstants.NO_ANSWER)
-                                        : activeAgent.askWithRagContext(input.text(),
-                                        prepared.prompt().system(), prepared.prompt().user());
-                                ragSources = prepared.prompt().chunks().stream()
-                                        .map(com.example.rag.RagRetriever.Chunk::source)
-                                        .distinct().toList();
+                                com.example.rag.RagService activeRagService = ragRef.service(activeAgent);
+                                com.example.rag.RagService.Result ragResult;
+                                if (activeRagService.shouldDecline(prepared)) {
+                                    ragResult = activeRagService.complete(prepared);
+                                    answer = activeAgent.recordLocalAnswer(input.text(),
+                                            com.example.rag.RagAnswerFormatter.format(ragResult,
+                                                    activeAgent.currentSettings().diagnostics()));
+                                } else {
+                                    long ragLlmStart = System.nanoTime();
+                                    try {
+                                        String rawAnswer = activeAgent.askWithRagContext(input.text(),
+                                                prepared.prompt().system(), prepared.prompt().user());
+                                        ragResult = activeRagService.evaluateAnswer(prepared, rawAnswer,
+                                                com.example.rag.RagService.elapsedMs(ragLlmStart));
+                                        answer = com.example.rag.RagAnswerFormatter.format(ragResult,
+                                                activeAgent.currentSettings().diagnostics());
+                                    } catch (EmptyLlmAnswerException empty) {
+                                        ragResult = activeRagService.evaluateAnswer(prepared, "",
+                                                com.example.rag.RagService.elapsedMs(ragLlmStart));
+                                        answer = activeAgent.recordLocalAnswer(input.text(),
+                                                com.example.rag.RagAnswerFormatter.format(ragResult,
+                                                        activeAgent.currentSettings().diagnostics()));
+                                    }
+                                }
                             } else {
                                 answer = activeAgent.ask(input.text());
                             }
                             ui.showMessage(answer);
-                            if (ragRef.enabled) {
-                                ui.showSystem("Источники: " + (ragSources.isEmpty()
-                                        ? "нет" : String.join(", ", ragSources)));
-                            }
                             if (demoRef.demo != null) {
                                 demoRef.demo.logSuccess();
                                 ui.showSystem(demoRef.demo.metricsAfterAnswer());
@@ -4091,21 +4102,20 @@ public final class Main {
             try {
                 com.example.rag.RagService service = ragRef.service(agent);
                 com.example.rag.RagService.Prepared prepared = service.prepare(question,
-                        ragRef.settings, null);
+                        ragRef.settings.withRewrite(false), null);
                 ui.showSystem("Поиск чанков… " + prepared.retrieveMs() + " мс");
                 ui.showSystem("Этапы: rewrite " + (prepared.settings().rewriteEnabled()
                         ? (prepared.rewriteFallback() ? "fallback" : prepared.rewriteMs() + " мс")
                         : "off") + " / поиск " + prepared.retrieveMs() + " мс / фильтр отброшено "
                         + prepared.ranking().filteredCount() + " / реранкинг "
                         + (prepared.settings().rerankEnabled() ? "on" : "off"));
-                com.example.rag.RagService.Result off = service.ask(question,
-                        com.example.rag.RagService.Mode.OFF, ragRef.settings, null);
-                ui.showSystem("Ответ без RAG… " + ragSeconds(off.llmMs()) + "\n"
-                        + ragResultStatus(off) + ": " + ragResultText(off));
                 com.example.rag.RagService.Result on = service.complete(prepared);
                 ui.showSystem("Ответ с RAG… " + ragSeconds(on.llmMs()) + "\n"
-                        + ragResultStatus(on) + ": " + ragResultText(on));
-                ui.showSystem("Источники: " + sourceNames(on.chunks()));
+                        + (on.status() == com.example.rag.RagService.Status.OK
+                        || on.status() == com.example.rag.RagService.Status.EMPTY
+                        ? com.example.rag.RagAnswerFormatter.format(on,
+                        agent.currentSettings().diagnostics())
+                        : ragResultStatus(on) + ": " + ragResultText(on)));
             } catch (Exception e) {
                 ui.showError("Ошибка /rag ask: " + safeError(e));
             }
@@ -4151,6 +4161,49 @@ public final class Main {
             }
             return;
         }
+        if (lower.equals("idk-scan")) {
+            try {
+                ui.showSystem(ragRef.calibrateIdk());
+            } catch (Exception e) {
+                ui.showError("Ошибка /rag idk-scan: " + safeError(e));
+            }
+            return;
+        }
+        if (lower.equals("eval cite") || lower.startsWith("eval cite ")) {
+            try {
+                RagCitationEvalCommand command = parseRagCitationEvalCommand(
+                        argument.substring("eval cite".length()).trim());
+                java.time.LocalDate date = java.time.LocalDate.now();
+                Path checkpoint = command.checkpoint() == null
+                        ? Path.of(System.getProperty("user.home"), ".ai-advent-agent",
+                        "rag-results", "rag-citations-checkpoint-" + date + ".json")
+                        : command.checkpoint();
+                Path reportPath = com.example.rag.RagCitationEval.reportPath(
+                        Path.of(System.getProperty("user.home")), date);
+                com.example.rag.RagCitationEval.Report report = ragRef.citationEval(agent,
+                        checkpoint, ui::showSystem, snapshot -> {
+                            try {
+                                com.example.rag.RagEval.writeReport(reportPath, snapshot.markdown());
+                            } catch (java.io.IOException failure) {
+                                throw new java.io.UncheckedIOException(failure);
+                            }
+                        });
+                com.example.rag.RagEval.writeReport(reportPath, report.markdown());
+                ui.showSystem("Ответов с источниками: " + report.answersWithSources());
+                ui.showSystem("Ответов с цитатами: " + report.answersWithQuotes());
+                ui.showSystem("Средняя доля подтверждённых цитат: "
+                        + String.format(java.util.Locale.ROOT, "%.1f%%",
+                        report.confirmedQuoteFraction() * 100));
+                ui.showSystem("Средний cosine: "
+                        + String.format(java.util.Locale.ROOT, "%.4f", report.averageCosine()));
+                ui.showSystem("Ловушка обработана: " + (report.trapHandled() ? "да" : "нет"));
+                ui.showSystem("Отчёт: " + reportPath);
+                ui.showSystem("Checkpoint: " + checkpoint);
+            } catch (Exception e) {
+                ui.showError("Ошибка /rag eval cite: " + safeError(e));
+            }
+            return;
+        }
         if (lower.equals("eval") || lower.startsWith("eval ")) {
             try {
                 RagEvalCommand evalCommand = parseRagEvalCommand(
@@ -4188,7 +4241,8 @@ public final class Main {
             return;
         }
         ui.showError("Использование: /rag on|off|status|config|set|ask <вопрос>|retrieval <вопрос>"
-                + "|threshold-scan|rerank-analysis|eval [режимы] [--questions ids] [--resume]"
+                + "|threshold-scan|idk-scan|rerank-analysis|eval cite [--checkpoint файл]"
+                + "|eval [режимы] [--questions ids] [--resume]"
                 + " [--checkpoint filename.json];"
                 + " подробности: /help /rag");
     }
@@ -4202,6 +4256,10 @@ public final class Main {
         if (parts.length == 2 && parts[0].equalsIgnoreCase("threshold")) {
             return current.withMinScore(Double.parseDouble(parts[1]));
         }
+        if (parts.length == 2 && (parts[0].equalsIgnoreCase("idk-threshold")
+                || parts[0].equalsIgnoreCase("idkThreshold"))) {
+            return current.withIdkThreshold(Double.parseDouble(parts[1]));
+        }
         if (parts.length == 2 && parts[0].equalsIgnoreCase("rerank")) {
             return current.withRerank(parseOnOff(parts[1]));
         }
@@ -4213,6 +4271,31 @@ public final class Main {
 
     record RagEvalCommand(List<String> modes, List<String> questionIds, boolean resume,
                           String checkpointName) {
+    }
+
+    record RagCitationEvalCommand(Path checkpoint) { }
+
+    static RagCitationEvalCommand parseRagCitationEvalCommand(String arguments) {
+        if (arguments == null || arguments.isBlank()) return new RagCitationEvalCommand(null);
+        String[] tokens = arguments.split("\\s+");
+        Path checkpoint = null;
+        for (int i = 0; i < tokens.length; i++) {
+            if (tokens[i].equals("--resume")) continue;
+            if (!tokens[i].equals("--checkpoint") || ++i >= tokens.length) {
+                throw new IllegalArgumentException("Использование: /rag eval cite [--resume] [--checkpoint файл.json]");
+            }
+            String value = tokens[i];
+            if (!value.endsWith(".json")) {
+                throw new IllegalArgumentException("--checkpoint должен указывать JSON-файл");
+            }
+            Path home = Path.of(System.getProperty("user.home")).toAbsolutePath().normalize();
+            if (value.equals("~")) value = home.toString();
+            else if (value.startsWith("~/")) value = home.resolve(value.substring(2)).toString();
+            checkpoint = Path.of(value);
+            if (!checkpoint.isAbsolute()) checkpoint = home.resolve(checkpoint);
+            checkpoint = checkpoint.normalize();
+        }
+        return new RagCitationEvalCommand(checkpoint);
     }
 
     static RagEvalCommand parseRagEvalCommand(String arguments) {
@@ -4280,6 +4363,8 @@ public final class Main {
                 + ", topKBefore=" + ref.settings.topKBefore()
                 + ", topKAfter=" + ref.settings.topKAfter()
                 + ", minScore=" + String.format(java.util.Locale.ROOT, "%.2f", ref.settings.minScore())
+                + ", idkThreshold=" + String.format(java.util.Locale.ROOT, "%.2f",
+                ref.settings.idkThreshold())
                 + ", rerank=" + (ref.settings.rerankEnabled() ? "on" : "off")
                 + " (vector=" + String.format(java.util.Locale.ROOT, "%.2f",
                 ref.settings.rerankVectorWeight()) + ", lexical="
@@ -4339,12 +4424,6 @@ public final class Main {
                     .append(retrieval.rewriteFallback() ? " (fallback)" : "");
         }
         return out.toString();
-    }
-
-    private static String sourceNames(List<com.example.rag.RagRetriever.Chunk> chunks) {
-        List<String> sources = chunks.stream().map(com.example.rag.RagRetriever.Chunk::source)
-                .distinct().toList();
-        return sources.isEmpty() ? "нет" : String.join(", ", sources);
     }
 
     private static String safeError(Exception error) {
@@ -4527,6 +4606,31 @@ public final class Main {
                     : "Веса не сохранены: ни один набор не выполнил ограничения. "
                     + "Текущие настройки оставлены без изменений.";
             return report.markdown() + "\n" + applied + "\nОтчёт: " + reportPath;
+        }
+
+        private String calibrateIdk() throws Exception {
+            ensureRetrievers();
+            com.example.rag.RagRetriever selected = "fixed".equals(strategy)
+                    ? fixedRetriever : structureRetriever;
+            com.example.rag.RagEval.IdkScoreReport report = com.example.rag.RagEval.idkScoreScan(
+                    com.example.rag.RagEval.loadQuestions(), selected, settings);
+            settings = settings.withIdkThreshold(report.selectedThreshold());
+            saveState();
+            if (!injectedService) {
+                service = null;
+                serviceAgent = null;
+            }
+            return report.markdown() + "\nСохранено idkThreshold="
+                    + String.format(java.util.Locale.ROOT, "%.6f", settings.idkThreshold()) + ".";
+        }
+
+        private com.example.rag.RagCitationEval.Report citationEval(LlmAgent agent, Path checkpoint,
+                                                                     java.util.function.Consumer<String> progress,
+                                                                     java.util.function.Consumer<com.example.rag.RagCitationEval.Report> snapshot)
+                throws Exception {
+            ensureRetrievers();
+            return com.example.rag.RagCitationEval.run(service(agent), embedder, settings,
+                    checkpoint, progress, snapshot);
         }
 
         private void ensureRetrievers() {

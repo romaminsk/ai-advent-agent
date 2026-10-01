@@ -4,27 +4,31 @@ package com.example.rag;
 public record RagSettings(int topKBefore, int topKAfter, double minScore,
                           boolean rerankEnabled, boolean rewriteEnabled,
                           double rerankVectorWeight, double rerankLexicalWeight,
-                          Double relativeDelta, boolean diversityEnabled) {
+                          Double relativeDelta, boolean diversityEnabled,
+                          double idkThreshold) {
     public static final double DEFAULT_MIN_SCORE = 0.50;
+    public static final double DEFAULT_IDK_THRESHOLD = 0.50;
     public static final double DEFAULT_RELATIVE_DELTA = 0.15;
     public static final double DEFAULT_VECTOR_WEIGHT = 1.00;
     public static final double DEFAULT_LEXICAL_WEIGHT = 0.00;
     public static final boolean DEFAULT_DIVERSITY_ENABLED = false;
     public static final RagSettings DEFAULT = new RagSettings(20, 5, DEFAULT_MIN_SCORE,
             true, true, DEFAULT_VECTOR_WEIGHT, DEFAULT_LEXICAL_WEIGHT, DEFAULT_RELATIVE_DELTA,
-            DEFAULT_DIVERSITY_ENABLED);
+            DEFAULT_DIVERSITY_ENABLED, DEFAULT_IDK_THRESHOLD);
 
     public RagSettings(int topKBefore, int topKAfter, double minScore,
                        boolean rerankEnabled, boolean rewriteEnabled) {
         this(topKBefore, topKAfter, minScore, rerankEnabled, rewriteEnabled,
-                DEFAULT_VECTOR_WEIGHT, DEFAULT_LEXICAL_WEIGHT, null, DEFAULT_DIVERSITY_ENABLED);
+                DEFAULT_VECTOR_WEIGHT, DEFAULT_LEXICAL_WEIGHT, null, DEFAULT_DIVERSITY_ENABLED,
+                DEFAULT_IDK_THRESHOLD);
     }
 
     public RagSettings(int topKBefore, int topKAfter, double minScore,
                        boolean rerankEnabled, boolean rewriteEnabled,
                        double rerankVectorWeight, double rerankLexicalWeight) {
         this(topKBefore, topKAfter, minScore, rerankEnabled, rewriteEnabled,
-                rerankVectorWeight, rerankLexicalWeight, null, DEFAULT_DIVERSITY_ENABLED);
+                rerankVectorWeight, rerankLexicalWeight, null, DEFAULT_DIVERSITY_ENABLED,
+                DEFAULT_IDK_THRESHOLD);
     }
 
     public RagSettings(int topKBefore, int topKAfter, double minScore,
@@ -32,7 +36,17 @@ public record RagSettings(int topKBefore, int topKAfter, double minScore,
                        double rerankVectorWeight, double rerankLexicalWeight,
                        Double relativeDelta) {
         this(topKBefore, topKAfter, minScore, rerankEnabled, rewriteEnabled,
-                rerankVectorWeight, rerankLexicalWeight, relativeDelta, DEFAULT_DIVERSITY_ENABLED);
+                rerankVectorWeight, rerankLexicalWeight, relativeDelta, DEFAULT_DIVERSITY_ENABLED,
+                DEFAULT_IDK_THRESHOLD);
+    }
+
+    public RagSettings(int topKBefore, int topKAfter, double minScore,
+                       boolean rerankEnabled, boolean rewriteEnabled,
+                       double rerankVectorWeight, double rerankLexicalWeight,
+                       Double relativeDelta, boolean diversityEnabled) {
+        this(topKBefore, topKAfter, minScore, rerankEnabled, rewriteEnabled,
+                rerankVectorWeight, rerankLexicalWeight, relativeDelta, diversityEnabled,
+                DEFAULT_IDK_THRESHOLD);
     }
 
     public RagSettings {
@@ -41,6 +55,9 @@ public record RagSettings(int topKBefore, int topKAfter, double minScore,
         }
         if (!Double.isFinite(minScore) || minScore < 0 || minScore > 1) {
             throw new IllegalArgumentException("minScore должен быть в диапазоне [0..1]");
+        }
+        if (!Double.isFinite(idkThreshold) || idkThreshold < 0 || idkThreshold > 1) {
+            throw new IllegalArgumentException("idkThreshold должен быть в диапазоне [0..1]");
         }
         if (!Double.isFinite(rerankVectorWeight) || !Double.isFinite(rerankLexicalWeight)
                 || rerankVectorWeight < 0 || rerankLexicalWeight < 0
@@ -55,37 +72,42 @@ public record RagSettings(int topKBefore, int topKAfter, double minScore,
 
     public RagSettings withTopK(int before, int after) {
         return new RagSettings(before, after, minScore, rerankEnabled, rewriteEnabled,
-                rerankVectorWeight, rerankLexicalWeight, relativeDelta, diversityEnabled);
+                rerankVectorWeight, rerankLexicalWeight, relativeDelta, diversityEnabled, idkThreshold);
     }
 
     public RagSettings withMinScore(double value) {
         return new RagSettings(topKBefore, topKAfter, value, rerankEnabled, rewriteEnabled,
-                rerankVectorWeight, rerankLexicalWeight, null, diversityEnabled);
+                rerankVectorWeight, rerankLexicalWeight, null, diversityEnabled, idkThreshold);
     }
 
     public RagSettings withRerank(boolean enabled) {
         return new RagSettings(topKBefore, topKAfter, minScore, enabled, rewriteEnabled,
-                rerankVectorWeight, rerankLexicalWeight, relativeDelta, diversityEnabled);
+                rerankVectorWeight, rerankLexicalWeight, relativeDelta, diversityEnabled, idkThreshold);
     }
 
     public RagSettings withRewrite(boolean enabled) {
         return new RagSettings(topKBefore, topKAfter, minScore, rerankEnabled, enabled,
-                rerankVectorWeight, rerankLexicalWeight, relativeDelta, diversityEnabled);
+                rerankVectorWeight, rerankLexicalWeight, relativeDelta, diversityEnabled, idkThreshold);
     }
 
     public RagSettings withWeights(double vectorWeight, double lexicalWeight) {
         return new RagSettings(topKBefore, topKAfter, minScore, rerankEnabled, rewriteEnabled,
-                vectorWeight, lexicalWeight, relativeDelta, diversityEnabled);
+                vectorWeight, lexicalWeight, relativeDelta, diversityEnabled, idkThreshold);
     }
 
     public RagSettings withRelativeDelta(Double delta) {
         return new RagSettings(topKBefore, topKAfter, minScore, rerankEnabled, rewriteEnabled,
-                rerankVectorWeight, rerankLexicalWeight, delta, diversityEnabled);
+                rerankVectorWeight, rerankLexicalWeight, delta, diversityEnabled, idkThreshold);
     }
 
     public RagSettings withDiversity(boolean enabled) {
         return new RagSettings(topKBefore, topKAfter, minScore, rerankEnabled, rewriteEnabled,
-                rerankVectorWeight, rerankLexicalWeight, relativeDelta, enabled);
+                rerankVectorWeight, rerankLexicalWeight, relativeDelta, enabled, idkThreshold);
+    }
+
+    public RagSettings withIdkThreshold(double value) {
+        return new RagSettings(topKBefore, topKAfter, minScore, rerankEnabled, rewriteEnabled,
+                rerankVectorWeight, rerankLexicalWeight, relativeDelta, diversityEnabled, value);
     }
 
     public RagReranker.Weights rerankWeights() {

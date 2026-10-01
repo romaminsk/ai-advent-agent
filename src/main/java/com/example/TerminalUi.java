@@ -200,8 +200,8 @@ public interface TerminalUi extends AutoCloseable {
                         "расход и обзор состояния"),
                 new Row("Индекс", "/index build /index stats /index search /index compare",
                         "сборка, статистика, поиск и сравнение индекса"),
-                new Row("RAG", "/rag on/off/config/set/retrieval/ask/eval/threshold-scan/rerank-analysis",
-                        "ответы с контекстом; фильтрация, реранкинг и сравнение режимов"),
+                new Row("RAG", "/rag on/off/config/set/retrieval/ask/eval cite/threshold-scan/idk-scan",
+                        "ответы с проверяемыми цитатами, источниками и отказом при слабом контексте"),
                 new Row("Прочее", "/mcp /monitor /help /exit (также exit, quit)",
                         "подключения, мониторинг и справка"),
         };
@@ -669,24 +669,36 @@ public interface TerminalUi extends AutoCloseable {
                       /rag on|off|status       — режим обычного диалога
                       /rag config              — настройки и путь к их JSON
                       /rag set topk <до> <после> — глубина поиска и размер контекста
-                      /rag set threshold <0..1> — порог cosine similarity
+                      /rag set threshold <0..1> — минимальный score фильтра
+                      /rag set idk-threshold <0..1> — порог «не знаю»
                       /rag set rerank|rewrite on|off
                       /rag retrieval <вопрос>  — таблицы кандидатов до/после без LLM
                       /rag retrieval           — сравнение fixed/structure
                       /rag threshold-scan      — калибровка порога без чат-модели
+                      /rag idk-scan            — top-1/top-5 и подбор idkThreshold
                       /rag rerank-analysis     — ранги чанков и сравнение весов без LLM
                       /rag rewrite-test <id>  — диагностика одного rewrite-вызова
-                      /rag ask <вопрос>        — ответы без RAG и с RAG
+                      /rag ask <вопрос>        — ответ RAG с источниками и цитатами
+                      /rag eval cite           — источники, цитаты и отказ; --checkpoint файл
                       /rag eval A,B,C,D        — режимы; --questions ids; --resume
                                                  --checkpoint filename.json — новый checkpoint
 
                     Эффекты
-                      режим on использует настройки topKBefore/topKAfter/minScore,
-                      heuristic rerank и query rewrite; при пустом контексте LLM не
-                      вызывается. В историю записываются обычные реплики без чанков.
+                      Ответ RAG содержит ссылки [n], сформированные источники с
+                      chunkId и только подтверждённые дословные цитаты. При 0
+                      подтверждённых цитат ответ помечается как неподтверждённый.
+                      При top-1 ниже idkThreshold или пустом фильтре LLM не вызывается;
+                      выводятся до 3 ближайших разделов и подсказка уточнения.
+                      idkThreshold меняется как minScore и сохраняется в настройках.
+                      В обычном RAG и /rag ask rewrite выключен; eval D сохраняет rewrite.
+                      В историю записываются обычные реплики без чанков.
                       Eval сохраняет каждую пару в JSON checkpoint; --resume
                       пропускает готовое, no-rag и rewrite кэшируются.
                       Порог и ранги без LLM: /rag threshold-scan и /rag rerank-analysis.
+                      /rag eval cite сохраняет отдельный resumable checkpoint и отчёт
+                      ~/.ai-advent-agent/rag-results/rag-citations-eval-<дата>.md;
+                      cosine — эвристика, смысловую проверку выполняет человек.
+                      Статус и число отброшенных цитат видны при LLM_DIAGNOSTICS=true.
                       Финальная генерация: max_tokens=4096, пустой ответ повторяется один раз.
                       Отчёты: ~/.ai-advent-agent/rag-results/ и artifacts/.
 
