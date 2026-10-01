@@ -100,7 +100,7 @@ public final class RagCitationEval {
             }
         }
         List<String> sources = new ArrayList<>();
-        for (int number : result.citations().validReferences().stream().sorted().toList()) {
+        for (int number : result.citations().confirmedQuoteNumbers()) {
             if (number <= result.chunks().size()) {
                 RagRetriever.Chunk chunk = result.chunks().get(number - 1);
                 String value = chunk.source() + " — " + chunk.section() + " (chunk: " + chunk.chunkId() + ")";

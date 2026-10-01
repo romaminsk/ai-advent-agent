@@ -226,7 +226,9 @@ public final class RagService {
         }
         CitationValidator.Validation citations = new CitationValidator()
                 .validate(safeAnswer, prepared.prompt().chunks());
-        CitationValidator.AnswerStatus answerStatus = citations.confirmedQuotes().isEmpty()
+        // ANSWERED требует хотя бы один подтверждённый фактический пункт:
+        // валидная цитата только внутри пункта «Не покрыто контекстом» ответом не считается.
+        CitationValidator.AnswerStatus answerStatus = citations.confirmedItems().isEmpty()
                 ? CitationValidator.AnswerStatus.UNVERIFIED
                 : CitationValidator.AnswerStatus.ANSWERED;
         return new Result(safeAnswer, prepared.prompt().chunks(), prepared.retrievedChunks(),

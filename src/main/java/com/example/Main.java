@@ -4105,7 +4105,7 @@ public final class Main {
             try {
                 com.example.rag.RagService service = ragRef.service(agent);
                 com.example.rag.RagService.Prepared prepared = service.prepare(question,
-                        ragRef.settings.withRewrite(false), null);
+                        ragRef.settings, null);
                 ui.showSystem("Поиск чанков… " + prepared.retrieveMs() + " мс");
                 ui.showSystem("Этапы: rewrite " + (prepared.settings().rewriteEnabled()
                         ? (prepared.rewriteFallback() ? "fallback" : prepared.rewriteMs() + " мс")
