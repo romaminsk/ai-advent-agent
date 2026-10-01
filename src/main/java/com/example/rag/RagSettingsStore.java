@@ -55,7 +55,8 @@ public final class RagSettingsStore {
                 node.has("relativeDelta")
                         ? (node.hasNonNull("relativeDelta") ? node.path("relativeDelta").asDouble() : null)
                         : RagSettings.DEFAULT_RELATIVE_DELTA,
-                node.path("diversityEnabled").asBoolean(RagSettings.DEFAULT_DIVERSITY_ENABLED));
+                node.path("diversityEnabled").asBoolean(RagSettings.DEFAULT_DIVERSITY_ENABLED),
+                node.path("idkThreshold").asDouble(RagSettings.DEFAULT_IDK_THRESHOLD));
         String strategy = root.path("indexStrategy").asText(RagConstants.INDEX_STRATEGY);
         if (!strategy.equals("fixed") && !strategy.equals("structure")) {
             throw new IOException("Неизвестная стратегия RAG-индекса: " + strategy);
@@ -80,6 +81,7 @@ public final class RagSettingsStore {
         if (state.settings().relativeDelta() == null) settings.putNull("relativeDelta");
         else settings.put("relativeDelta", state.settings().relativeDelta());
         settings.put("diversityEnabled", state.settings().diversityEnabled());
+        settings.put("idkThreshold", state.settings().idkThreshold());
         Path temporary = Files.createTempFile(absolute.getParent(), "rag-settings.", ".tmp");
         try {
             Files.writeString(temporary, JsonSupport.MAPPER.writerWithDefaultPrettyPrinter()

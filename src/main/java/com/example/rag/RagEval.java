@@ -197,6 +197,12 @@ public final class RagEval {
                                        int answerableQuestions, boolean constraintsMet) {
     }
 
+    public record IdkScoreRow(String id, double top1, double top5, boolean trap) { }
+    public record IdkScoreReport(List<IdkScoreRow> rows, double selectedThreshold,
+                                boolean calibrated, int answerableLost, String markdown) {
+        public IdkScoreReport { rows = List.copyOf(rows); }
+    }
+
     private record AnalysisQuestion(String id, String question, String expectedSources) {
     }
 
@@ -247,6 +253,58 @@ public final class RagEval {
         }
     }
 
+    /** Measures raw top-1/top-5 cosine scores without calling either the chat model or rewrite. */
+    public static IdkScoreReport idkScoreScan(List<Question> questions, RagRetriever retriever,
+                                              RagSettings settings) throws Exception {
+        List<IdkScoreRow> rows = new ArrayList<>();
+        RagSettings noRewrite = settings.withRewrite(false);
+        for (Question question : questions) {
+            List<RagRetriever.Chunk> chunks = retriever.retrieve(question.question(), noRewrite.topKBefore());
+            double top1 = chunks.isEmpty() ? 0 : chunks.get(0).score();
+            double top5 = chunks.isEmpty() ? 0 : chunks.get(Math.min(4, chunks.size() - 1)).score();
+            rows.add(new IdkScoreRow(question.id(), top1, top5, question.noAnswerExpected()));
+        }
+        List<Double> answerable = rows.stream().filter(row -> !row.trap())
+                .map(IdkScoreRow::top1).toList();
+        List<Double> traps = rows.stream().filter(IdkScoreRow::trap)
+                .map(IdkScoreRow::top1).toList();
+        double trapMax = traps.stream().mapToDouble(Double::doubleValue).max().orElse(0);
+        double neededMin = answerable.stream().mapToDouble(Double::doubleValue).min().orElse(0);
+        boolean calibrated = !traps.isEmpty() && !answerable.isEmpty() && trapMax < neededMin;
+        double selected;
+        int lost;
+        if (calibrated) {
+            selected = (trapMax + neededMin) / 2.0;
+            lost = 0;
+        } else {
+            double bestLoss = Double.POSITIVE_INFINITY;
+            boolean bestTrap = false;
+            selected = 0;
+            for (int step = 0; step <= 1000; step++) {
+                double candidate = step / 1000.0;
+                int candidateLoss = (int) answerable.stream().filter(score -> score < candidate).count();
+                boolean catchesTrap = traps.stream().allMatch(score -> score < candidate);
+                if (candidateLoss < bestLoss || (candidateLoss == bestLoss && catchesTrap && !bestTrap)) {
+                    bestLoss = candidateLoss;
+                    bestTrap = catchesTrap;
+                    selected = candidate;
+                }
+            }
+            double chosen = selected;
+            lost = (int) answerable.stream().filter(score -> score < chosen).count();
+        }
+        StringBuilder markdown = new StringBuilder("| id | top-1 | top-5 | ловушка? |\n|---|---:|---:|:---:|");
+        for (IdkScoreRow row : rows) markdown.append("\n| ").append(row.id()).append(" | ")
+                .append(String.format(Locale.ROOT, "%.6f", row.top1())).append(" | ")
+                .append(String.format(Locale.ROOT, "%.6f", row.top5())).append(" | ")
+                .append(row.trap() ? "да" : "нет").append(" |");
+        markdown.append("\n\nidkThreshold=").append(String.format(Locale.ROOT, "%.6f", selected))
+                .append(calibrated ? "; разделяет ловушку и все ответные вопросы."
+                        : "; идеального разделения нет; потеря ответных вопросов: " + lost + "/"
+                        + answerable.size() + ". Порог выбран с минимальной потерей.");
+        return new IdkScoreReport(rows, selected, calibrated, lost, markdown.toString());
+    }
+
     public static Report run(RagService service) throws IOException {
         return run(service, ignored -> { }, ignored -> { });
     }
@@ -259,7 +317,7 @@ public final class RagEval {
         for (int i = 0; i < questions.size(); i++) {
             Question question = questions.get(i);
             RagService.Result off = service.ask(question.question(), RagService.Mode.OFF);
-            RagService.Result on = service.ask(question.question(), RagService.Mode.ON);
+            RagService.Result on = service.askForEvaluation(question.question());
             Row row = evaluate(question, off, on);
             rows.add(row);
             Report snapshot = report(rows);
@@ -289,14 +347,14 @@ public final class RagEval {
             Question question = questions.get(i);
             RagService.Result noRag = noRagCache.computeIfAbsent(question.id(), ignored ->
                     service.ask(question.question(), RagService.Mode.OFF));
-            RagService.Result baseline = service.ask(question.question(), RagService.Mode.ON,
+            RagService.Result baseline = service.askForEvaluation(question.question(),
                     baselineSettings, question.question());
-            RagService.Result filter = service.ask(question.question(), RagService.Mode.ON,
+            RagService.Result filter = service.askForEvaluation(question.question(),
                     filterSettings, question.question());
             RagQueryRewriter.Result rewrite = rewriteCache.computeIfAbsent(question.id(), ignored ->
                     fullSettings.rewriteEnabled() ? service.rewriteQuery(question.question())
                             : new RagQueryRewriter.Result(question.question(), false, 0, "off"));
-            RagService.Result full = service.ask(question.question(), RagService.Mode.ON,
+            RagService.Result full = service.askForEvaluation(question.question(),
                     fullSettings, rewrite.query());
             full = withRewrite(full, rewrite);
             ComparisonRow row = new ComparisonRow(question,
@@ -351,9 +409,9 @@ public final class RagEval {
                 RagService.Result result;
                 switch (mode) {
                     case "A" -> result = service.ask(question.question(), RagService.Mode.OFF);
-                    case "B" -> result = service.ask(question.question(), RagService.Mode.ON,
+                    case "B" -> result = service.askForEvaluation(question.question(),
                             baseline, question.question());
-                    case "C" -> result = service.ask(question.question(), RagService.Mode.ON,
+                    case "C" -> result = service.askForEvaluation(question.question(),
                             filter, question.question());
                     case "D" -> {
                         RagQueryRewriter.Result rewrite = store.rewrite(question.id());
@@ -361,7 +419,7 @@ public final class RagEval {
                             rewrite = service.rewriteQuery(question.question());
                             store.putRewrite(question.id(), rewrite);
                         }
-                        result = withRewrite(service.ask(question.question(), RagService.Mode.ON,
+                        result = withRewrite(service.askForEvaluation(question.question(),
                                 full, rewrite.query()), rewrite);
                     }
                     default -> throw new IllegalStateException("Неизвестный режим: " + mode);

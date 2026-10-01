@@ -47,9 +47,22 @@ public final class RagService {
 
     public record Result(String answer, List<RagRetriever.Chunk> chunks,
                          List<RagRetriever.Chunk> retrievedChunks,
-                          long retrieveMs, long llmMs, Status status, String error,
-                          int filteredCount, boolean filteredAll, boolean rewriteFallback,
-                          String rewriteQuery, long rewriteMs, String rewriteStatus) {
+                           long retrieveMs, long llmMs, Status status, String error,
+                           int filteredCount, boolean filteredAll, boolean rewriteFallback,
+                           String rewriteQuery, long rewriteMs, String rewriteStatus,
+                           CitationValidator.AnswerStatus answerStatus,
+                           CitationValidator.Validation citations) {
+        public Result(String answer, List<RagRetriever.Chunk> chunks,
+                      List<RagRetriever.Chunk> retrievedChunks, long retrieveMs, long llmMs,
+                      Status status, String error, int filteredCount, boolean filteredAll,
+                      boolean rewriteFallback, String rewriteQuery, long rewriteMs,
+                      String rewriteStatus) {
+            this(answer, chunks, retrievedChunks, retrieveMs, llmMs, status, error,
+                    filteredCount, filteredAll, rewriteFallback, rewriteQuery, rewriteMs,
+                    rewriteStatus, CitationValidator.AnswerStatus.UNVERIFIED,
+                    new CitationValidator.Validation(List.of(), List.of(), 0, 0, 0));
+        }
+
         public Result(String answer, List<RagRetriever.Chunk> chunks,
                       List<RagRetriever.Chunk> retrievedChunks,
                       long retrieveMs, long llmMs, Status status, String error,
@@ -144,40 +157,83 @@ public final class RagService {
     }
 
     public Result complete(Prepared prepared) {
-        if (prepared.prompt().chunks().isEmpty()) {
+        return complete(prepared, true);
+    }
+
+    public Result complete(Prepared prepared, boolean enforceIdkThreshold) {
+        if (enforceIdkThreshold && shouldDecline(prepared)) return lowRelevance(prepared, 0);
+        if (!enforceIdkThreshold && prepared.prompt().chunks().isEmpty()) {
             return new Result(RagConstants.NO_ANSWER, List.of(), prepared.retrievedChunks(),
                     prepared.retrieveMs(), 0, Status.OK, null,
                     prepared.ranking().filteredCount(), prepared.ranking().filteredAll(),
                     prepared.rewriteFallback(), prepared.rewriteQuery(), prepared.rewriteMs(),
-                    prepared.rewriteStatus());
+                    prepared.rewriteStatus(), CitationValidator.AnswerStatus.IDK_MODEL,
+                    new CitationValidator.Validation(List.of(), List.of(), 0, 0, 0));
         }
         long start = System.nanoTime();
         try {
             String answer = completeWithRetry(prepared.prompt().system(), prepared.prompt().user());
-            return new Result(answer, prepared.prompt().chunks(), prepared.retrievedChunks(),
-                    prepared.retrieveMs(), elapsedMs(start), Status.OK, null,
-                    prepared.ranking().filteredCount(), prepared.ranking().filteredAll(),
-                    prepared.rewriteFallback(), prepared.rewriteQuery(), prepared.rewriteMs(),
-                    prepared.rewriteStatus());
+            return evaluateAnswer(prepared, answer, elapsedMs(start));
         } catch (EmptyLlmAnswerException empty) {
             return new Result("", prepared.prompt().chunks(), prepared.retrievedChunks(),
                     prepared.retrieveMs(), elapsedMs(start), Status.EMPTY, errorText(empty),
                     prepared.ranking().filteredCount(), prepared.ranking().filteredAll(),
                     prepared.rewriteFallback(), prepared.rewriteQuery(), prepared.rewriteMs(),
-                    prepared.rewriteStatus());
+                    prepared.rewriteStatus(), CitationValidator.AnswerStatus.UNVERIFIED,
+                    new CitationValidator.Validation(List.of(), List.of(), 0, 0, 0));
         } catch (LlmCallTimeoutException timeout) {
             return new Result("", prepared.prompt().chunks(), prepared.retrievedChunks(),
                     prepared.retrieveMs(), elapsedMs(start), Status.TIMEOUT, errorText(timeout),
                     prepared.ranking().filteredCount(), prepared.ranking().filteredAll(),
                     prepared.rewriteFallback(), prepared.rewriteQuery(), prepared.rewriteMs(),
-                    prepared.rewriteStatus());
+                    prepared.rewriteStatus(), CitationValidator.AnswerStatus.UNVERIFIED,
+                    new CitationValidator.Validation(List.of(), List.of(), 0, 0, 0));
         } catch (Exception error) {
             return new Result("", prepared.prompt().chunks(), prepared.retrievedChunks(),
                     prepared.retrieveMs(), elapsedMs(start), Status.ERROR, errorText(error),
                     prepared.ranking().filteredCount(), prepared.ranking().filteredAll(),
                     prepared.rewriteFallback(), prepared.rewriteQuery(), prepared.rewriteMs(),
-                    prepared.rewriteStatus());
+                    prepared.rewriteStatus(), CitationValidator.AnswerStatus.UNVERIFIED,
+                    new CitationValidator.Validation(List.of(), List.of(), 0, 0, 0));
         }
+    }
+
+    public boolean shouldDecline(Prepared prepared) {
+        return prepared.prompt().chunks().isEmpty()
+                || prepared.retrievedChunks().stream().mapToDouble(RagRetriever.Chunk::score)
+                .max().orElse(0) < prepared.settings().idkThreshold();
+    }
+
+    /** Applies citation checks to the stateful chat response without changing chat history flow. */
+    public Result evaluateAnswer(Prepared prepared, String answer, long llmMs) {
+        String safeAnswer = RagQueryRewriter.redactSecrets(answer == null ? "" : answer);
+        if (safeAnswer.strip().equalsIgnoreCase("НЕ ЗНАЮ")) {
+            return new Result("НЕ ЗНАЮ", prepared.prompt().chunks(), prepared.retrievedChunks(),
+                    prepared.retrieveMs(), llmMs, Status.OK, null,
+                    prepared.ranking().filteredCount(), prepared.ranking().filteredAll(),
+                    prepared.rewriteFallback(), prepared.rewriteQuery(), prepared.rewriteMs(),
+                    prepared.rewriteStatus(), CitationValidator.AnswerStatus.IDK_MODEL,
+                    new CitationValidator.Validation(List.of(), List.of(), 0, 0, 0));
+        }
+        CitationValidator.Validation citations = new CitationValidator()
+                .validate(safeAnswer, prepared.prompt().chunks());
+        CitationValidator.AnswerStatus answerStatus = citations.confirmedQuotes().isEmpty()
+                ? CitationValidator.AnswerStatus.UNVERIFIED
+                : CitationValidator.AnswerStatus.ANSWERED;
+        return new Result(safeAnswer, prepared.prompt().chunks(), prepared.retrievedChunks(),
+                prepared.retrieveMs(), llmMs, Status.OK, null,
+                prepared.ranking().filteredCount(), prepared.ranking().filteredAll(),
+                prepared.rewriteFallback(), prepared.rewriteQuery(), prepared.rewriteMs(),
+                prepared.rewriteStatus(), answerStatus, citations);
+    }
+
+    private Result lowRelevance(Prepared prepared, long llmMs) {
+        return new Result(RagConstants.LOW_RELEVANCE_ANSWER, prepared.prompt().chunks(),
+                prepared.retrievedChunks(), prepared.retrieveMs(), llmMs, Status.OK, null,
+                prepared.ranking().filteredCount(), prepared.ranking().filteredAll(),
+                prepared.rewriteFallback(), prepared.rewriteQuery(), prepared.rewriteMs(),
+                prepared.rewriteStatus(), CitationValidator.AnswerStatus.IDK_LOW_RELEVANCE,
+                new CitationValidator.Validation(List.of(), List.of(), 0, 0, 0));
     }
 
     public Result ask(String question, Mode mode) {
@@ -186,6 +242,21 @@ public final class RagService {
 
     public Result ask(String question, Mode mode, RagSettings requestSettings,
                       String rewriteOverride) {
+        return ask(question, mode, requestSettings, rewriteOverride, true);
+    }
+
+    /** A–D evaluation keeps its historical no-threshold retrieval policy. */
+    public Result askForEvaluation(String question) {
+        return ask(question, Mode.ON, settings, null, false);
+    }
+
+    public Result askForEvaluation(String question, RagSettings requestSettings,
+                                   String rewriteOverride) {
+        return ask(question, Mode.ON, requestSettings, rewriteOverride, false);
+    }
+
+    private Result ask(String question, Mode mode, RagSettings requestSettings,
+                       String rewriteOverride, boolean enforceIdkThreshold) {
         if (mode == Mode.OFF) {
             long start = System.nanoTime();
             try {
@@ -212,7 +283,7 @@ public final class RagService {
                     Status.ERROR, errorText(error), 0, false, false, question, 0,
                     requestSettings.rewriteEnabled() ? "fallback:retrieval-error" : "off");
         }
-        return complete(prepared);
+        return complete(prepared, enforceIdkThreshold);
     }
 
     private Rewrite rewrite(String question, RagSettings requestSettings, String override) {
