@@ -679,7 +679,8 @@ public interface TerminalUi extends AutoCloseable {
                       /rag rerank-analysis     — ранги чанков и сравнение весов без LLM
                       /rag rewrite-test <id>  — диагностика одного rewrite-вызова
                       /rag ask <вопрос>        — ответ RAG с источниками и цитатами
-                      /rag eval cite           — источники, цитаты и отказ; --checkpoint файл
+                      /rag eval cite           — источники, цитаты и отказ;
+                                               --checkpoint файл.json; --report файл.md
                       /rag eval A,B,C,D        — режимы; --questions ids; --resume
                                                  --checkpoint filename.json — новый checkpoint
 

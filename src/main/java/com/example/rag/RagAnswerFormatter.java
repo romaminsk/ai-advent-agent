@@ -9,8 +9,21 @@ public final class RagAnswerFormatter {
 
     public static String format(RagService.Result result, boolean diagnostics) {
         StringBuilder out = new StringBuilder();
-        if (result.answerStatus() == CitationValidator.AnswerStatus.IDK_LOW_RELEVANCE) {
-            out.append(RagConstants.LOW_RELEVANCE_ANSWER).append("\nБлижайшие разделы:");
+        if (result.answerStatus() == CitationValidator.AnswerStatus.IDK_LOW_RELEVANCE
+                || result.answerStatus() == CitationValidator.AnswerStatus.IDK_THRESHOLD) {
+            out.append(RagConstants.LOW_RELEVANCE_ANSWER);
+            if (result.answerStatus() == CitationValidator.AnswerStatus.IDK_THRESHOLD) {
+                out.append("\nПричина: top-1 score ")
+                        .append(String.format(java.util.Locale.ROOT, "%.4f",
+                                result.retrievedChunks().stream()
+                                        .mapToDouble(RagRetriever.Chunk::score).max().orElse(0)))
+                        .append(" ниже порога «не знаю»; фильтр minScore чанки пропустил.");
+            } else if (result.retrievedChunks().isEmpty()) {
+                out.append("\nПричина: поиск не дал чанков.");
+            } else {
+                out.append("\nПричина: после фильтра minScore не осталось чанков (filteredAll).");
+            }
+            out.append("\nБлижайшие разделы:");
             result.retrievedChunks().stream().limit(3).forEach(chunk -> out.append("\n")
                     .append(safe(chunk.source())).append(" — ").append(safe(chunk.section()))
                     .append(" (score ").append(String.format(java.util.Locale.ROOT, "%.4f", chunk.score()))

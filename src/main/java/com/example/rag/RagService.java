@@ -161,7 +161,8 @@ public final class RagService {
     }
 
     public Result complete(Prepared prepared, boolean enforceIdkThreshold) {
-        if (enforceIdkThreshold && shouldDecline(prepared)) return lowRelevance(prepared, 0);
+        CitationValidator.AnswerStatus refusal = enforceIdkThreshold ? idkStatus(prepared) : null;
+        if (refusal != null) return lowRelevance(prepared, refusal, 0);
         if (!enforceIdkThreshold && prepared.prompt().chunks().isEmpty()) {
             return new Result(RagConstants.NO_ANSWER, List.of(), prepared.retrievedChunks(),
                     prepared.retrieveMs(), 0, Status.OK, null,
@@ -199,9 +200,17 @@ public final class RagService {
     }
 
     public boolean shouldDecline(Prepared prepared) {
-        return prepared.prompt().chunks().isEmpty()
-                || prepared.retrievedChunks().stream().mapToDouble(RagRetriever.Chunk::score)
-                .max().orElse(0) < prepared.settings().idkThreshold();
+        return idkStatus(prepared) != null;
+    }
+
+    public CitationValidator.AnswerStatus idkStatus(Prepared prepared) {
+        if (prepared.prompt().chunks().isEmpty()) {
+            return CitationValidator.AnswerStatus.IDK_LOW_RELEVANCE;
+        }
+        double top1 = prepared.retrievedChunks().stream()
+                .mapToDouble(RagRetriever.Chunk::score).max().orElse(0);
+        return top1 < prepared.settings().idkThreshold()
+                ? CitationValidator.AnswerStatus.IDK_THRESHOLD : null;
     }
 
     /** Applies citation checks to the stateful chat response without changing chat history flow. */
@@ -227,12 +236,12 @@ public final class RagService {
                 prepared.rewriteStatus(), answerStatus, citations);
     }
 
-    private Result lowRelevance(Prepared prepared, long llmMs) {
+    private Result lowRelevance(Prepared prepared, CitationValidator.AnswerStatus refusal, long llmMs) {
         return new Result(RagConstants.LOW_RELEVANCE_ANSWER, prepared.prompt().chunks(),
                 prepared.retrievedChunks(), prepared.retrieveMs(), llmMs, Status.OK, null,
                 prepared.ranking().filteredCount(), prepared.ranking().filteredAll(),
                 prepared.rewriteFallback(), prepared.rewriteQuery(), prepared.rewriteMs(),
-                prepared.rewriteStatus(), CitationValidator.AnswerStatus.IDK_LOW_RELEVANCE,
+                prepared.rewriteStatus(), refusal,
                 new CitationValidator.Validation(List.of(), List.of(), 0, 0, 0));
     }
 
