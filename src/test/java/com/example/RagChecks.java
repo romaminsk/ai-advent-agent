@@ -74,9 +74,13 @@ final class RagChecks extends SelfTestSupport {
                         && userPrompt.get().contains("› loading")
                         && on.chunks().stream().anyMatch(chunk ->
                         chunk.chunkId().equals("chunk-a")));
-        expect("RAG system prompt требует опору на контекст и ссылки",
+        expect("RAG system prompt требует опору на контекст, пункты с цитатами и отказ",
                 systemPrompt.get().equals(RagConstants.SYSTEM_PROMPT)
-                        && systemPrompt.get().contains("Не выдумывай"));
+                        && systemPrompt.get().contains("короткими проверяемыми пунктами")
+                        && systemPrompt.get().contains("дословная цитата [n]")
+                        && systemPrompt.get().contains("Пункт без дословной цитаты не включай")
+                        && systemPrompt.get().contains("Не покрыто контекстом:")
+                        && systemPrompt.get().contains("Не добавляй знания вне чанков"));
         expect("RAG измеряет retrieve и LLM раздельно",
                 on.retrieveMs() >= 0 && on.llmMs() >= 0);
         expect("RAG off/on используют отдельный лимит max_tokens=4096",
@@ -569,7 +573,9 @@ final class RagChecks extends SelfTestSupport {
                         && RagSettings.DEFAULT.relativeDelta() == 0.15
                         && RagSettings.DEFAULT.rerankVectorWeight() == 1.0
                         && RagSettings.DEFAULT.rerankLexicalWeight() == 0.0
-                        && !RagSettings.DEFAULT.diversityEnabled());
+                        && !RagSettings.DEFAULT.diversityEnabled()
+                        && RagSettings.DEFAULT.idkThreshold() == RagSettings.DEFAULT_IDK_THRESHOLD
+                        && RagSettings.DEFAULT_IDK_THRESHOLD == 0.50);
 
         Path file = Files.createTempDirectory(baseTempDir, "rag-settings-").resolve("rag.json");
         RagSettingsStore persistence = new RagSettingsStore(file);
@@ -896,17 +902,60 @@ final class RagChecks extends SelfTestSupport {
         expect("выдуманная цитата отбрасывается и ответ становится UNVERIFIED",
                 fabricated.answerStatus() == CitationValidator.AnswerStatus.UNVERIFIED
                         && fabricated.citations().rejectedQuotes() == 1
+                        && fabricated.citations().droppedItemCount() == 1
                         && RagAnswerFormatter.format(fabricated, false)
                         .contains("Не могу подтвердить ответ цитатами из базы")
+                        && RagAnswerFormatter.format(fabricated, false)
+                        .contains("Уточните вопрос, указав файл, класс или команду.")
                         && !RagAnswerFormatter.format(fabricated, false)
                         .contains("This sentence was invented"));
+
+        String mixedAnswer = "Первый факт подтверждён [1] «" + exactQuote + "».\n\n"
+                + "Второй факт не подтверждён [2] «This second sentence was invented and is absent from chunks.»";
+        RagService.Result mixed = citationService(store, embedder, settings, mixedAnswer,
+                new AtomicInteger()).ask(question, RagService.Mode.ON);
+        String mixedFormatted = RagAnswerFormatter.format(mixed, false);
+        expect("одна валидная цитата не легализует остальные пункты: скрыт без своей цитаты",
+                mixed.answerStatus() == CitationValidator.AnswerStatus.ANSWERED
+                        && mixed.citations().droppedItemCount() == 1
+                        && mixed.citations().confirmedItems().size() == 1
+                        && mixedFormatted.contains("Первый факт подтверждён [1]")
+                        && !mixedFormatted.contains("Второй факт не подтверждён")
+                        && mixedFormatted.contains("скрыта: 1 из 2")
+                        && mixedFormatted.contains("[1] src/main/java/Source1.java — section-1 (chunk: chunk-1)")
+                        && !mixedFormatted.contains("[2] src/main/java/Source2.java"));
+
+        String uncoveredAnswer = "Факт подтверждён [1] «" + exactQuote + "».\n\n"
+                + "Не покрыто контекстом: точного правила границы в чанках нет.";
+        RagService.Result uncovered = citationService(store, embedder, settings, uncoveredAnswer,
+                new AtomicInteger()).ask(question, RagService.Mode.ON);
+        String uncoveredFormatted = RagAnswerFormatter.format(uncovered, false);
+        expect("пункт «Не покрыто контекстом» показывается как указание, чего не хватает",
+                uncovered.answerStatus() == CitationValidator.AnswerStatus.ANSWERED
+                        && uncoveredFormatted.contains("Не покрыто контекстом: точного правила границы")
+                        && !uncoveredFormatted.contains("скрыта:")
+                        && uncovered.citations().droppedItemCount() == 0);
+
+        String onlyUncoveredAnswer = "Не покрыто контекстом: механизма нет в чанках, видно только вызов "
+                + "[1] «" + exactQuote + "»";
+        RagService.Result onlyUncovered = citationService(store, embedder, settings, onlyUncoveredAnswer,
+                new AtomicInteger()).ask(question, RagService.Mode.ON);
+        String onlyUncoveredFormatted = RagAnswerFormatter.format(onlyUncovered, false);
+        expect("валидная цитата только в пункте «Не покрыто» не делает ответ подтверждённым",
+                onlyUncovered.answerStatus() == CitationValidator.AnswerStatus.UNVERIFIED
+                        && onlyUncovered.citations().confirmedQuotes().size() == 1
+                        && onlyUncovered.citations().confirmedItems().isEmpty()
+                        && onlyUncoveredFormatted.contains("Не могу подтвердить ответ цитатами из базы")
+                        && onlyUncoveredFormatted.contains("Уточните вопрос, указав файл, класс или команду.")
+                        && !onlyUncoveredFormatted.contains("Не покрыто контекстом"));
 
         RagService.Result outOfRange = citationService(store, embedder, settings,
                 "Факт [7].\n[1] «" + exactQuote + "»", new AtomicInteger())
                 .ask(question, RagService.Mode.ON);
-        expect("ссылка [7] при пяти чанках учитывается как ошибка диапазона",
+        expect("ссылка [7] при пяти чанках учитывается как ошибка диапазона и не выводится",
                 outOfRange.citations().invalidReferences() == 1
-                        && outOfRange.answerStatus() == CitationValidator.AnswerStatus.ANSWERED);
+                        && outOfRange.answerStatus() == CitationValidator.AnswerStatus.ANSWERED
+                        && !RagAnswerFormatter.format(outOfRange, false).contains("[7] "));
 
         String ownSectionAnswer = "Тезис [1].\n## Цитаты\n\n[1] «" + exactQuote + "»\n"
                 + "Источники: [5] invented.java";
@@ -917,19 +966,25 @@ final class RagChecks extends SelfTestSupport {
                 ownSection.answerStatus() == CitationValidator.AnswerStatus.ANSWERED
                         && ownSection.citations().confirmedQuotes().size() == 1
                         && CitationValidator.answerText(ownSectionAnswer).equals("Тезис [1].")
-                        && ownSectionFormatted.contains("Ответ: Тезис [1].")
                         && !ownSectionFormatted.contains("## Цитаты")
                         && !ownSectionFormatted.contains("invented.java"));
 
         RagService.Result noQuotes = citationService(store, embedder, settings,
                 "Ответ со ссылкой [1].", new AtomicInteger()).ask(question, RagService.Mode.ON);
-        expect("ответ без цитат имеет статус UNVERIFIED",
-                noQuotes.answerStatus() == CitationValidator.AnswerStatus.UNVERIFIED);
+        String noQuotesFormatted = RagAnswerFormatter.format(noQuotes, false);
+        expect("ответ без цитат: UNVERIFIED, ссылка без цитаты не попадает в Источники",
+                noQuotes.answerStatus() == CitationValidator.AnswerStatus.UNVERIFIED
+                        && noQuotesFormatted.contains("Уточните вопрос, указав файл, класс или команду.")
+                        && !noQuotesFormatted.contains("[1] src/main/java/Source1.java"));
 
         RagService.Result modelIdk = citationService(store, embedder, settings,
                 "НЕ ЗНАЮ", new AtomicInteger()).ask(question, RagService.Mode.ON);
-        expect("ответ НЕ ЗНАЮ получает IDK_MODEL",
-                modelIdk.answerStatus() == CitationValidator.AnswerStatus.IDK_MODEL);
+        String modelIdkFormatted = RagAnswerFormatter.format(modelIdk, false);
+        expect("ответ НЕ ЗНАЮ: IDK_MODEL с причиной и просьбой уточнить",
+                modelIdk.answerStatus() == CitationValidator.AnswerStatus.IDK_MODEL
+                        && modelIdkFormatted.contains("Ответ: НЕ ЗНАЮ")
+                        && modelIdkFormatted.contains("Причина: модель сообщила")
+                        && modelIdkFormatted.contains("Уточните вопрос, указав файл, класс или команду."));
 
         String spacedText = "Пробелы сохраняются    при переносе строки\nи в точной цитате достаточно символов.";
         String spacedQuote = "Пробелы сохраняются при переносе\nстроки и в точной цитате достаточно символов.";
@@ -1081,7 +1136,7 @@ final class RagChecks extends SelfTestSupport {
         expect("cite eval stub проверяет все 10 вопросов, ловушку, цитаты, cosine и resume",
                 citeCallsAfterFirstRun == 10 && citeLlmCalls.get() == citeCallsAfterFirstRun
                         && citeReport.rows().size() == 10
-                        && citeReport.answersWithSources() == 9
+                        && citeReport.answersWithSources() == 8
                         && citeReport.answersWithQuotes() == 9
                         && citeReport.answeredCount() == 8
                         && citeReport.answerableTotal() == 9
