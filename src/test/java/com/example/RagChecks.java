@@ -745,9 +745,9 @@ final class RagChecks extends SelfTestSupport {
         long started = System.nanoTime();
         RagService.Result timeout = timed.ask("timeout question", RagService.Mode.OFF);
         long elapsed = RagService.elapsedMs(started);
-        expect("таймаут отдельного LLM-вызова возвращается как TIMEOUT",
-                timeout.status() == RagService.Status.TIMEOUT && timeoutCalls.get() == 1
-                        && elapsed < 3_000 && timeout.error().contains("Таймаут LLM-вызова"));
+        expect("таймаут LLM-вызова повторяется один раз и после второго возвращается TIMEOUT",
+                timeout.status() == RagService.Status.TIMEOUT && timeoutCalls.get() == 2
+                        && elapsed < 5_000 && timeout.error().contains("Таймаут LLM-вызова"));
 
         Main.RagEvalCommand parsed = Main.parseRagEvalCommand(
                 "C,D --questions history-lock,context-layers --resume "
@@ -907,6 +907,19 @@ final class RagChecks extends SelfTestSupport {
         expect("ссылка [7] при пяти чанках учитывается как ошибка диапазона",
                 outOfRange.citations().invalidReferences() == 1
                         && outOfRange.answerStatus() == CitationValidator.AnswerStatus.ANSWERED);
+
+        String ownSectionAnswer = "Тезис [1].\n## Цитаты\n\n[1] «" + exactQuote + "»\n"
+                + "Источники: [5] invented.java";
+        RagService.Result ownSection = citationService(store, embedder, settings, ownSectionAnswer,
+                new AtomicInteger()).ask(question, RagService.Mode.ON);
+        String ownSectionFormatted = RagAnswerFormatter.format(ownSection, false);
+        expect("answerText вырезает секции Цитаты/Источники модели, а validate проверяет эти цитаты",
+                ownSection.answerStatus() == CitationValidator.AnswerStatus.ANSWERED
+                        && ownSection.citations().confirmedQuotes().size() == 1
+                        && CitationValidator.answerText(ownSectionAnswer).equals("Тезис [1].")
+                        && ownSectionFormatted.contains("Ответ: Тезис [1].")
+                        && !ownSectionFormatted.contains("## Цитаты")
+                        && !ownSectionFormatted.contains("invented.java"));
 
         RagService.Result noQuotes = citationService(store, embedder, settings,
                 "Ответ со ссылкой [1].", new AtomicInteger()).ask(question, RagService.Mode.ON);
