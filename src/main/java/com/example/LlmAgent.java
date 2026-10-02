@@ -868,11 +868,12 @@ public final class LlmAgent {
         if (userMessage == null || userMessage.isBlank() || answer == null || answer.isBlank()) {
             throw new AgentException("Пустое локальное сообщение или ответ.");
         }
-        // Локальный ответ — это отказ RAG без вызова модели: состояние
-        // обновляется из сообщения пользователя, а вопрос фиксируется
-        // открытым. Цель при этом не затирается (маркеры смены темы явные).
-        dialogState = DialogTaskStateTracker.withOpenQuestion(
-                DialogTaskStateTracker.update(dialogState, userMessage), userMessage);
+        // Локальный ответ — отказ поиска RAG по порогу или подтверждение
+        // мета-сообщения: состояние обновляется из сообщения пользователя,
+        // но в открытые вопросы оно не попадает (отказ по порогу — признак
+        // вопроса вне базы; открытыми фиксируются только отказы по теме —
+        // см. noteOpenQuestion). Цель не затирается (маркеры смены темы явные).
+        dialogState = DialogTaskStateTracker.update(dialogState, userMessage);
         List<ChatMessage> updated = new ArrayList<>(history);
         updated.add(new ChatMessage("user", userMessage));
         updated.add(new ChatMessage("assistant", answer));

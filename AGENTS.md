@@ -11,7 +11,7 @@
 - LLM/config: `LlmAgent`, `Config`, `ModelSettings`, `RequestDiagnostics`.
 - Контекст: `ContextBuilder`, `SummaryEngine`, `StrategyEngine`, `FactsBlock`, `BranchData`.
 - Persistence: `JsonConversationStore`, `MemoryStore`, `ProfileStore`, `InvariantStore`.
-- Состояние диалога (память задачи беседы): `DialogTaskState`, `DialogTaskStateTracker`; поле `dialogState` в файле истории, команды `/dialogstate` и `/dialogstate clear`; цель и термины подмешиваются в поисковый запрос RAG-режима (`RagService.prepareChat`), обновление детерминированное, без LLM.
+- Состояние диалога (память задачи беседы): `DialogTaskState`, `DialogTaskStateTracker`; поле `dialogState` в файле истории, команды `/dialogstate` и `/dialogstate clear`; обновление детерминированное, без LLM. Чисто мета-сообщения («уточняю:», «ограничение:», «термины:» без «?») в RAG-режиме не идут в поиск и LLM — локальный ответ «Зафиксировано: …». Обогащение поискового запроса (goal+terms, `RagService.prepareChat`) — только для вопросов короче 10 слов (минимум по контрольным вопросам калибровки). Открытые вопросы — только отказы по теме (IDK_MODEL/UNVERIFIED после прохождения порогов), лимит 5.
 - Задачи/ограничения: `TaskState`, `TaskStage`, `TaskStatus`, `InvariantGuard`.
 - MCP: `McpClientComponent`, `McpRegistry`, `McpOrchestrator`, `ToolRouter`, `GitMcpServer`, `GitMonitorMcpServer`, `PipelineMcpServer`, `PipelineRunner`.
 - Monitor: `MonitorStore`, `MonitorRunner`, `MonitorWorker`, `MonitorSchedule`, `MonitorAggregator`.
