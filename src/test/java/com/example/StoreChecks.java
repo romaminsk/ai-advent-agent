@@ -67,6 +67,7 @@ final class StoreChecks extends SelfTestSupport {
         checkModelSettings();
         checkSessionTokenLimitSettings();
         checkDialogStatePersistence();
+        checkDefaultHistoryContinuation();
     }
 
      static void checkConversationStore() throws IOException {
@@ -615,6 +616,38 @@ final class StoreChecks extends SelfTestSupport {
         try (JsonConversationStore store = new JsonConversationStore(file)) {
             expect("dialogState не-объект даёт ошибку повреждения состояния диалога",
                     expectStoreError(store::load).contains("состояние диалога"));
+        }
+    }
+
+    /** Дефект 1: без LLM_HISTORY_FILE перезапуск продолжает последнюю сессию. */
+    static void checkDefaultHistoryContinuation() throws IOException {
+        Path dir = Files.createTempDirectory(baseTempDir, "history-continue-");
+        Path older = dir.resolve("chat-20260101-000000-000-0001.json");
+        Path newer = dir.resolve("chat-20260102-000000-000-0001.json");
+        try {
+            expect("до сессий выбирается новый per-run файл chat-*.json",
+                    JsonConversationStore.continueOrNewChatFile(dir)
+                            .getFileName().toString().startsWith("chat-"));
+            Files.createFile(older);
+            expect("с одной прошлой сессией перезапуск продолжает её",
+                    JsonConversationStore.continueOrNewChatFile(dir).equals(older));
+            Files.createFile(newer);
+            expect("из двух сессий перезапуск продолжает самую свежую",
+                    JsonConversationStore.continueOrNewChatFile(dir).equals(newer));
+            Files.createFile(dir.resolve("chat-20260103-000000-000-0001.txt"));
+            Files.createFile(dir.resolve("notes-20260103.json"));
+            Files.createFile(dir.resolve("memory.json"));
+            expect("посторонние файлы (не chat-*.json) не выбираются",
+                    JsonConversationStore.latestChatFile(dir).equals(newer));
+            expect("несуществующий каталог — сессий нет (будет новый файл)",
+                    JsonConversationStore.latestChatFile(dir.resolve("missing")) == null);
+        } finally {
+            try (java.util.stream.Stream<Path> stream = Files.list(dir)) {
+                for (Path path : stream.toList()) {
+                    Files.deleteIfExists(path);
+                }
+            }
+            Files.deleteIfExists(dir);
         }
     }
 

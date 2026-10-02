@@ -111,19 +111,37 @@ final class QuietOutputChecks extends SelfTestSupport {
         }
     }
 
-     static void checkDefaultRunSettings() {
+     static void checkDefaultRunSettings() throws java.io.IOException {
         Map<String, String> empty = Map.of();
         expect("LLM_DIAGNOSTICS по умолчанию false (краткий вывод)",
                 !ModelSettings.from(empty).diagnostics());
 
         Path first = JsonConversationStore.defaultHistoryFile(empty);
-        Path second = JsonConversationStore.defaultHistoryFile(empty);
         expect("история по умолчанию: каталог ~/.ai-advent-agent, имя chat-*.json",
                 first.getParent().getFileName().toString().equals(".ai-advent-agent")
                         && first.getFileName().toString().startsWith("chat-")
                         && first.getFileName().toString().endsWith(".json"));
-        expect("уникальное имя файла истории на каждый запуск",
-                !first.equals(second));
+
+        // Перезапуск продолжает последнюю сессию (история и dialogState
+        // переживают перезапуск); уникальное имя — только когда сессий нет.
+        Path continueDir = Files.createTempDirectory("selftest-history-continue-");
+        try {
+            Path runOne = JsonConversationStore.continueOrNewChatFile(continueDir);
+            Files.createFile(runOne);
+            expect("второй запуск продолжает единственную сессию",
+                    JsonConversationStore.continueOrNewChatFile(continueDir).equals(runOne));
+            Path latest = continueDir.resolve("chat-29991231-235959-999-ffff.json");
+            Files.createFile(latest);
+            expect("запуск выбирает самую свежую из нескольких сессий",
+                    JsonConversationStore.continueOrNewChatFile(continueDir).equals(latest));
+        } finally {
+            try (java.util.stream.Stream<Path> stream = Files.list(continueDir)) {
+                for (Path path : stream.toList()) {
+                    Files.deleteIfExists(path);
+                }
+            }
+            Files.deleteIfExists(continueDir);
+        }
 
         Map<String, String> explicit = new java.util.HashMap<>();
         explicit.put("LLM_HISTORY_FILE", "/tmp/selftest-history-fix.json");

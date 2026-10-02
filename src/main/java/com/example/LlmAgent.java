@@ -1252,8 +1252,13 @@ public final class LlmAgent {
      * нет подтверждённых цитат): ход уже сохранён, поэтому состояние
      * дописывается отдельной атомарной записью. Сбой записи не ломает
      * показанный ответ — заметка уходит в контекстные заметки.
+     * Вопросы вне темы цели/терминов (погода, цены) не фиксируются:
+     * см. {@link DialogTaskStateTracker#onTopic}.
      */
     public void noteOpenQuestion(String userMessage) {
+        if (!DialogTaskStateTracker.onTopic(dialogState, userMessage)) {
+            return;
+        }
         DialogTaskState updated = DialogTaskStateTracker.withOpenQuestion(dialogState,
                 userMessage);
         if (updated.equals(dialogState)) {

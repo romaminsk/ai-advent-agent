@@ -1,8 +1,10 @@
 package com.example;
 
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 
 /**
  * Детерминированное обновление {@link DialogTaskState} после каждого хода
@@ -72,6 +74,15 @@ public final class DialogTaskStateTracker {
             "привет", "здравствуй", "здравствуйте", "добрый день", "добрый вечер",
             "доброе утро", "hello", "hi", "hey", "хай");
 
+    /** Служебные слова, не несущие темы (короткие русские и английские). */
+    private static final Set<String> TOPIC_STOP_WORDS = Set.of(
+            "и", "в", "во", "на", "с", "со", "по", "за", "от", "до", "из", "у",
+            "о", "об", "про", "для", "как", "что", "это", "или", "не", "но",
+            "а", "же", "ли", "я", "мы", "ты", "вы", "он", "она", "они", "оно",
+            "да", "нет", "уже", "все", "без", "при", "над", "под", "пере",
+            "the", "is", "are", "a", "an", "to", "of", "and", "in", "on",
+            "how", "what", "for", "with", "that", "this");
+
     private DialogTaskStateTracker() { }
 
     /**
@@ -138,6 +149,52 @@ public final class DialogTaskStateTracker {
         DialogTaskState state = current == null ? DialogTaskState.EMPTY : current;
         return state.withOpenQuestions(addItem(state.openQuestions(), question,
                 MAX_OPEN_QUESTIONS));
+    }
+
+    /**
+     * Вопрос относится к теме цели/терминов: есть пересечение содержательных
+     * слов (точное равенство либо общий префикс от 4 символов). Внешние
+     * отказы (погода, цены) такого пересечения не имеют и не должны
+     * попадать в {@link #withOpenQuestion} — только по теме вопросов.
+     * Без цели и терминов тема не ограничена: считаем вопрос по теме.
+     */
+    public static boolean onTopic(DialogTaskState state, String question) {
+        if (state == null || question == null || question.isBlank()) {
+            return true;
+        }
+        Set<String> anchors = new LinkedHashSet<>(contentWords(state.goal()));
+        for (String term : state.terms()) {
+            anchors.addAll(contentWords(term));
+        }
+        if (anchors.isEmpty()) {
+            return true;
+        }
+        for (String word : contentWords(question)) {
+            for (String anchor : anchors) {
+                if (word.equals(anchor)) {
+                    return true;
+                }
+                if (word.length() >= 4 && anchor.length() >= 4
+                        && (word.startsWith(anchor) || anchor.startsWith(word))) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** Содержательные слова текста: lowercase, длина от 3, без служебных. */
+    private static List<String> contentWords(String text) {
+        if (text == null || text.isBlank()) {
+            return List.of();
+        }
+        List<String> words = new ArrayList<>();
+        for (String token : text.toLowerCase(Locale.ROOT).split("[^\\p{L}\\p{N}]+")) {
+            if (token.length() >= 3 && !TOPIC_STOP_WORDS.contains(token)) {
+                words.add(token);
+            }
+        }
+        return words;
     }
 
     /**

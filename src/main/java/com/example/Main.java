@@ -307,7 +307,8 @@ public final class Main {
                                     ragResult = activeRagService.complete(prepared);
                                     answer = activeAgent.recordLocalAnswer(input.text(),
                                             com.example.rag.RagAnswerFormatter.format(ragResult,
-                                                    activeAgent.currentSettings().diagnostics()));
+                                                    activeAgent.currentSettings().diagnostics(),
+                                                    true));
                                 } else {
                                     long ragLlmStart = System.nanoTime();
                                     try {
@@ -328,7 +329,7 @@ public final class Main {
                                         ragResult = activeRagService.evaluateAnswer(prepared, rawAnswer,
                                                 com.example.rag.RagService.elapsedMs(ragLlmStart));
                                         answer = com.example.rag.RagAnswerFormatter.format(ragResult,
-                                                activeAgent.currentSettings().diagnostics());
+                                                activeAgent.currentSettings().diagnostics(), true);
                                         // Отказ модели или проверки: вопрос открыт,
                                         // состояние диалога не портится.
                                         if (ragResult.answerStatus()
@@ -342,7 +343,8 @@ public final class Main {
                                                 com.example.rag.RagService.elapsedMs(ragLlmStart));
                                         answer = activeAgent.recordLocalAnswer(input.text(),
                                                 com.example.rag.RagAnswerFormatter.format(ragResult,
-                                                        activeAgent.currentSettings().diagnostics()));
+                                                        activeAgent.currentSettings().diagnostics(),
+                                                        true));
                                     }
                                 }
                             } else {
