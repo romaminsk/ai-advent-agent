@@ -134,6 +134,28 @@ public final class RagService {
                 requestSettings, rewrite.query(), rewrite.fallback(), rewrite.ms(), rewrite.status());
     }
 
+    /**
+     * Вариант для обычного диалога с памятью задачи: retrieval идёт по
+     * searchQuery (вопрос + цель и термины состояния диалога), а реранкер
+     * и промпт получают исходный вопрос — пороги, веса и фильтры не меняются.
+     * Rewrite в этом пути выключен настройкой вызывающего кода.
+     */
+    public Prepared prepareChat(String question, String searchQuery,
+                                RagSettings requestSettings) throws Exception {
+        Rewrite rewrite = rewrite(question, requestSettings, null);
+        long searchStart = System.nanoTime();
+        List<RagRetriever.Chunk> chunks = retriever.retrieve(
+                searchQuery == null || searchQuery.isBlank() ? question : searchQuery,
+                requestSettings.topKBefore());
+        RagReranker.Result ranking = reranker.process(question, chunks, requestSettings);
+        List<RagRetriever.Chunk> selected = ranking.selected().stream()
+                .map(RagReranker.ScoredChunk::chunk).toList();
+        RagPromptBuilder.Prompt prompt = promptBuilder.build(question, selected);
+        return new Prepared(question, prompt, chunks, elapsedMs(searchStart), ranking,
+                requestSettings, rewrite.query(), rewrite.fallback(), rewrite.ms(),
+                rewrite.status());
+    }
+
     public Retrieval retrieveOnly(String question) throws Exception {
         return retrieveOnly(question, settings);
     }

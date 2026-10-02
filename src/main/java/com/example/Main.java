@@ -190,6 +190,10 @@ public final class Main {
                                 || normalized.startsWith("/forget ")) {
                             LlmAgent activeAgent = activeAgent(demoRef, agent);
                             handleMemoryCommand(ui, activeAgent, input.text(), demoRef);
+                        } else if (normalized.equals("/dialogstate")
+                                || normalized.startsWith("/dialogstate ")) {
+                            LlmAgent activeAgent = activeAgent(demoRef, agent);
+                            handleDialogStateCommand(ui, activeAgent, input.text(), demoRef);
                         } else if (normalized.equals("/invariant")
                                 || normalized.startsWith("/invariant ")) {
                             LlmAgent activeAgent = activeAgent(demoRef, agent);
@@ -265,8 +269,13 @@ public final class Main {
                             if (ragRef.enabled) {
                                 com.example.rag.RagService.Prepared prepared;
                                 try {
-                                    prepared = ragRef.service(activeAgent).prepare(input.text(),
-                                            ragRef.settings.withRewrite(false), null);
+                                    // Поисковый запрос = вопрос + цель и термины
+                                    // состояния диалога (с лимитом длины); пороги
+                                    // и веса retrieval не меняются, rewrite выключен.
+                                    String searchQuery = DialogTaskStateTracker.searchQuery(
+                                            activeAgent.dialogState(), input.text());
+                                    prepared = ragRef.service(activeAgent).prepareChat(input.text(),
+                                            searchQuery, ragRef.settings.withRewrite(false));
                                 } catch (Exception e) {
                                     throw new AgentException("Ошибка поиска RAG: "
                                             + (e.getMessage() == null ? "неизвестная ошибка"
@@ -282,12 +291,27 @@ public final class Main {
                                 } else {
                                     long ragLlmStart = System.nanoTime();
                                     try {
+                                        // Состояние диалога — коротким блоком до
+                                        // RAG-инструкции и RAG-контекста (только
+                                        // в RAG-режиме: обычный system-промпт
+                                        // не меняется).
+                                        String stateBlock = DialogTaskStateTracker.promptBlock(
+                                                activeAgent.dialogState());
                                         String rawAnswer = activeAgent.askWithRagContext(input.text(),
-                                                prepared.prompt().system(), prepared.prompt().user());
+                                                stateBlock + prepared.prompt().system(),
+                                                prepared.prompt().user());
                                         ragResult = activeRagService.evaluateAnswer(prepared, rawAnswer,
                                                 com.example.rag.RagService.elapsedMs(ragLlmStart));
                                         answer = com.example.rag.RagAnswerFormatter.format(ragResult,
                                                 activeAgent.currentSettings().diagnostics());
+                                        // Отказ модели или проверки: вопрос открыт,
+                                        // состояние диалога не портится.
+                                        if (ragResult.answerStatus()
+                                                == com.example.rag.CitationValidator.AnswerStatus.IDK_MODEL
+                                                || ragResult.answerStatus()
+                                                == com.example.rag.CitationValidator.AnswerStatus.UNVERIFIED) {
+                                            activeAgent.noteOpenQuestion(input.text());
+                                        }
                                     } catch (EmptyLlmAnswerException empty) {
                                         ragResult = activeRagService.evaluateAnswer(prepared, "",
                                                 com.example.rag.RagService.elapsedMs(ragLlmStart));
@@ -594,6 +618,41 @@ public final class Main {
         } catch (AgentException e) {
             ui.showError(e.getMessage());
         }
+    }
+
+    // ================= Состояние диалога (память задачи беседы) =================
+
+    /**
+     * Команда /dialogstate: показ состояния диалога (цель, уточнения,
+     * ограничения, термины, открытые вопросы) и его сброс. Состояние
+     * обновляется автоматически после каждого хода; LLM не вызывается.
+     */
+    private static void handleDialogStateCommand(TerminalUi ui, LlmAgent agent, String raw,
+                                                 DemoRef demoRef) {
+        if (demoRef.demo != null) {
+            ui.showSystem("В режиме измерения токенов команды состояния диалога "
+                    + "работают с основной беседой. Завершите режим (/demo stop) и повторите.");
+            return;
+        }
+        String argument = raw.length() > "/dialogstate".length()
+                ? raw.substring("/dialogstate".length()).trim() : "";
+        if (argument.isEmpty()) {
+            ui.showSystem(DialogTaskStateTracker.renderView(agent.dialogState()));
+            return;
+        }
+        if (argument.equalsIgnoreCase("clear")) {
+            try {
+                agent.clearDialogState();
+                ui.showSystem("✓ Состояние диалога очищено. История не изменена; "
+                        + "полный сброс вместе с историей — /clear.");
+            } catch (ConversationStoreException e) {
+                ui.showError(e.getMessage());
+            }
+            return;
+        }
+        ui.showSystem("Использование: /dialogstate — показать цель, уточнения, "
+                + "ограничения, термины и открытые вопросы; /dialogstate clear — "
+                + "очистить состояние (история сохраняется).");
     }
 
     // ================= Инварианты (жёсткие рамки) =================

@@ -66,6 +66,7 @@ final class StoreChecks extends SelfTestSupport {
         checkStoresHardening();
         checkModelSettings();
         checkSessionTokenLimitSettings();
+        checkDialogStatePersistence();
     }
 
      static void checkConversationStore() throws IOException {
@@ -564,6 +565,56 @@ final class StoreChecks extends SelfTestSupport {
         } finally {
             server.stop(0);
             Files.deleteIfExists(keyStore);
+        }
+    }
+
+     static void checkDialogStatePersistence() throws IOException {
+        // Round-trip: состояние диалога со всеми полями переживает запись и чтение.
+        DialogTaskState original = new DialogTaskState("цель Х", List.of("уточнение У"),
+                List.of("только Java"), List.of("чанк"), List.of("вопрос?"));
+        try (JsonConversationStore store = tempStore()) {
+            store.save(new ConversationState("sid-dlg", List.of(
+                    new ChatMessage("user", "q"), new ChatMessage("assistant", "a")),
+                    null, null, null, original));
+            ConversationState loaded = store.load();
+            expect("состояние диалога переживает round-trip через JSON",
+                    original.equals(loaded.dialogState()));
+        }
+
+        // Совместимость: файл, записанный без dialogState (старый конструктор).
+        try (JsonConversationStore store = tempStore()) {
+            store.save(new ConversationState("sid-old", List.of(
+                    new ChatMessage("user", "q"), new ChatMessage("assistant", "a")),
+                    null, null, null));
+            ConversationState loaded = store.load();
+            expect("файл без dialogState читается с null-состоянием, сообщения на месте",
+                    loaded.dialogState() == null && loaded.messages().size() == 2);
+        }
+
+        // Пустое состояние не сериализуется вовсе.
+        try (JsonConversationStore store = tempStore()) {
+            store.save(new ConversationState("sid-empty", List.of(
+                    new ChatMessage("user", "q"), new ChatMessage("assistant", "a")),
+                    null, null, null, DialogTaskState.EMPTY));
+            expect("пустое состояние диалога не сериализуется в файл",
+                    !Files.readString(store.file(), StandardCharsets.UTF_8)
+                            .contains("dialogState"));
+        }
+
+        // Повреждённое поле dialogState — понятная ошибка повреждения, файл не меняется.
+        Path file = Files.createTempDirectory(baseTempDir, "dlg-corrupt-")
+                .resolve("conversation.json");
+        Files.writeString(file, "{\"schemaVersion\":3,\"sessionId\":\"s\",\"messages\":[],"
+                + "\"dialogState\":{\"goal\":123}}", StandardCharsets.UTF_8);
+        try (JsonConversationStore store = new JsonConversationStore(file)) {
+            expect("числовой goal в dialogState даёт ошибку повреждения состояния диалога",
+                    expectStoreError(store::load).contains("состояние диалога"));
+        }
+        Files.writeString(file, "{\"schemaVersion\":3,\"sessionId\":\"s\",\"messages\":[],"
+                + "\"dialogState\":\"строка\"}", StandardCharsets.UTF_8);
+        try (JsonConversationStore store = new JsonConversationStore(file)) {
+            expect("dialogState не-объект даёт ошибку повреждения состояния диалога",
+                    expectStoreError(store::load).contains("состояние диалога"));
         }
     }
 

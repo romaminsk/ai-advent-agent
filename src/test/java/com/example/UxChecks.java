@@ -56,6 +56,33 @@ import java.util.concurrent.CopyOnWriteArraySet;
 final class UxChecks extends SelfTestSupport {
     static void run() throws Exception {
         checkUxGroup();
+        checkDialogStateCommandUx();
+    }
+
+     static void checkDialogStateCommandUx() throws Exception {
+        boolean listed = false;
+        for (String name : TerminalUi.chatCommandNames()) {
+            if (name.equals("/dialogstate")) {
+                listed = true;
+            }
+        }
+        expect("/dialogstate входит в список известных команд (подсказки опечаток)", listed);
+        expect("полный индекс /help all содержит /dialogstate в группе «Память»",
+                TerminalUi.chatIndex(80).contains("/dialogstate"));
+        String commandHelp = TerminalUi.chatCommandHelp("/dialogstate");
+        expect("у /dialogstate есть подробная справка с /dialogstate clear",
+                commandHelp != null && commandHelp.contains("/dialogstate clear"));
+
+        LlmAgent agent = newMemoryAgent(new Config("test-key",
+                        "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash"),
+                HttpClient.newHttpClient(), Map.of());
+        FakeUi ui = new FakeUi(
+                TerminalUi.Input.command("/dialogstate"),
+                TerminalUi.Input.command("/exit"));
+        Main.runLoop(ui, agent, "glm-5.3-flash");
+        expect("/dialogstate при пустом состоянии показывает пустое состояние без ошибок",
+                ui.systems.stream().anyMatch(s -> s.contains("Состояние диалога пока пусто"))
+                        && ui.errors.isEmpty());
     }
 
      static void checkPlainTerminalUi() {

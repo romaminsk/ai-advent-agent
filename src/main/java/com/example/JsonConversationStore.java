@@ -61,7 +61,7 @@ import java.util.Set;
  */
 public final class JsonConversationStore implements ConversationStore {
 
-    /** Текущая поддерживаемая версия формата (+ блок фактов и ветки). */
+    /** Текущая поддерживаемая версия формата (+ блок фактов, ветки и состояние диалога). */
     public static final int SUPPORTED_SCHEMA_VERSION = 3;
 
     /** Версии без резюме/фактов/веток; по-прежнему читаются полностью. */
@@ -251,12 +251,16 @@ public final class JsonConversationStore implements ConversationStore {
         ConversationSummary summary = parseSummaryForVersion(schemaVersion, root);
         LinkedHashMap<String, String> facts;
         BranchData branches;
+        DialogTaskState dialogState;
         try {
             facts = schemaVersion >= DAY9_SCHEMA_VERSION
                     ? parseFacts(root.get("facts"))
                     : null;
             branches = schemaVersion >= SUPPORTED_SCHEMA_VERSION
                     ? parseBranches(root.get("branches"), messages.size())
+                    : null;
+            dialogState = schemaVersion >= SUPPORTED_SCHEMA_VERSION
+                    ? parseDialogState(root.get("dialogState"))
                     : null;
         } catch (ConversationStoreException e) {
             // Ошибка необязательной сущности тоже содержит путь к файлу.
@@ -277,7 +281,8 @@ public final class JsonConversationStore implements ConversationStore {
                 throw corrupt("хвост активной ветки не совпадает с массивом messages");
             }
         }
-        return new ConversationState(sessionIdNode.asText(), messages, summary, facts, branches);
+        return new ConversationState(sessionIdNode.asText(), messages, summary, facts,
+                branches, dialogState);
     }
 
     /** Summary читается в версиях 2+; в старых файлах его нет. */
@@ -349,6 +354,58 @@ public final class JsonConversationStore implements ConversationStore {
             facts.put(key, valueNode.asText());
         }
         return facts;
+    }
+
+    /**
+     * Читает необязательное состояние диалога (dialogState): цель, уточнения,
+     * ограничения, термины и открытые вопросы. Отсутствие поля — null
+     * (совместимость с файлами, записанными до его появления). Повреждённое
+     * поле — ошибка повреждения: применять молча нельзя.
+     */
+    private static DialogTaskState parseDialogState(JsonNode node) {
+        if (node == null || node.isNull() || node.isMissingNode()) {
+            return null;
+        }
+        if (!node.isObject()) {
+            throw corruptEntity("состояние диалога (dialogState)",
+                    "ожидается объект с полями goal, clarifications, constraints, "
+                            + "terms, openQuestions");
+        }
+        String goal = null;
+        JsonNode goalNode = node.get("goal");
+        if (goalNode != null && !goalNode.isNull()) {
+            if (!goalNode.isTextual() || goalNode.asText().isBlank()) {
+                throw corruptEntity("состояние диалога (dialogState)",
+                        "goal не является непустым текстом");
+            }
+            goal = goalNode.asText();
+        }
+        return new DialogTaskState(goal,
+                parseStringList(node.get("clarifications"), "clarifications"),
+                parseStringList(node.get("constraints"), "constraints"),
+                parseStringList(node.get("terms"), "terms"),
+                parseStringList(node.get("openQuestions"), "openQuestions"));
+    }
+
+    /** Список непустых строк необязательного поля dialogState; отсутствие — пустой список. */
+    private static List<String> parseStringList(JsonNode node, String name) {
+        if (node == null || node.isNull() || node.isMissingNode()) {
+            return List.of();
+        }
+        if (!node.isArray()) {
+            throw corruptEntity("состояние диалога (dialogState)",
+                    name + " не является массивом строк");
+        }
+        List<String> items = new ArrayList<>();
+        for (int i = 0; i < node.size(); i++) {
+            JsonNode item = node.get(i);
+            if (item == null || !item.isTextual() || item.asText().isBlank()) {
+                throw corruptEntity("состояние диалога (dialogState)",
+                        name + "[" + i + "] не является непустым текстом");
+            }
+            items.add(item.asText());
+        }
+        return items;
     }
 
     /**
@@ -590,7 +647,29 @@ public final class JsonConversationStore implements ConversationStore {
                 }
             }
         }
+        DialogTaskState dialogState = state.dialogState();
+        if (dialogState != null && !dialogState.isEmpty()) {
+            ObjectNode stateNode = root.putObject("dialogState");
+            if (dialogState.goal() != null) {
+                stateNode.put("goal", dialogState.goal());
+            }
+            putStringArray(stateNode, "clarifications", dialogState.clarifications());
+            putStringArray(stateNode, "constraints", dialogState.constraints());
+            putStringArray(stateNode, "terms", dialogState.terms());
+            putStringArray(stateNode, "openQuestions", dialogState.openQuestions());
+        }
         return MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(root) + "\n";
+    }
+
+    /** Непустой список строк dialogState в JSON; пустой не сериализуется. */
+    private static void putStringArray(ObjectNode parent, String name, List<String> items) {
+        if (items == null || items.isEmpty()) {
+            return;
+        }
+        ArrayNode array = parent.putArray(name);
+        for (String item : items) {
+            array.add(item);
+        }
     }
 
     /**
