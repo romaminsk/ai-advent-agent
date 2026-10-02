@@ -185,7 +185,7 @@ public interface TerminalUi extends AutoCloseable {
     static String chatIndex(int width) {
         record Row(String group, String commands, String purpose) {}
         Row[] rows = {
-                new Row("Память", "/memory /remember /forget /task /history",
+                new Row("Память", "/memory /remember /forget /task /dialogstate /history",
                         "что агент помнит: надолго, в рамках задачи и диалога"),
                 new Row("Профиль", "/profile /skill /pipeline",
                         "как к вам обращаться и как отвечать"),
@@ -229,6 +229,7 @@ public interface TerminalUi extends AutoCloseable {
     static String[] chatCommandNames() {
         return new String[]{
                 "/help", "/history", "/memory", "/remember", "/forget", "/task",
+                "/dialogstate",
                 "/profile", "/skill", "/pipeline", "/invariant", "/clear", "/reset",
                 "/mode", "/multiline", "/paste", "/demo",
                 "/context", "/summary", "/strategy", "/facts", "/branch",
@@ -424,6 +425,25 @@ public interface TerminalUi extends AutoCloseable {
                       при нескольких совпадениях показывается список — уточните.
 
                     Связано: /memory, /remember.""";
+            case "/dialogstate" -> """
+                    /dialogstate — состояние диалога: цель, уточнения, рамки
+
+                    Использование
+                      /dialogstate        — показать состояние диалога
+                      /dialogstate clear  — очистить состояние (история сохраняется)
+
+                    Эффекты
+                      состояние диалога (память задачи беседы) заполняется
+                      автоматически после каждого ответа: цель — из первого
+                      сообщения и меняется только при явной смене темы;
+                      уточнения, ограничения и термины — по явным формулировкам
+                      («уточняю: …», «ограничение: …», «только …», «термины: …»);
+                      открытые вопросы — после отказов RAG. Хранится в файле
+                      истории, переживает перезапуск и сбрасывается вместе
+                      с историей (/clear, /reset). В режиме /rag on цель
+                      и термины добавляются в поисковый запрос. Не вызывает API.
+
+                    Связано: /task, /facts, /rag, /clear.""";
             case "/task" -> """
                     /task — состояние задачи: конечный автомат этапов
 

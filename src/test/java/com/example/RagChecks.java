@@ -47,6 +47,10 @@ final class RagChecks extends SelfTestSupport {
         checkEvalCheckpointResumeAndLlmTimeout();
         checkDetailedThresholdScan();
         checkCitationsAndIdk();
+        checkDialogStateTracker();
+        checkDialogStateRagFlow();
+        checkDialogStateClearAndReset();
+        checkDialogStateRestoreAfterRestart();
     }
 
     private static void checkPromptAndRetriever() throws Exception {
@@ -1163,6 +1167,305 @@ final class RagChecks extends SelfTestSupport {
                         && citeReport.markdown().contains("Длительность: всего")
                         && citeReport.markdown().contains("факты найдено")
                         && citeReport.markdown().contains("| fixed-limits | UNVERIFIED |"));
+    }
+
+    /**
+     * Детерминированный embedder для диалогового сценария состояния диалога:
+     * записывает все входные тексты запросов; текст со словом «погода» получает
+     * ортогональный вектор (score 0 ко всем чанкам), остальные — вектор chunk-a.
+     */
+    private static final class KeywordEmbedder implements com.example.index.Embedder {
+        final List<String> queries = new ArrayList<>();
+
+        @Override
+        public int batchSize() {
+            return 4;
+        }
+
+        @Override
+        public List<float[]> embed(List<String> texts) {
+            queries.addAll(texts);
+            List<float[]> vectors = new ArrayList<>();
+            for (String text : texts) {
+                vectors.add(text.toLowerCase(java.util.Locale.ROOT).contains("погода")
+                        ? new float[]{0f, 0f, 1f} : new float[]{1f, 0f, 0f});
+            }
+            return vectors;
+        }
+    }
+
+    private static void checkDialogStateTracker() {
+        DialogTaskState greeted = DialogTaskStateTracker.update(DialogTaskState.EMPTY, "привет");
+        expect("приветствие «привет» целью диалога не становится", greeted.goal() == null);
+        DialogTaskState state = DialogTaskStateTracker.update(greeted,
+                "Разбираюсь с пайплайном индексации");
+        expect("цель — первое содержательное сообщение беседы",
+                "Разбираюсь с пайплайном индексации".equals(state.goal()));
+
+        DialogTaskState clarified = DialogTaskStateTracker.update(state,
+                "уточняю: интересует structure-стратегия");
+        expect("уточнение добавляется в список и не затирает цель",
+                clarified.clarifications().equals(List.of("интересует structure-стратегия"))
+                        && "Разбираюсь с пайплайном индексации".equals(clarified.goal()));
+
+        DialogTaskState constrained = DialogTaskStateTracker.update(clarified,
+                "ограничение: только Java-код");
+        expect("ограничение с двоеточием сохраняет текст после маркера",
+                constrained.constraints().contains("только Java-код"));
+        DialogTaskState onlyConstraint = DialogTaskStateTracker.update(state,
+                "смотри только Java-код");
+        expect("маркер «только» без двоеточия сохраняет ограничение от места маркера",
+                onlyConstraint.constraints().contains("только Java-код"));
+
+        DialogTaskState withTerms = DialogTaskStateTracker.update(clarified,
+                "термины: чанк, перекрытие, секция");
+        expect("термины режутся по запятым в отдельные элементы",
+                withTerms.terms().equals(List.of("чанк", "перекрытие", "секция")));
+
+        DialogTaskState newTopic = DialogTaskStateTracker.update(withTerms,
+                "новая тема: погода и климат");
+        expect("явная смена темы меняет цель и очищает все списки",
+                "новая тема: погода и климат".equals(newTopic.goal())
+                        && newTopic.clarifications().isEmpty()
+                        && newTopic.constraints().isEmpty()
+                        && newTopic.terms().isEmpty()
+                        && newTopic.openQuestions().isEmpty());
+
+        DialogTaskState duplicate = DialogTaskStateTracker.update(DialogTaskState.EMPTY,
+                "уточняю: одно и то же");
+        duplicate = DialogTaskStateTracker.update(duplicate, "УТОЧНЯЮ: Одно И ТО ЖЕ");
+        expect("дубликаты элементов без учёта регистра не добавляются",
+                duplicate.clarifications().size() == 1);
+
+        DialogTaskState overflow = DialogTaskState.EMPTY;
+        for (int i = 1; i <= 12; i++) {
+            overflow = DialogTaskStateTracker.update(overflow,
+                    String.format("уточняю: пункт %02d", i));
+        }
+        expect("при переполнении списка вытесняются самые старые элементы",
+                overflow.clarifications().size() == DialogTaskStateTracker.MAX_ITEMS
+                        && !overflow.clarifications().contains("пункт 01")
+                        && !overflow.clarifications().contains("пункт 02")
+                        && overflow.clarifications().contains("пункт 11")
+                        && overflow.clarifications().contains("пункт 12"));
+
+        DialogTaskState longItem = DialogTaskStateTracker.update(DialogTaskState.EMPTY,
+                "уточняю: " + "x".repeat(250));
+        expect("элемент списка обрезается до 200 символов",
+                longItem.clarifications().size() == 1
+                        && longItem.clarifications().get(0).length()
+                        == DialogTaskStateTracker.MAX_ITEM_CHARS);
+        DialogTaskState longGoal = DialogTaskStateTracker.update(DialogTaskState.EMPTY,
+                "ц".repeat(350));
+        expect("цель обрезается до 300 символов",
+                longGoal.goal() != null
+                        && longGoal.goal().length() == DialogTaskStateTracker.MAX_GOAL_CHARS);
+
+        DialogTaskState secretClarification = DialogTaskStateTracker.update(DialogTaskState.EMPTY,
+                "уточняю: api_key: abcdef123456789");
+        expect("уточнение, похожее на секрет, не сохраняется",
+                secretClarification.clarifications().isEmpty());
+        DialogTaskState secretGoal = DialogTaskStateTracker.update(DialogTaskState.EMPTY,
+                "api_key: abcdef123456789");
+        expect("сообщение, похожее на секрет, не становится целью",
+                secretGoal.goal() == null);
+
+        String question = "как устроен индекс?";
+        expect("пустое состояние не меняет поисковый запрос",
+                DialogTaskStateTracker.searchQuery(DialogTaskState.EMPTY, question)
+                        .equals(question));
+        DialogTaskState searchState = DialogTaskState.EMPTY.withGoal("Цель про индексацию")
+                .withTerms(List.of("чанк"));
+        String searchQuery = DialogTaskStateTracker.searchQuery(searchState, question);
+        expect("поисковый запрос содержит вопрос, цель и термины",
+                searchQuery.contains(question) && searchQuery.contains("Цель про индексацию")
+                        && searchQuery.contains("чанк"));
+        DialogTaskState cappedState = DialogTaskStateTracker.update(DialogTaskState.EMPTY,
+                "а".repeat(350));
+        expect("добавка состояния к поисковому запросу не длиннее 300 символов",
+                DialogTaskStateTracker.searchQuery(cappedState, question).length()
+                        <= question.length() + 1
+                        + DialogTaskStateTracker.MAX_SEARCH_SUPPLEMENT_CHARS);
+
+        expect("promptBlock пустого состояния пуст",
+                DialogTaskStateTracker.promptBlock(DialogTaskState.EMPTY).isEmpty());
+        String block = DialogTaskStateTracker.promptBlock(searchState);
+        expect("promptBlock содержит заголовок блока и текст цели",
+                block.contains("СОСТОЯНИЕ ДИАЛОГА") && block.contains("Цель про индексацию"));
+
+        expect("renderView пустого состояния сообщает о пустоте",
+                DialogTaskStateTracker.renderView(DialogTaskState.EMPTY).contains("пока пусто"));
+        String view = DialogTaskStateTracker.renderView(searchState);
+        expect("renderView непустого состояния показывает цель и термины",
+                view.contains("Цель:") && view.contains("Термины:"));
+    }
+
+    private static void checkDialogStateRagFlow() throws Exception {
+        Path keyStore = createSelfSignedKeyStore();
+        KeywordEmbedder embedder = new KeywordEmbedder();
+        AtomicInteger llmCalls = new AtomicInteger();
+        List<String> bodies = new ArrayList<>();
+        var server = startHttpsServer(keyStore, (body, session, auth) -> {
+            llmCalls.incrementAndGet();
+            bodies.add(body);
+            return json(200, "{\"choices\":[{\"finish_reason\":\"stop\",\"message\":{\"role\":"
+                    + "\"assistant\",\"content\":\"Загрузчик принимает документы [1].\\n"
+                    + "[1] «Loader accepts markdown and Java documents.»\"}}],\"usage\":{"
+                    + "\"prompt_tokens\":10,\"completion_tokens\":20,\"total_tokens\":30}}");
+        });
+        IndexStore store = new IndexStore(
+                Files.createTempDirectory(baseTempDir, "rag-dialog-state-"));
+        JsonConversationStore history = tempStore();
+        try {
+            store.save(new IndexStore.Index("structure", "fake", 3, Instant.now(), "tmp", 0,
+                    0, 0, List.of(
+                    new IndexStore.IndexedChunk(new ChunkMeta("chunk-a",
+                            "src/main/java/com/example/DocumentLoader.java", "DocumentLoader",
+                            "loading", "structure", 0, 42, 42),
+                            "Loader accepts markdown and Java documents.",
+                            new float[]{1f, 0f, 0f}),
+                    new IndexStore.IndexedChunk(new ChunkMeta("chunk-b", "Other.java", "Other",
+                            "irrelevant", "structure", 0, 15, 15), "unrelated chunk",
+                            new float[]{0f, 1f, 0f}))));
+            Config config = new Config("test-key", "https://127.0.0.1:"
+                    + server.getAddress().getPort() + "/v1/chat/completions", "glm-5.3-flash");
+            LlmAgent agent = new LlmAgent(config, ModelSettings.defaults(),
+                    trustedHttpClient(keyStore), history, tempMemoryStore());
+            AtomicInteger serviceLlmCalls = new AtomicInteger();
+            RagService service = new RagService(new RagRetriever(store, embedder),
+                    new RagPromptBuilder(), ContextBuilder.BASE_SYSTEM_PROMPT,
+                    (system, user, tokens) -> {
+                        serviceLlmCalls.incrementAndGet();
+                        return "неожиданный вызов LLM-клиента сервиса";
+                    });
+            FakeUi ui = new FakeUi(
+                    TerminalUi.Input.command("/rag on"),
+                    TerminalUi.Input.message("Разбираюсь с пайплайном индексации документов"),
+                    TerminalUi.Input.message("уточняю: интересует structure-стратегия"),
+                    TerminalUi.Input.message("ограничение: только Java-код"),
+                    TerminalUi.Input.message("термины: чанк, перекрытие, секция"),
+                    TerminalUi.Input.message("как задано перекрытие чанков?"),
+                    TerminalUi.Input.message("какая сейчас погода в Берлине?"),
+                    TerminalUi.Input.command("/dialogstate"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(ui, agent, "glm-5.3-flash", service);
+
+            expect("каждое сообщение диалога вызвало ровно один поиск по индексу",
+                    embedder.queries.size() == 6);
+            expect("поисковый запрос пятого сообщения содержит цель и термины состояния",
+                    embedder.queries.size() >= 5
+                            && embedder.queries.get(4)
+                            .contains("Разбираюсь с пайплайном индексации документов")
+                            && embedder.queries.get(4).contains("чанк"));
+            boolean sourcesOk = ui.messages.size() >= 5;
+            for (int i = 0; i < Math.min(5, ui.messages.size()); i++) {
+                sourcesOk &= ui.messages.get(i).contains("Источники:")
+                        && ui.messages.get(i).contains("DocumentLoader.java")
+                        && ui.messages.get(i).contains("chunk: chunk-a");
+            }
+            expect("первые пять ответов содержат источники из метаданных chunk-a", sourcesOk);
+            String fifthBody = bodies.size() >= 5 ? bodies.get(4) : "";
+            expect("тело запроса к LLM содержит блок состояния диалога до RAG-контекста",
+                    fifthBody.contains("СОСТОЯНИЕ ДИАЛОГА") && fifthBody.contains("Контекст:")
+                            && fifthBody.indexOf("СОСТОЯНИЕ ДИАЛОГА")
+                            < fifthBody.indexOf("Контекст:"));
+            String refusal = ui.messages.size() >= 6 ? ui.messages.get(5) : "";
+            expect("вопрос о погоде получает локальный отказ без вызова LLM",
+                    refusal.contains("Не знаю") && refusal.contains("Причина")
+                            && refusal.contains("Уточните") && llmCalls.get() == 5
+                            && serviceLlmCalls.get() == 0);
+            DialogTaskState state = agent.dialogState();
+            expect("состояние диалога после сценария: цель, уточнение, ограничение, термины",
+                    "Разбираюсь с пайплайном индексации документов".equals(state.goal())
+                            && state.clarifications().contains("интересует structure-стратегия")
+                            && state.constraints().contains("только Java-код")
+                            && state.terms().equals(List.of("чанк", "перекрытие", "секция")));
+            expect("вопрос с локальным отказом зафиксирован открытым",
+                    state.openQuestions().contains("какая сейчас погода в Берлине?"));
+            String dialogView = String.join("\n", ui.systems);
+            expect("/dialogstate показывает цель, термины и открытый вопрос",
+                    dialogView.contains("Состояние диалога (память задачи):")
+                            && dialogView.contains("Разбираюсь с пайплайном индексации документов")
+                            && dialogView.contains("перекрытие")
+                            && dialogView.contains("какая сейчас погода в Берлине?"));
+        } finally {
+            history.close();
+            server.stop(0);
+            Files.deleteIfExists(keyStore);
+        }
+    }
+
+    private static void checkDialogStateClearAndReset() throws Exception {
+        // Прямые вызовы агента без HTTP: clearDialogState и resetConversation.
+        JsonConversationStore store = tempStore();
+        try {
+            LlmAgent agent = new LlmAgent(new Config("test-key",
+                    "https://127.0.0.1:1/v1/chat/completions", "test-model"),
+                    ModelSettings.defaults(), HttpClient.newHttpClient(), store,
+                    tempMemoryStore());
+            agent.recordLocalAnswer("уточняю: важна structure-стратегия", "локальный ответ");
+            expect("локальный ответ заполнил состояние диалога и историю",
+                    !agent.dialogState().isEmpty() && agent.getHistory().size() == 2);
+            agent.clearDialogState();
+            expect("clearDialogState очищает состояние и сохраняет историю",
+                    agent.dialogState().isEmpty() && agent.getHistory().size() == 2);
+            agent.recordLocalAnswer("термины: чанк", "ещё ответ");
+            expect("после очистки состояние заполняется заново",
+                    agent.dialogState().terms().contains("чанк")
+                            && agent.getHistory().size() == 4);
+            agent.resetConversation();
+            expect("resetConversation сбрасывает состояние вместе с историей",
+                    agent.dialogState().isEmpty() && agent.getHistory().isEmpty());
+            expect("файл истории после resetConversation не содержит dialogState",
+                    !Files.readString(store.file(), StandardCharsets.UTF_8)
+                            .contains("dialogState"));
+        } finally {
+            store.close();
+        }
+
+        // Команда /dialogstate через UI без HTTP.
+        LlmAgent uiAgent = newMemoryAgent(new Config("test-key",
+                        "https://127.0.0.1:1/v1/chat/completions", "test-model"),
+                HttpClient.newHttpClient(), Map.of());
+        FakeUi ui = new FakeUi(
+                TerminalUi.Input.command("/dialogstate clear"),
+                TerminalUi.Input.command("/dialogstate unknown"),
+                TerminalUi.Input.command("/exit"));
+        Main.runLoop(ui, uiAgent, "test-model");
+        String systems = String.join("\n", ui.systems);
+        expect("/dialogstate clear подтверждает очистку, неизвестный аргумент даёт usage",
+                systems.contains("✓ Состояние диалога очищено")
+                        && systems.contains("Использование: /dialogstate")
+                        && ui.errors.isEmpty());
+    }
+
+    private static void checkDialogStateRestoreAfterRestart() throws Exception {
+        Path dir = Files.createTempDirectory(baseTempDir, "dlg-restore-");
+        Path file = dir.resolve("conversation.json");
+        Config config = new Config("test-key", "https://127.0.0.1:1/v1/chat/completions",
+                "test-model");
+        JsonConversationStore storeA = new JsonConversationStore(file);
+        try {
+            LlmAgent agentA = new LlmAgent(config, ModelSettings.defaults(),
+                    HttpClient.newHttpClient(), storeA, tempMemoryStore());
+            agentA.recordLocalAnswer("Разбираюсь с пайплайном индексации", "ответ 1");
+            agentA.recordLocalAnswer("термины: чанк, перекрытие", "ответ 2");
+        } finally {
+            storeA.close();
+        }
+        JsonConversationStore storeB = new JsonConversationStore(file);
+        try {
+            LlmAgent agentB = new LlmAgent(config, ModelSettings.defaults(),
+                    HttpClient.newHttpClient(), storeB, tempMemoryStore());
+            expect("после перезапуска история восстановлена (две пары)",
+                    agentB.getHistory().size() == 4 && agentB.hasRestoredContext());
+            expect("состояние диалога восстановлено после перезапуска",
+                    "Разбираюсь с пайплайном индексации".equals(agentB.dialogState().goal())
+                            && agentB.dialogState().terms().contains("чанк")
+                            && agentB.dialogState().terms().contains("перекрытие"));
+        } finally {
+            storeB.close();
+        }
     }
 
     private static RagService citationService(IndexStore store, CountingEmbedder embedder,

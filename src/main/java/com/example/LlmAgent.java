@@ -186,6 +186,15 @@ public final class LlmAgent {
     /** Модель веток диалога (стратегия branching). */
     private BranchData branches = BranchData.empty();
 
+    /**
+     * Состояние диалога (память задачи беседы): цель, уточнения, ограничения,
+     * термины, открытые вопросы. Обновляется детерминированно после каждого
+     * хода ({@link DialogTaskStateTracker}), хранится в файле истории,
+     * сбрасывается вместе с ней. Не путать с формальным состоянием задачи
+     * (/task) в рабочей памяти.
+     */
+    private DialogTaskState dialogState = DialogTaskState.EMPTY;
+
     /** Время последнего служебного запроса обновления facts; 0 — не выполнялся. */
     private long lastFactsNanos;
 
@@ -425,6 +434,9 @@ public final class LlmAgent {
         }
         if (state.branches() != null) {
             branches = state.branches();
+        }
+        if (state.dialogState() != null) {
+            dialogState = state.dialogState();
         }
         if (state.summary() != null) {
             if (state.summary().matchesArchive(sessionId, history)) {
@@ -856,6 +868,11 @@ public final class LlmAgent {
         if (userMessage == null || userMessage.isBlank() || answer == null || answer.isBlank()) {
             throw new AgentException("Пустое локальное сообщение или ответ.");
         }
+        // Локальный ответ — это отказ RAG без вызова модели: состояние
+        // обновляется из сообщения пользователя, а вопрос фиксируется
+        // открытым. Цель при этом не затирается (маркеры смены темы явные).
+        dialogState = DialogTaskStateTracker.withOpenQuestion(
+                DialogTaskStateTracker.update(dialogState, userMessage), userMessage);
         List<ChatMessage> updated = new ArrayList<>(history);
         updated.add(new ChatMessage("user", userMessage));
         updated.add(new ChatMessage("assistant", answer));
@@ -1025,6 +1042,9 @@ public final class LlmAgent {
         // Архив не обрезается ни в full, ни в summary — старые
         // сообщения не теряются ни при переключении режимов, ни при обычных
         // запросах.
+        // Состояние диалога обновляется детерминированно из сообщения
+        // пользователя и сохраняется атомарно вместе с новой парой.
+        dialogState = DialogTaskStateTracker.update(dialogState, userMessage);
         List<ChatMessage> updated = new ArrayList<>(history);
         updated.add(new ChatMessage("user", userMessage));
         updated.add(new ChatMessage("assistant", answer));
@@ -1196,6 +1216,56 @@ public final class LlmAgent {
         store.save(stateWithMeta(sessionId, List.copyOf(history), this.summary,
                 new LinkedHashMap<>(), persistentBranches(history)));
         workingMemory.clearFacts();
+    }
+
+    // ================= Состояние диалога (память задачи беседы) =================
+
+    /**
+     * Текущее состояние диалога (цель, уточнения, ограничения, термины,
+     * открытые вопросы); не null, пустое — до первого содержательного
+     * сообщения. Используется командой /dialogstate без вызова API.
+     */
+    public DialogTaskState dialogState() {
+        return dialogState;
+    }
+
+    /**
+     * Очистка состояния диалога (/dialogstate clear): сначала сохраняется
+     * пустое состояние, затем очищается память. История не изменяется
+     * (полный сброс вместе с историей — /clear, /reset).
+     */
+    public void clearDialogState() throws ConversationStoreException {
+        DialogTaskState previous = dialogState;
+        dialogState = DialogTaskState.EMPTY;
+        try {
+            store.save(stateWithMeta(sessionId, List.copyOf(history), this.summary,
+                    factsForSave(), persistentBranches(history)));
+        } catch (ConversationStoreException e) {
+            dialogState = previous;
+            throw e;
+        }
+    }
+
+    /**
+     * Фиксирует вопрос открытым после отказа модели или проверки (НЕ ЗНАЮ,
+     * нет подтверждённых цитат): ход уже сохранён, поэтому состояние
+     * дописывается отдельной атомарной записью. Сбой записи не ломает
+     * показанный ответ — заметка уходит в контекстные заметки.
+     */
+    public void noteOpenQuestion(String userMessage) {
+        DialogTaskState updated = DialogTaskStateTracker.withOpenQuestion(dialogState,
+                userMessage);
+        if (updated.equals(dialogState)) {
+            return;
+        }
+        dialogState = updated;
+        try {
+            store.save(stateWithMeta(sessionId, List.copyOf(history), this.summary,
+                    factsForSave(), persistentBranches(history)));
+        } catch (ConversationStoreException e) {
+            pendingContextNotes.add("Предупреждение: состояние диалога не сохранено ("
+                    + e.getMessage() + ").");
+        }
     }
 
     // ================= Долговременная память: команды =================
@@ -2081,14 +2151,14 @@ public final class LlmAgent {
 
     // ================= Хранение состояния и модель веток =================
 
-    /** Состояние для записи: сообщения + резюме + факты + ветки. */
+    /** Состояние для записи: сообщения + резюме + факты + ветки + состояние диалога. */
     private ConversationState stateWithMeta(String session, List<ChatMessage> messages,
                                             ConversationSummary summaryEntity,
                                             LinkedHashMap<String, String> factsMap,
                                             BranchData branchData) {
         return new ConversationState(session, messages, summaryEntity,
                 factsMap == null || factsMap.isEmpty() ? null : factsMap,
-                branchData);
+                branchData, dialogState == null || dialogState.isEmpty() ? null : dialogState);
     }
 
     /**
@@ -2927,6 +2997,7 @@ public final class LlmAgent {
         contextRestored = false;
         workingMemory.clearFacts();
         workingMemory.clearTask();
+        dialogState = DialogTaskState.EMPTY;
         summary = null;
     }
 

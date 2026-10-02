@@ -11,6 +11,7 @@
 - LLM/config: `LlmAgent`, `Config`, `ModelSettings`, `RequestDiagnostics`.
 - Контекст: `ContextBuilder`, `SummaryEngine`, `StrategyEngine`, `FactsBlock`, `BranchData`.
 - Persistence: `JsonConversationStore`, `MemoryStore`, `ProfileStore`, `InvariantStore`.
+- Состояние диалога (память задачи беседы): `DialogTaskState`, `DialogTaskStateTracker`; поле `dialogState` в файле истории, команды `/dialogstate` и `/dialogstate clear`; цель и термины подмешиваются в поисковый запрос RAG-режима (`RagService.prepareChat`), обновление детерминированное, без LLM.
 - Задачи/ограничения: `TaskState`, `TaskStage`, `TaskStatus`, `InvariantGuard`.
 - MCP: `McpClientComponent`, `McpRegistry`, `McpOrchestrator`, `ToolRouter`, `GitMcpServer`, `GitMonitorMcpServer`, `PipelineMcpServer`, `PipelineRunner`.
 - Monitor: `MonitorStore`, `MonitorRunner`, `MonitorWorker`, `MonitorSchedule`, `MonitorAggregator`.
