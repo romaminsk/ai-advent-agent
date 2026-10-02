@@ -111,11 +111,25 @@ public final class JsonConversationStore implements ConversationStore {
     /**
      * Открывает хранилище по умолчанию либо с путём из переменной окружения
      * LLM_HISTORY_FILE (только абсолютный путь: относительный сделал бы
-     * историю разной в зависимости от каталога запуска).
+     * историю разной в зависимости от каталога запуска). Если последняя
+     * сессия занята параллельным экземпляром, запуск не ломается — работа
+     * идёт в новом per-run файле (прежнее поведение параллельных запусков).
      */
     public static JsonConversationStore openDefault() {
         java.util.Map.Entry<Path, Boolean> resolved = defaultHistoryFileWithFlag(System.getenv());
-        return new JsonConversationStore(resolved.getKey(), resolved.getValue());
+        try {
+            return new JsonConversationStore(resolved.getKey(), resolved.getValue());
+        } catch (ConversationBusyException busy) {
+            return new JsonConversationStore(newChatFile(
+                    Path.of(System.getProperty("user.home"), DEFAULT_DIR_NAME)), true);
+        }
+    }
+
+    /** История занята другим экземпляром приложения (файловая блокировка). */
+    static final class ConversationBusyException extends ConversationStoreException {
+        ConversationBusyException(String message) {
+            super(message);
+        }
     }
 
     /**
@@ -133,9 +147,10 @@ public final class JsonConversationStore implements ConversationStore {
      * Путь файла истории по умолчанию (для тестов передаётся набор переменных
      * окружения; {@link #openDefault()} передаёт System.getenv).
      *
-     * Если LLM_HISTORY_FILE не задана — файл создаётся в ~/.ai-advent-agent/
-     * с именем «chat-<дата-время>.json», уникальным на каждый запуск: сессии
-     * не затирают друг друга, запуск работает без переменных окружения.
+     * Если LLM_HISTORY_FILE не задана — открывается последняя сессия
+     * ~/.ai-advent-agent/ (самый свежий «chat-*.json»): история и dialogState
+     * переживают перезапуск; новый per-run файл создаётся только при первом
+     * запуске (или занятости последней сессии — см. openDefault).
      * Файл долговременной памяти при этом общий (~/.ai-advent-agent/
      * memory.json) и переживает запуски.
      */
@@ -157,15 +172,49 @@ public final class JsonConversationStore implements ConversationStore {
             }
             return specified;
         }
-        // Без переменной — уникальное имя на каждый запуск: дата-время
-        // с миллисекундами плюс суффикс от System.nanoTime(), чтобы
-        // совпадения даже при высокой частоте запусков не влияли.
+        // Без переменной — продолжение последней сессии: самый свежий
+        // chat-*.json каталога истории (история и dialogState переживают
+        // перезапуск); новый per-run файл создаётся, только если сессий
+        // ещё нет (или последняя занята — см. openDefault).
+        return continueOrNewChatFile(
+                Path.of(System.getProperty("user.home"), DEFAULT_DIR_NAME));
+    }
+
+    /** Продолжение последней сессии каталога либо новый per-run файл (для тестов). */
+    static Path continueOrNewChatFile(Path dir) {
+        Path latest = latestChatFile(dir);
+        return latest != null ? latest : newChatFile(dir);
+    }
+
+    /**
+     * Самый свежий per-run файл сессии в каталоге (имя — нулепadded метка
+     * времени, лексикографический максимум = хронологический); null — сессий нет
+     * или каталог недоступен (запуску это не мешает: будет создан новый файл).
+     */
+    static Path latestChatFile(Path dir) {
+        if (dir == null || !Files.isDirectory(dir)) {
+            return null;
+        }
+        try (java.util.stream.Stream<Path> stream = Files.list(dir)) {
+            return stream.filter(p -> {
+                        String name = p.getFileName().toString();
+                        return name.startsWith("chat-") && name.endsWith(".json")
+                                && Files.isRegularFile(p);
+                    })
+                    .max(java.util.Comparator.comparing(p -> p.getFileName().toString()))
+                    .orElse(null);
+        } catch (IOException | RuntimeException e) {
+            return null;
+        }
+    }
+
+    /** Имя нового per-run файла: дата-время с миллисекундами + nanoTime-суффикс. */
+    private static Path newChatFile(Path dir) {
         java.time.format.DateTimeFormatter stamp = java.time.format.DateTimeFormatter
                 .ofPattern("yyyyMMdd-HHmmss-SSS", java.util.Locale.ROOT);
         java.time.LocalDateTime now = java.time.LocalDateTime.now();
         String nanoSuffix = String.format(java.util.Locale.ROOT, "%04x",
                 System.nanoTime() & 0xFFFF);
-        Path dir = Path.of(System.getProperty("user.home"), DEFAULT_DIR_NAME);
         return dir.resolve("chat-" + now.format(stamp) + "-" + nanoSuffix + ".json");
     }
 
@@ -712,7 +761,7 @@ public final class JsonConversationStore implements ConversationStore {
     }
 
     private ConversationStoreException busyError() {
-        return new ConversationStoreException(
+        return new ConversationBusyException(
                 "Эта история уже открыта другим экземпляром приложения: " + file
                         + ". Закройте другой экземпляр либо укажите другой абсолютный "
                         + "путь в переменной LLM_HISTORY_FILE.");

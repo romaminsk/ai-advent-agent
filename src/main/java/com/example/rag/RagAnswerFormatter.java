@@ -10,7 +10,18 @@ import java.util.List;
 public final class RagAnswerFormatter {
     private RagAnswerFormatter() { }
 
+    /**
+     * Формат ответа для обычного чата ({@code nearestSections=true}: отказы
+     * UNVERIFIED/IDK_MODEL показывают «Ближайшие разделы» — как и пороговые
+     * отказы ниже). Без флага ({@code false}) вывод пороговых отказов
+     * не меняется; именно так печатает /rag ask.
+     */
     public static String format(RagService.Result result, boolean diagnostics) {
+        return format(result, diagnostics, false);
+    }
+
+    public static String format(RagService.Result result, boolean diagnostics,
+                                boolean nearestSections) {
         StringBuilder out = new StringBuilder();
         if (result.answerStatus() == CitationValidator.AnswerStatus.IDK_LOW_RELEVANCE
                 || result.answerStatus() == CitationValidator.AnswerStatus.IDK_THRESHOLD) {
@@ -26,12 +37,7 @@ public final class RagAnswerFormatter {
             } else {
                 out.append("\nПричина: после фильтра minScore не осталось чанков (filteredAll).");
             }
-            out.append("\nБлижайшие разделы:");
-            result.retrievedChunks().stream().limit(3).forEach(chunk -> out.append("\n")
-                    .append(safe(chunk.source())).append(" — ").append(safe(chunk.section()))
-                    .append(" (score ").append(String.format(java.util.Locale.ROOT, "%.4f", chunk.score()))
-                    .append(')'));
-            if (result.retrievedChunks().isEmpty()) out.append(" нет");
+            appendNearestSections(out, result);
             out.append("\nУточните вопрос: укажите файл, класс или команду.");
             appendDiagnostics(out, result, diagnostics);
             return out.toString();
@@ -79,10 +85,23 @@ public final class RagAnswerFormatter {
         if (result.citations().confirmedQuotes().isEmpty()) out.append(" нет");
         if (result.answerStatus() == CitationValidator.AnswerStatus.UNVERIFIED
                 || result.answerStatus() == CitationValidator.AnswerStatus.IDK_MODEL) {
+            if (nearestSections) {
+                appendNearestSections(out, result);
+            }
             out.append("\nУточните вопрос, указав файл, класс или команду.");
         }
         appendDiagnostics(out, result, diagnostics);
         return out.toString();
+    }
+
+    /** Ближайшие разделы (source — section, score) из найденных чанков: top-3. */
+    private static void appendNearestSections(StringBuilder out, RagService.Result result) {
+        out.append("\nБлижайшие разделы:");
+        result.retrievedChunks().stream().limit(3).forEach(chunk -> out.append("\n")
+                .append(safe(chunk.source())).append(" — ").append(safe(chunk.section()))
+                .append(" (score ").append(String.format(java.util.Locale.ROOT, "%.4f", chunk.score()))
+                .append(')'));
+        if (result.retrievedChunks().isEmpty()) out.append(" нет");
     }
 
     private static void appendDiagnostics(StringBuilder out, RagService.Result result,

@@ -51,6 +51,8 @@ final class RagChecks extends SelfTestSupport {
         checkDialogStateRagFlow();
         checkDialogStateClearAndReset();
         checkDialogStateRestoreAfterRestart();
+        checkOpenQuestionTopicFilter();
+        checkRefusalNearestSections();
     }
 
     private static void checkPromptAndRetriever() throws Exception {
@@ -1517,11 +1519,14 @@ final class RagChecks extends SelfTestSupport {
         Config config = new Config("test-key", "https://127.0.0.1:1/v1/chat/completions",
                 "test-model");
         JsonConversationStore storeA = new JsonConversationStore(file);
+        DialogTaskState written;
         try {
             LlmAgent agentA = new LlmAgent(config, ModelSettings.defaults(),
                     HttpClient.newHttpClient(), storeA, tempMemoryStore());
             agentA.recordLocalAnswer("Разбираюсь с пайплайном индексации", "ответ 1");
             agentA.recordLocalAnswer("термины: чанк, перекрытие", "ответ 2");
+            agentA.recordLocalAnswer("Ограничение: только Java", "Зафиксировано: только Java");
+            written = agentA.dialogState();
         } finally {
             storeA.close();
         }
@@ -1529,15 +1534,75 @@ final class RagChecks extends SelfTestSupport {
         try {
             LlmAgent agentB = new LlmAgent(config, ModelSettings.defaults(),
                     HttpClient.newHttpClient(), storeB, tempMemoryStore());
-            expect("после перезапуска история восстановлена (две пары)",
-                    agentB.getHistory().size() == 4 && agentB.hasRestoredContext());
+            expect("после перезапуска история восстановлена (три пары)",
+                    agentB.getHistory().size() == 6 && agentB.hasRestoredContext());
             expect("состояние диалога восстановлено после перезапуска",
                     "Разбираюсь с пайплайном индексации".equals(agentB.dialogState().goal())
                             && agentB.dialogState().terms().contains("чанк")
                             && agentB.dialogState().terms().contains("перекрытие"));
+            expect("запись → новое чтение: state совпадает целиком (включая ограничение)",
+                    written.equals(agentB.dialogState())
+                            && agentB.dialogState().constraints().stream()
+                                    .anyMatch(item -> item.contains("Java")));
         } finally {
             storeB.close();
         }
+    }
+
+    /** Дефект 2: отказы вне темы цели не должны фиксироваться открытыми. */
+    private static void checkOpenQuestionTopicFilter() throws Exception {
+        JsonConversationStore store = tempStore();
+        try {
+            LlmAgent agent = new LlmAgent(new Config("test-key",
+                    "https://127.0.0.1:1/v1/chat/completions", "test-model"),
+                    ModelSettings.defaults(), HttpClient.newHttpClient(), store,
+                    tempMemoryStore());
+            agent.recordLocalAnswer("Хочу разобраться, как в ai-agent устроена индексация",
+                    "ответ");
+            agent.noteOpenQuestion("Как проверить, что индекс собрался корректно?");
+            expect("отказ по теме фиксируется открытым вопросом",
+                    agent.dialogState().openQuestions().size() == 1);
+            agent.noteOpenQuestion("Какая сейчас погода в Берлине?");
+            agent.noteOpenQuestion("Сколько стоит подписка?");
+            expect("отказы вне темы не попадают в openQuestions",
+                    agent.dialogState().openQuestions().size() == 1);
+
+            DialogTaskState state = agent.dialogState();
+            expect("onTopic: погода и цены вне темы, вопрос про индекс — по теме",
+                    !DialogTaskStateTracker.onTopic(state, "Какая сейчас погода?")
+                            && !DialogTaskStateTracker.onTopic(state, "Сколько стоит подписка?")
+                            && DialogTaskStateTracker.onTopic(state,
+                                    "Как проверить индекс после сборки?"));
+            expect("без цели и терминов тема не ограничена",
+                    DialogTaskStateTracker.onTopic(null, "любой вопрос")
+                            && DialogTaskStateTracker.onTopic(DialogTaskState.EMPTY,
+                                    "любой вопрос"));
+        } finally {
+            store.close();
+        }
+    }
+
+    /** Дефект 4: UNVERIFIED/IDK_MODEL в чате показывает ближайшие разделы. */
+    private static void checkRefusalNearestSections() {
+        RagRetriever.Chunk nearest = chunk("DocumentLoader.java", "loading", "text");
+        RagService.Result unverified = new RagService.Result("", List.of(),
+                List.of(nearest), 0, 0, RagService.Status.OK, null, 0, false, false, "",
+                0, "ok");
+        String inChat = RagAnswerFormatter.format(unverified, false, true);
+        expect("UNVERIFIED в чате показывает ближайшие разделы",
+                inChat.contains("Ближайшие разделы:")
+                        && inChat.contains("DocumentLoader.java — loading (score"));
+        expect("/rag ask (без флага) не меняет вывод UNVERIFIED",
+                !RagAnswerFormatter.format(unverified, false)
+                        .contains("Ближайшие разделы:"));
+
+        RagService.Result idkModel = new RagService.Result("НЕ ЗНАЮ", List.of(),
+                List.of(nearest), 0, 0, RagService.Status.OK, null, 0, false, false, "",
+                0, "ok", CitationValidator.AnswerStatus.IDK_MODEL,
+                new CitationValidator.Validation(List.of(), List.of(), 0, 0, 0));
+        expect("IDK_MODEL в чате показывает ближайшие разделы",
+                RagAnswerFormatter.format(idkModel, false, true)
+                        .contains("Ближайшие разделы:"));
     }
 
     private static RagService citationService(IndexStore store, CountingEmbedder embedder,
