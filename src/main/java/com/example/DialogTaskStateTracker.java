@@ -34,6 +34,8 @@ public final class DialogTaskStateTracker {
 
     /** Максимум элементов в каждом списке состояния. */
     public static final int MAX_ITEMS = 10;
+    /** Максимум открытых вопросов (только тематические отказы модели/проверки). */
+    public static final int MAX_OPEN_QUESTIONS = 5;
     /** Максимум символов в одном элементе списка. */
     public static final int MAX_ITEM_CHARS = 200;
     /** Максимум символов в тексте цели. */
@@ -42,6 +44,16 @@ public final class DialogTaskStateTracker {
     public static final int MAX_PROMPT_BLOCK_CHARS = 1200;
     /** Максимум символов добавки (цель + термины) к поисковому запросу. */
     public static final int MAX_SEARCH_SUPPLEMENT_CHARS = 300;
+
+    /**
+     * Граница «короткого уточняющего вопроса» в словах. Контрольные вопросы
+     * калибровки порогов (src/test/resources/rag/questions.json) имеют минимум
+     * 10 слов и идут в поиск без обогащения; пороги minScore/idkThreshold
+     * откалиброваны на таких полных запросах. Поэтому обогащаются только
+     * вопросы короче 10 слов — для самодостаточных запрос и проверка порога
+     * «не знаю» остаются прежними.
+     */
+    public static final int SHORT_QUESTION_MAX_WORDS = 10;
 
     private static final List<String> TOPIC_CHANGE_MARKERS = List.of(
             "новая тема", "сменим тему", "смена темы", "другая задача",
@@ -81,7 +93,7 @@ public final class DialogTaskStateTracker {
             DialogTaskState restarted = DialogTaskState.EMPTY;
             return safeGoal(text) == null ? restarted : restarted.withGoal(safeGoal(text));
         }
-        if (state.goal() == null && !isGreeting(lower)) {
+        if (state.goal() == null && !isGreeting(lower) && !isPureMeta(text)) {
             String goal = safeGoal(text);
             if (goal != null) {
                 state = state.withGoal(goal);
@@ -115,21 +127,29 @@ public final class DialogTaskStateTracker {
     }
 
     /**
-     * Фиксирует вопрос как открытый (локальный отказ RAG без вызова модели
-     * или отказ по итогам проверки). Дубликаты не добавляются.
+     * Фиксирует вопрос как открытый. Вызывается только для отказов по теме
+     * цели (модель ответила «НЕ ЗНАЮ» или пункты не подтверждены цитатами):
+     * retrieval для них прошёл пороги, то есть вопрос относится к базе.
+     * Отказы поиска по порогу (filteredAll/idkThreshold — вопросы вне базы)
+     * сюда не попадают. Лимит — {@link #MAX_OPEN_QUESTIONS}, дубликаты
+     * не добавляются.
      */
     public static DialogTaskState withOpenQuestion(DialogTaskState current, String question) {
         DialogTaskState state = current == null ? DialogTaskState.EMPTY : current;
-        return state.withOpenQuestions(addItem(state.openQuestions(), question));
+        return state.withOpenQuestions(addItem(state.openQuestions(), question,
+                MAX_OPEN_QUESTIONS));
     }
 
     /**
-     * Поисковый запрос для RAG в режиме чата: сам вопрос плюс цель и термины
-     * из состояния (добавка ограничена {@link #MAX_SEARCH_SUPPLEMENT_CHARS}).
+     * Поисковый запрос для RAG в режиме чата. Обогащаются только короткие
+     * уточняющие вопросы (меньше {@link #SHORT_QUESTION_MAX_WORDS} слов):
+     * сам вопрос плюс цель и термины из состояния (добавка ограничена
+     * {@link #MAX_SEARCH_SUPPLEMENT_CHARS}). Самодостаточный вопрос идёт
+     * в поиск как есть — порог «не знаю» проверяется по прежнему запросу.
      * Пороги, веса и фильтры retrieval не меняются.
      */
     public static String searchQuery(DialogTaskState state, String question) {
-        if (state == null || state.isEmpty()) {
+        if (state == null || state.isEmpty() || !isShortQuestion(question)) {
             return question;
         }
         StringBuilder supplement = new StringBuilder();
@@ -217,17 +237,17 @@ public final class DialogTaskStateTracker {
 
     private static DialogTaskState addTerm(DialogTaskState state, String rawTerm) {
         String term = stripTrailingPunctuation(rawTerm.trim());
-        return state.withTerms(addItem(state.terms(), term));
+        return state.withTerms(addItem(state.terms(), term, MAX_ITEMS));
     }
 
     private static DialogTaskState addConstraint(DialogTaskState state, String rawItem) {
         return state.withConstraints(addItem(state.constraints(),
-                stripTrailingPunctuation(rawItem == null ? "" : rawItem.trim())));
+                stripTrailingPunctuation(rawItem == null ? "" : rawItem.trim()), MAX_ITEMS));
     }
 
     private static DialogTaskState addClarification(DialogTaskState state, String rawItem) {
         return state.withClarifications(addItem(state.clarifications(),
-                stripTrailingPunctuation(rawItem == null ? "" : rawItem.trim())));
+                stripTrailingPunctuation(rawItem == null ? "" : rawItem.trim()), MAX_ITEMS));
     }
 
     /**
@@ -235,7 +255,7 @@ public final class DialogTaskStateTracker {
      * регистра) и секреты отбрасываются; при переполнении вытесняется самый
      * старый элемент (свежие договорённости важнее).
      */
-    private static List<String> addItem(List<String> items, String candidate) {
+    private static List<String> addItem(List<String> items, String candidate, int maxItems) {
         if (candidate == null || candidate.isBlank()
                 || com.example.rag.RagQueryRewriter.looksSecret(candidate)) {
             return items;
@@ -251,7 +271,7 @@ public final class DialogTaskStateTracker {
             }
         }
         List<String> updated = new ArrayList<>(items);
-        while (updated.size() >= MAX_ITEMS) {
+        while (updated.size() >= maxItems) {
             updated.remove(0);
         }
         updated.add(item);
@@ -297,6 +317,74 @@ public final class DialogTaskStateTracker {
         }
         String item = line.substring(start).trim();
         return item.isEmpty() ? line : item;
+    }
+
+    /** Короткий уточняющий вопрос: слов меньше {@link #SHORT_QUESTION_MAX_WORDS}. */
+    public static boolean isShortQuestion(String question) {
+        if (question == null || question.isBlank()) {
+            return false;
+        }
+        return question.trim().split("\\s+").length < SHORT_QUESTION_MAX_WORDS;
+    }
+
+    /**
+     * Чисто мета-сообщение: маркеры состояния («уточняю: …», «ограничение: …»,
+     * «термины: …») без вопроса. Такое сообщение в RAG-режиме не идёт ни в
+     * поиск, ни к модели: состояние обновляется локально, ответ — короткое
+     * подтверждение ({@link #metaConfirmation}). Смешанное сообщение
+     * (маркер + «?») — вопрос и обрабатывается через RAG.
+     */
+    public static boolean isPureMeta(String userMessage) {
+        return metaConfirmation(userMessage) != null;
+    }
+
+    /**
+     * Текст короткого подтверждения для чисто мета-сообщения
+     * («Зафиксировано: …»); null — сообщение не мета (обрабатывать как вопрос).
+     */
+    public static String metaConfirmation(String userMessage) {
+        String text = userMessage == null ? "" : userMessage.trim();
+        if (text.isEmpty() || text.contains("?")) {
+            return null;
+        }
+        List<String> confirmed = new ArrayList<>();
+        for (String fragment : text.split("\\n")) {
+            String line = fragment.trim();
+            if (line.isEmpty()) {
+                continue;
+            }
+            String lineLower = line.toLowerCase(Locale.ROOT);
+            String termMarker = firstMarker(lineLower, TERM_MARKERS);
+            if (termMarker != null) {
+                String terms = stripTrailingPunctuation(afterMarker(line, lineLower, termMarker));
+                if (!terms.isEmpty()) {
+                    confirmed.add("термины «" + terms + "»");
+                }
+                continue;
+            }
+            String constraintMarker = firstMarker(lineLower, CONSTRAINT_MARKERS);
+            if (constraintMarker != null) {
+                String item = stripTrailingPunctuation(
+                        constraintItem(line, lineLower, constraintMarker));
+                if (!item.isEmpty()) {
+                    confirmed.add("ограничение «" + item + "»");
+                }
+                continue;
+            }
+            String clarificationMarker = firstMarker(lineLower, CLARIFICATION_MARKERS);
+            if (clarificationMarker != null) {
+                String item = stripTrailingPunctuation(afterMarker(line, lineLower,
+                        clarificationMarker));
+                if (!item.isEmpty()) {
+                    confirmed.add("уточнение «" + item + "»");
+                }
+            }
+        }
+        if (confirmed.isEmpty()) {
+            return null;
+        }
+        return "Зафиксировано: " + String.join("; ", confirmed) + ". "
+                + "Состояние: /dialogstate.";
     }
 
     private static boolean containsMarker(String lower, List<String> markers) {

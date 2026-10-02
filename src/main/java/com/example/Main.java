@@ -21,6 +21,19 @@ import java.nio.file.Path;
  */
 public final class Main {
 
+    /**
+     * Дополнение системного промпта только для RAG-режима обычного чата
+     * (не затрагивает /rag ask и eval): диагностика волны UNVERIFIED показала,
+     * что модель в чат-режиме нередко возвращает пустой ответ после длинных
+     * скрытых рассуждений — поэтому ответ должен начинаться сразу с пунктов.
+     */
+    private static final String RAG_CHAT_FORMAT_HINT = """
+
+            Отвечай сразу пунктами, без вступления: первый символ ответа — начало \
+            первого пункта. Каждый пункт — одно утверждение, и в том же пункте — \
+            дословная цитата [n] «…» из чанка n. Если контекст не покрывает вопрос, \
+            ответь ровно: НЕ ЗНАЮ.""";
+
     public static void main(String[] args) {
         if (args.length >= 2 && "--mcp-server".equals(args[0])) {
             int exitCode = switch (args[1]) {
@@ -266,7 +279,14 @@ public final class Main {
                         }
                         try (TerminalUi.ProgressIndicator progress = ui.startProgress()) {
                             String answer;
-                            if (ragRef.enabled) {
+                            if (ragRef.enabled
+                                    && DialogTaskStateTracker.isPureMeta(input.text())) {
+                                // Чисто мета-сообщение (маркеры состояния без вопроса):
+                                // состояние обновляется локально и сохраняется в историю,
+                                // поиск RAG и LLM не вызываются.
+                                answer = activeAgent.recordLocalAnswer(input.text(),
+                                        DialogTaskStateTracker.metaConfirmation(input.text()));
+                            } else if (ragRef.enabled) {
                                 com.example.rag.RagService.Prepared prepared;
                                 try {
                                     // Поисковый запрос = вопрос + цель и термины
@@ -294,11 +314,16 @@ public final class Main {
                                         // Состояние диалога — коротким блоком до
                                         // RAG-инструкции и RAG-контекста (только
                                         // в RAG-режиме: обычный system-промпт
-                                        // не меняется).
+                                        // не меняется). В конец — подсказка
+                                        // формата чата: диагностика UNVERIFIED
+                                        // показала пустые ответы модели на
+                                        // длинных рассуждениях, поэтому ответ
+                                        // должен начинаться сразу с пунктов.
                                         String stateBlock = DialogTaskStateTracker.promptBlock(
                                                 activeAgent.dialogState());
                                         String rawAnswer = activeAgent.askWithRagContext(input.text(),
-                                                stateBlock + prepared.prompt().system(),
+                                                stateBlock + prepared.prompt().system()
+                                                        + RAG_CHAT_FORMAT_HINT,
                                                 prepared.prompt().user());
                                         ragResult = activeRagService.evaluateAnswer(prepared, rawAnswer,
                                                 com.example.rag.RagService.elapsedMs(ragLlmStart));

@@ -1298,6 +1298,62 @@ final class RagChecks extends SelfTestSupport {
         String view = DialogTaskStateTracker.renderView(searchState);
         expect("renderView непустого состояния показывает цель и термины",
                 view.contains("Цель:") && view.contains("Термины:"));
+
+        // Мета-сообщения: маркеры без вопроса — подтверждение, смешанные — вопрос.
+        String metaConstraint = DialogTaskStateTracker.metaConfirmation(
+                "Ограничение: только Java-код");
+        expect("чистое мета-сообщение с ограничением даёт подтверждение без API",
+                metaConstraint != null && metaConstraint.startsWith("Зафиксировано:")
+                        && metaConstraint.contains("только Java-код"));
+        String metaTerms = DialogTaskStateTracker.metaConfirmation(
+                "термины: чанк, перекрытие, секция");
+        expect("чистое мета-сообщение с терминами перечисляет их в подтверждении",
+                metaTerms != null && metaTerms.contains("чанк") && metaTerms.contains("секция"));
+        String metaClarification = DialogTaskStateTracker.metaConfirmation(
+                "уточняю: важна structure-стратегия");
+        expect("чистое мета-сообщение с уточнением подтверждается",
+                metaClarification != null && metaClarification.contains("уточнение")
+                        && metaClarification.contains("важна structure-стратегия"));
+        expect("смешанное сообщение (маркер + вопрос) мета не считается",
+                DialogTaskStateTracker.metaConfirmation(
+                        "уточняю: как выбирается граница секции?") == null
+                        && DialogTaskStateTracker.metaConfirmation(
+                        "Какая сейчас погода в Берлине?") == null
+                        && DialogTaskStateTracker.metaConfirmation(
+                        "обычное сообщение без маркеров") == null);
+        DialogTaskState metaFirst = DialogTaskStateTracker.update(DialogTaskState.EMPTY,
+                "Ограничение: только Java-код");
+        expect("чисто мета-сообщение не становится целью, но обновляет списки",
+                metaFirst.goal() == null && metaFirst.constraints().contains("только Java-код"));
+
+        // Обогащение поискового запроса — только для коротких уточняющих вопросов.
+        expect("вопрос из 9 слов короткий, из 10 — самодостаточный",
+                DialogTaskStateTracker.isShortQuestion("как задано перекрытие чанков в нашем"
+                        + " индексе у проекта")
+                        && !DialogTaskStateTracker.isShortQuestion("как выбирается граница"
+                        + " секции при структурной нарезке исходников в индексе"));
+        String longQuestion = "как выбирается граница секции при структурной нарезке"
+                + " исходников в индексе";
+        expect("самодостаточный вопрос (10 слов) идёт в поиск без обогащения",
+                DialogTaskStateTracker.searchQuery(searchState, longQuestion)
+                        .equals(longQuestion));
+        expect("короткий вопрос обогащается целью и терминами",
+                DialogTaskStateTracker.searchQuery(searchState, "как задано перекрытие?")
+                        .contains("Цель про индексацию"));
+
+        // Открытые вопросы: лимит 5 и дедупликация.
+        DialogTaskState openOverflow = DialogTaskState.EMPTY;
+        for (int i = 1; i <= 7; i++) {
+            openOverflow = DialogTaskStateTracker.withOpenQuestion(openOverflow,
+                    "тематический вопрос " + i + "?");
+        }
+        openOverflow = DialogTaskStateTracker.withOpenQuestion(openOverflow,
+                "тематический вопрос 7?");
+        expect("открытые вопросы ограничены пятью, вытесняются старые, дубли не добавляются",
+                openOverflow.openQuestions().size() == DialogTaskStateTracker.MAX_OPEN_QUESTIONS
+                        && !openOverflow.openQuestions().contains("тематический вопрос 1?")
+                        && !openOverflow.openQuestions().contains("тематический вопрос 2?")
+                        && openOverflow.openQuestions().contains("тематический вопрос 7?"));
     }
 
     private static void checkDialogStateRagFlow() throws Exception {
@@ -1345,49 +1401,65 @@ final class RagChecks extends SelfTestSupport {
                     TerminalUi.Input.message("ограничение: только Java-код"),
                     TerminalUi.Input.message("термины: чанк, перекрытие, секция"),
                     TerminalUi.Input.message("как задано перекрытие чанков?"),
+                    TerminalUi.Input.message("уточняю: как выбирается граница секции?"),
                     TerminalUi.Input.message("какая сейчас погода в Берлине?"),
                     TerminalUi.Input.command("/dialogstate"),
                     TerminalUi.Input.command("/exit"));
             Main.runLoop(ui, agent, "glm-5.3-flash", service);
 
-            expect("каждое сообщение диалога вызвало ровно один поиск по индексу",
-                    embedder.queries.size() == 6);
-            expect("поисковый запрос пятого сообщения содержит цель и термины состояния",
-                    embedder.queries.size() >= 5
-                            && embedder.queries.get(4)
+            // Поиск вызвали ровно 4 вопросных сообщения (1, 5, 6, 7); мета 2–4 — нет.
+            expect("поиск вызывается для вопросов, а мета-сообщения — без поиска и без LLM",
+                    embedder.queries.size() == 4 && llmCalls.get() == 3
+                            && serviceLlmCalls.get() == 0
+                            && embedder.queries.get(0)
+                            .equals("Разбираюсь с пайплайном индексации документов"));
+            expect("мета-сообщения получают локальное подтверждение «Зафиксировано»",
+                    ui.messages.size() >= 4
+                            && ui.messages.get(1).startsWith("Зафиксировано:")
+                            && ui.messages.get(1).contains("интересует structure-стратегия")
+                            && ui.messages.get(2).startsWith("Зафиксировано:")
+                            && ui.messages.get(3).startsWith("Зафиксировано:")
+                            && ui.messages.get(3).contains("чанк"));
+            expect("короткий вопрос обогащается целью и терминами состояния",
+                    embedder.queries.size() >= 2
+                            && embedder.queries.get(1)
+                            .startsWith("как задано перекрытие чанков?")
+                            && embedder.queries.get(1)
                             .contains("Разбираюсь с пайплайном индексации документов")
-                            && embedder.queries.get(4).contains("чанк"));
-            boolean sourcesOk = ui.messages.size() >= 5;
-            for (int i = 0; i < Math.min(5, ui.messages.size()); i++) {
+                            && embedder.queries.get(1).contains("чанк"));
+            boolean sourcesOk = ui.messages.size() >= 6;
+            for (int i : new int[]{0, 4, 5}) {
                 sourcesOk &= ui.messages.get(i).contains("Источники:")
                         && ui.messages.get(i).contains("DocumentLoader.java")
                         && ui.messages.get(i).contains("chunk: chunk-a");
             }
-            expect("первые пять ответов содержат источники из метаданных chunk-a", sourcesOk);
-            String fifthBody = bodies.size() >= 5 ? bodies.get(4) : "";
-            expect("тело запроса к LLM содержит блок состояния диалога до RAG-контекста",
-                    fifthBody.contains("СОСТОЯНИЕ ДИАЛОГА") && fifthBody.contains("Контекст:")
-                            && fifthBody.indexOf("СОСТОЯНИЕ ДИАЛОГА")
-                            < fifthBody.indexOf("Контекст:"));
-            String refusal = ui.messages.size() >= 6 ? ui.messages.get(5) : "";
+            expect("вопросы (включая смешанное маркер+вопрос) отвечаются с источниками chunk-a",
+                    sourcesOk);
+            String secondBody = bodies.size() >= 2 ? bodies.get(1) : "";
+            expect("запрос к LLM содержит блок состояния до RAG-контекста и подсказку формата",
+                    secondBody.contains("СОСТОЯНИЕ ДИАЛОГА") && secondBody.contains("Контекст:")
+                            && secondBody.indexOf("СОСТОЯНИЕ ДИАЛОГА")
+                            < secondBody.indexOf("Контекст:")
+                            && secondBody.contains("Отвечай сразу пунктами"));
+            String refusal = ui.messages.size() >= 7 ? ui.messages.get(6) : "";
             expect("вопрос о погоде получает локальный отказ без вызова LLM",
                     refusal.contains("Не знаю") && refusal.contains("Причина")
-                            && refusal.contains("Уточните") && llmCalls.get() == 5
-                            && serviceLlmCalls.get() == 0);
+                            && refusal.contains("Уточните") && llmCalls.get() == 3);
             DialogTaskState state = agent.dialogState();
-            expect("состояние диалога после сценария: цель, уточнение, ограничение, термины",
+            expect("состояние: цель, уточнения (мета и смешанное), ограничение, термины",
                     "Разбираюсь с пайплайном индексации документов".equals(state.goal())
                             && state.clarifications().contains("интересует structure-стратегия")
+                            && state.clarifications().contains("как выбирается граница секции?")
                             && state.constraints().contains("только Java-код")
                             && state.terms().equals(List.of("чанк", "перекрытие", "секция")));
-            expect("вопрос с локальным отказом зафиксирован открытым",
-                    state.openQuestions().contains("какая сейчас погода в Берлине?"));
+            expect("отказ по порогу (вне базы) не попадает в открытые вопросы",
+                    state.openQuestions().isEmpty());
             String dialogView = String.join("\n", ui.systems);
-            expect("/dialogstate показывает цель, термины и открытый вопрос",
+            expect("/dialogstate показывает цель и термины без внебазовых отказов",
                     dialogView.contains("Состояние диалога (память задачи):")
                             && dialogView.contains("Разбираюсь с пайплайном индексации документов")
                             && dialogView.contains("перекрытие")
-                            && dialogView.contains("какая сейчас погода в Берлине?"));
+                            && !dialogView.contains("какая сейчас погода в Берлине?"));
         } finally {
             history.close();
             server.stop(0);
