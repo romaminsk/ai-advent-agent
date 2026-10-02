@@ -93,6 +93,12 @@ public final class SelfTest extends SelfTestSupport {
 
         baseTempDir = Files.createTempDirectory(args.length == 0
                 ? "selftest-day8" : "selftest-groups");
+        // Изоляция от реальных настроек RAG пользователя: 3-арг Main.runLoop
+        // без инъекции сервиса читает defaultStore(); enabled:true после
+        // live-прогонов не должно ломать suite. Файл создаётся пустым —
+        // состояние по умолчанию (режим выключен).
+        System.setProperty("ai-agent.rag.settings-file",
+                baseTempDir.resolve("rag-settings.json").toString());
         try {
             for (Map.Entry<String, TestGroup> entry : selected) {
                 int beforePassed = passed;
