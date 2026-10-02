@@ -53,6 +53,9 @@ final class RagChecks extends SelfTestSupport {
         checkDialogStateRestoreAfterRestart();
         checkOpenQuestionTopicFilter();
         checkRefusalNearestSections();
+        checkItemQuoteCutNoDuplication();
+        checkItemQuoteCutEdgeCases();
+        checkRagChatFormatHint();
     }
 
     private static void checkPromptAndRetriever() throws Exception {
@@ -1577,6 +1580,31 @@ final class RagChecks extends SelfTestSupport {
                     DialogTaskStateTracker.onTopic(null, "любой вопрос")
                             && DialogTaskStateTracker.onTopic(DialogTaskState.EMPTY,
                                     "любой вопрос"));
+
+            // Финальный фикс B: пересечение и с уточнениями/ограничениями.
+            expect("без уточнения и ограничения вопрос вне темы",
+                    !DialogTaskStateTracker.onTopic(state,
+                            "Как выглядит структура корпуса?")
+                            && !DialogTaskStateTracker.onTopic(state,
+                                    "Как запустить Java-тесты?"));
+            agent.recordLocalAnswer("уточняю: структура корпуса",
+                    "Зафиксировано: структура корпуса");
+            agent.recordLocalAnswer("Ограничение: только Java",
+                    "Зафиксировано: только Java");
+            DialogTaskState enriched = agent.dialogState();
+            expect("onTopic учитывает уточнение: вопрос только из уточнения — по теме",
+                    DialogTaskStateTracker.onTopic(enriched,
+                            "Как выглядит структура корпуса?"));
+            agent.noteOpenQuestion("Как выглядит структура корпуса?");
+            expect("вопрос по теме из уточнения записан в openQuestions",
+                    agent.dialogState().openQuestions().stream()
+                            .anyMatch(q -> q.contains("структура корпуса")));
+            expect("onTopic учитывает ограничение: вопрос с Java — по теме",
+                    DialogTaskStateTracker.onTopic(enriched, "Как запустить Java-тесты?"));
+            expect("погода и цена по-прежнему вне темы с уточнениями и ограничениями",
+                    !DialogTaskStateTracker.onTopic(enriched, "Какая сейчас погода?")
+                            && !DialogTaskStateTracker.onTopic(enriched,
+                                    "Сколько стоит подписка?"));
         } finally {
             store.close();
         }
@@ -1603,6 +1631,105 @@ final class RagChecks extends SelfTestSupport {
         expect("IDK_MODEL в чате показывает ближайшие разделы",
                 RagAnswerFormatter.format(idkModel, false, true)
                         .contains("Ближайшие разделы:"));
+    }
+
+    /**
+     * Дефект 5: вырезка цитаты из пункта оставляла хвост цитаты (дубль
+     * фрагмента), когда цитата содержит внутренние «…». Репро — реальный
+     * ответ модели; проверка цитат (validate) не меняется: lazy-QUOTE
+     * по-прежнему отклоняет усечённую цитату line1 как слишком короткую.
+     */
+    private static void checkItemQuoteCutNoDuplication() {
+        String fragment = "В блок «Источники» вида `source — section (chunk: chunkId)` "
+                + "попадают только номера с подтверждённой цитатой";
+        List<RagRetriever.Chunk> chunks = List.of(
+                chunk("README.md", "sources",
+                        "Ответ RAG содержит ссылки [n], сформированные источники с chunkId "
+                                + "и только подтверждённые дословные цитаты"),
+                chunk("Other.java", "other", "прочий чанк"),
+                chunk("Validator.java", "quotes",
+                        "Ссылка вне диапазона, недословная цитата и ссылка без проверенной "
+                                + "цитаты отбрасываются"),
+                chunk("README.md", "history-lock",
+                        "Как это работает: источники строит приложение из метаданных чанков, "
+                                + "а не модель. " + fragment));
+        String answer = "– " + fragment + " [4] «" + fragment + "».\n"
+                + "– Источники строит приложение из метаданных чанков, а не модель [4] "
+                + "«источники строит приложение из метаданных чанков, а не модель».\n"
+                + "– Ссылки вне диапазона, недословные цитаты и ссылки без проверенной "
+                + "цитаты отбрасываются [3] «Ссылка вне диапазона, недословная цитата и "
+                + "ссылка без проверенной цитаты отбрасываются».\n"
+                + "– Ответ RAG содержит ссылки [n] и сформированные источники с chunkId [1] "
+                + "«Ответ RAG содержит ссылки [n], сформированные источники с chunkId "
+                + "и только подтверждённые дословные цитаты».";
+
+        CitationValidator.Validation validation = new CitationValidator().validate(
+                answer, chunks);
+        expect("проверка цитаты как раньше: усечённая цитата line1 отклонена",
+                validation.totalQuotes() == 4 && validation.rejectedQuotes() == 1
+                        && validation.rejectedQuoteDetails().get(0).reason()
+                                .equals("quote-shorter-than-20"));
+        expect("пункт подтверждён по цитате line2 (en-dash не разбивает пункт)",
+                validation.confirmedItems().size() == 1
+                        && validation.confirmedQuoteNumbers().equals(List.of(1, 3, 4)));
+
+        String item = validation.confirmedItems().get(0);
+        String tailFragment = "вида `source — section (chunk: chunkId)` "
+                + "попадают только номера с подтверждённой цитатой";
+        expect("пункт без повтора фрагмента цитаты",
+                countOccurrences(item, tailFragment) == 1);
+        expect("ссылка [4] сохранена, хвостовой «» из цитаты убран",
+                item.split("\n")[0].trim().endsWith("[4]."));
+    }
+
+    /** Регрессия: цитата в конце и в середине пункта, слишком короткий остаток. */
+    private static void checkItemQuoteCutEdgeCases() {
+        List<RagRetriever.Chunk> chunks = List.of(chunk("A.java", "text",
+                "утверждение проверено строго дословно здесь"));
+        String quote = "утверждение проверено строго дословно здесь";
+
+        String end = new CitationValidator()
+                .validate("- Пункт утверждает [1] «" + quote + "».", chunks)
+                .confirmedItems().get(0);
+        expect("цитата в конце пункта: вырезана, ссылка осталась",
+                end.endsWith("[1].") && !end.contains("«"));
+
+        String middle = new CitationValidator()
+                .validate("- Середина [1] «" + quote + "» и хвост пункта.", chunks)
+                .confirmedItems().get(0);
+        expect("цитата в середине пункта: вырезана, хвост сохранён",
+                middle.equals("- Середина [1] и хвост пункта."));
+
+        String onlyQuote = new CitationValidator()
+                .validate("- [1] «" + quote + "»", chunks)
+                .confirmedItems().get(0);
+        expect("остаток после вырезки слишком короткий — исходный текст пункта",
+                onlyQuote.contains("«" + quote + "»"));
+    }
+
+    private static long countOccurrences(String text, String needle) {
+        long count = 0;
+        int from = 0;
+        while (true) {
+            int at = text.indexOf(needle, from);
+            if (at < 0) {
+                return count;
+            }
+            count++;
+            from = at + needle.length();
+        }
+    }
+
+    /** Финальный фикс A: подсказка чата для широких вопросов. */
+    private static void checkRagChatFormatHint() {
+        String hint = Main.RAG_CHAT_FORMAT_HINT;
+        expect("подсказка чата называет широкие вопросы",
+                hint.contains("по шагам") && hint.contains("чем отличается")
+                        && hint.contains("как устроено"));
+        expect("подсказка чата: 3–5 коротких пунктов, одна дословная цитата из одного чанка",
+                hint.contains("3–5") && hint.contains("одна дословная цитата")
+                        && hint.contains("одного чанка")
+                        && hint.contains("без пересказа нескольких чанков"));
     }
 
     private static RagService citationService(IndexStore store, CountingEmbedder embedder,

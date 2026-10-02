@@ -80,8 +80,8 @@ public final class DialogTaskStateTracker {
             "о", "об", "про", "для", "как", "что", "это", "или", "не", "но",
             "а", "же", "ли", "я", "мы", "ты", "вы", "он", "она", "они", "оно",
             "да", "нет", "уже", "все", "без", "при", "над", "под", "пере",
-            "the", "is", "are", "a", "an", "to", "of", "and", "in", "on",
-            "how", "what", "for", "with", "that", "this");
+            "только", "the", "is", "are", "a", "an", "to", "of", "and", "in",
+            "on", "how", "what", "for", "with", "that", "this");
 
     private DialogTaskStateTracker() { }
 
@@ -152,11 +152,11 @@ public final class DialogTaskStateTracker {
     }
 
     /**
-     * Вопрос относится к теме цели/терминов: есть пересечение содержательных
-     * слов (точное равенство либо общий префикс от 4 символов). Внешние
-     * отказы (погода, цены) такого пересечения не имеют и не должны
-     * попадать в {@link #withOpenQuestion} — только по теме вопросов.
-     * Без цели и терминов тема не ограничена: считаем вопрос по теме.
+     * Вопрос относится к теме: есть пересечение содержательных слов с целью,
+     * терминами, уточнениями или ограничениями (точное равенство либо общий
+     * префикс от 4 символов). Внешние отказы (погода, цены) такого
+     * пересечения не имеют и не должны попадать в {@link #withOpenQuestion}.
+     * Без цели и договорённостей тема не ограничена: считаем вопрос по теме.
      */
     public static boolean onTopic(DialogTaskState state, String question) {
         if (state == null || question == null || question.isBlank()) {
@@ -165,6 +165,12 @@ public final class DialogTaskStateTracker {
         Set<String> anchors = new LinkedHashSet<>(contentWords(state.goal()));
         for (String term : state.terms()) {
             anchors.addAll(contentWords(term));
+        }
+        for (String clarification : state.clarifications()) {
+            anchors.addAll(contentWords(clarification));
+        }
+        for (String constraint : state.constraints()) {
+            anchors.addAll(contentWords(constraint));
         }
         if (anchors.isEmpty()) {
             return true;

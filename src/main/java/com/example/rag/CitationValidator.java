@@ -20,6 +20,16 @@ public final class CitationValidator {
     private static final Pattern REFERENCE = Pattern.compile("\\[(\\d+)]");
     private static final Pattern QUOTE = Pattern.compile("\\[(\\d+)]\\s*[«“](.*?)[»”]",
             Pattern.DOTALL);
+    /**
+     * Вырезка цитаты для показа пункта: в отличие от {@link #QUOTE} (проверка,
+     * ленивая — без изменений), поддерживает один уровень вложенных «…»
+     * внутри цитаты. Ленивая остановка на первом внутреннем «» оставляла
+     * хвост цитаты в пункте — дубль фрагмента и лишнюю кавычку.
+     */
+    private static final Pattern DISPLAY_QUOTE = Pattern.compile(
+            "\\[(\\d+)]\\s*[«“]((?:[^«»“”]|«[^»]*»|“[^”]*”)*)[»”]", Pattern.DOTALL);
+    /** Пустой или слишком короткий остаток пункта после вырезки — исходный текст. */
+    private static final int MIN_DISPLAY_REMAINDER = 10;
     private static final Pattern ITEM_START = Pattern.compile("^\\s*(?:[-*•]|\\d+[.)])\\s+");
     private static final String UNCOVERED_MARKER = "не покрыто контекстом";
 
@@ -173,7 +183,14 @@ public final class CitationValidator {
     }
 
     private static String itemDisplayText(String item) {
-        return QUOTE.matcher(item).replaceAll("[$1]")
+        String cut = DISPLAY_QUOTE.matcher(item).replaceAll("[$1]");
+        String remainder = cut.replaceAll("\\[\\d+]", "").strip();
+        if (remainder.length() < MIN_DISPLAY_REMAINDER) {
+            // Вырезка оставила пустой или слишком короткий остаток —
+            // показываем исходный текст пункта.
+            cut = item;
+        }
+        return cut
                 .replaceAll("(?imu)^\\s*(?:#{1,6}\\s*)?(?:источники|sources|цитаты|quotes)[ \\t]*[:\\t ]*$",
                         "")
                 .replaceAll("\\n{3,}", "\n\n").strip();
