@@ -31,7 +31,17 @@ public final class RagSettingsStore {
         this.file = file;
     }
 
+    /**
+     * Хранилище настроек по умолчанию: ~/.ai-advent-agent/rag-settings.json.
+     * Системное свойство ai-agent.rag.settings-file переопределяет путь
+     * (изоляция self-tests от реальных настроек пользователя); без свойства
+     * путь прежний.
+     */
     public static RagSettingsStore defaultStore() {
+        String override = System.getProperty("ai-agent.rag.settings-file");
+        if (override != null && !override.isBlank()) {
+            return new RagSettingsStore(Path.of(override));
+        }
         return new RagSettingsStore(Path.of(System.getProperty("user.home"),
                 ".ai-advent-agent", "rag-settings.json"));
     }
