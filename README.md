@@ -9,6 +9,66 @@ OpenAI-совместимый эндпоинт, полный контроль к
 - Секреты только из переменных окружения; в файле истории — только
   переписка, без ключей и служебных полей ответов модели.
 
+## Локальная LLM (Ollama)
+
+Агент может работать полностью офлайн: чат-модель и эмбеддинги —
+локальный Ollama по OpenAI-совместимому эндпоинту.
+
+Установка (один раз):
+
+```bash
+# Ollama: https://ollama.com/download (или: brew install ollama)
+ollama serve                  # или приложение Ollama; адрес http://localhost:11434
+ollama pull qwen2.5:3b        # чат-модель
+ollama pull bge-m3            # эмбеддинги для RAG /index (если нужна полнотекстовая память)
+curl http://localhost:11434/api/tags   # проверка: обе модели в списке
+```
+
+Быстрая демонстрация без агента (три запроса разной сложности, с временем):
+
+```bash
+./scripts/ollama_demo.sh
+```
+
+Включение в ai-agent — командой `/model` прямо в чате, без правки .env
+и без перезапуска:
+
+```
+/model ollama     — переключиться на локальную модель (проверяет, что `ollama serve` запущен)
+/model            — показать активный профиль, модель и URL
+/model cloud      — вернуться на облачную модель (как настроена в .env)
+```
+
+Выбранный профиль сохраняется в `~/.ai-advent-agent/model-profile.json`
+и переживает перезапуск; по умолчанию (без файла) действует cloud.
+История и состояние диалога при переключении не изменяются. RAG-ответы
+с цитатами на локальной 3B-модели менее надёжны.
+
+Альтернатива — постоянная настройка в `.env` (`http://` разрешён только
+для localhost; ключ не требуется, если клиент требует непустой,
+подставляется заглушка):
+
+```bash
+export LLM_API_URL="http://localhost:11434/v1/chat/completions"
+export LLM_MODEL="qwen2.5:3b"
+export LLM_API_KEY="ollama"
+export LLM_REQUEST_TIMEOUT_SECONDS="300"   # локальная генерация медленнее облачной
+export EMBEDDING_BASE_URL="http://localhost:11434/v1"
+export EMBEDDING_MODEL="bge-m3"
+```
+
+Затем обычный запуск: `ai-agent` (пересборка не нужна — настройки читаются
+при старте; .env не коммитится).
+
+Возврат на облачную модель при .env-варианте — вернуть прежние значения:
+
+```bash
+export LLM_API_URL="https://opencode.ai/zen/go/v1/chat/completions"
+export LLM_MODEL="glm-5.3-flash"
+export LLM_API_KEY="<ваш ключ из .env>"
+# по желанию убрать LLM_REQUEST_TIMEOUT_SECONDS
+```
+
 ## Возможности
 
 | Функция | Что делает |

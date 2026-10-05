@@ -239,6 +239,25 @@ public record ModelSettings(
     }
 
     /**
+     * Тот же экземпляр с другим таймаутом запроса. Запись неизменяема:
+     * метод возвращает копию. Используется переключением профиля провайдера
+     * (/model): локальным моделям нужен более длинный таймаут генерации.
+     */
+    public ModelSettings withRequestTimeoutSeconds(int newTimeoutSeconds) {
+        if (newTimeoutSeconds <= 0) {
+            throw new AgentException("Таймаут запроса должен быть положительным числом: "
+                    + newTimeoutSeconds);
+        }
+        return new ModelSettings(profile, maxOutputTokens, limitOverridden,
+                temperature, newTimeoutSeconds, contextMaxTurns,
+                contextWindowTokens, overflowPolicy, inputPricePer1M, outputPricePer1M,
+                sessionTokenLimit, diagnostics, contextMode,
+                keepLastMessages, summaryBatchMessages, summaryMaxOutputTokens,
+                contextStrategy, slidingWindowMessages, factsWindowMessages,
+                factsMaxOutputTokens, factsUpdateMode);
+    }
+
+    /**
      * Тот же экземпляр с другим режимом контекста (/context full|summary).
      * Настройки сжатия и прочие значения не меняются; API команда не вызывает.
      */

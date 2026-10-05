@@ -194,8 +194,8 @@ public interface TerminalUi extends AutoCloseable {
                 new Row("Контекст", "/context /summary /strategy /facts /branch",
                         "что уходит в запрос к модели"),
                 new Row("Диалог", "/clear /reset", "удалить текущую историю"),
-                new Row("Режимы", "/mode /multiline /paste /demo",
-                        "формат ответа, длинный ввод, измерения"),
+                new Row("Режимы", "/mode /model /multiline /paste /demo",
+                        "формат ответа, провайдер, длинный ввод, измерения"),
                 new Row("Статистика", "/tokens /stats /limit /status",
                         "расход и обзор состояния"),
                 new Row("Индекс", "/index build /index stats /index search /index compare",
@@ -231,7 +231,7 @@ public interface TerminalUi extends AutoCloseable {
                 "/help", "/history", "/memory", "/remember", "/forget", "/task",
                 "/dialogstate",
                 "/profile", "/skill", "/pipeline", "/invariant", "/clear", "/reset",
-                "/mode", "/multiline", "/paste", "/demo",
+                "/mode", "/model", "/multiline", "/paste", "/demo",
                 "/context", "/summary", "/strategy", "/facts", "/branch",
                 "/tokens", "/stats", "/limit", "/status", "/mcp", "/monitor", "/index", "/rag", "/exit",
         };
@@ -739,6 +739,22 @@ public interface TerminalUi extends AutoCloseable {
                       запуска; LLM_MAX_OUTPUT_TOKENS приоритетнее профиля.
 
                     Связано: /stats.""";
+            case "/model" -> """
+                    /model — переключение провайдера без перезапуска
+
+                    Использование
+                      /model            — активный профиль, модель, URL
+                      /model cloud      — облачная модель (как в .env)
+                      /model ollama     — локальная Ollama (нужен `ollama serve`)
+
+                    Эффекты
+                      меняет провайдера, модель и таймаут; история и состояние
+                      диалога сохраняются. Профиль переживает перезапуск
+                      (~/.ai-advent-agent/model-profile.json). По умолчанию —
+                      cloud. На локальной 3B-модели RAG-ответы с цитатами
+                      менее надёжны.
+
+                    Связано: /mode, /tokens, /status.""";
             case "/multiline" -> """
                     /multiline — многострочный ввод
 

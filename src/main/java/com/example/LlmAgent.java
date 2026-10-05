@@ -101,10 +101,23 @@ public final class LlmAgent {
     /** Максимум завершённых пар user/assistant в памяти и в файле истории. */
     public static final int MAX_HISTORY_TURNS = 20;
 
-    private final Config config;
+    /**
+     * Активный провайдер. Заменяется только переключением профиля
+     * (/model, переключение заменяет объект целиком — записи неизменяемы).
+     */
+    private Config config;
+
+    /** Профиль cloud: конфигурация, с которой агент был создан (Config старта). */
+    private final Config cloudConfig;
     private final HttpClient httpClient;
     private final ObjectMapper objectMapper;
     private final ConversationStore store;
+
+    /** Таймаут настроек старта: возвращается при переключении на профиль cloud. */
+    private final int cloudRequestTimeoutSeconds;
+
+    /** Имя активного профиля провайдера (/model); cloud до первого переключения. */
+    private String profileName = ModelProfiles.CLOUD;
 
     /** Долговременная память: файл, чтение и атомарная запись. */
     private final MemoryStore memoryStore;
@@ -383,6 +396,8 @@ public final class LlmAgent {
                     ConversationStore store, MemoryStore memoryStore,
                     ProfileStore profileStore, InvariantStore invariantStore) {
         this.config = config;
+        this.cloudConfig = config;
+        this.cloudRequestTimeoutSeconds = settings.requestTimeoutSeconds();
         this.settings = Objects.requireNonNull(settings, "settings");
         this.httpClient = httpClient;
         this.store = Objects.requireNonNull(store, "store");
@@ -466,6 +481,37 @@ public final class LlmAgent {
 
     public String modelName() {
         return config.model();
+    }
+
+    /** Открытый URL активного провайдера (для /model; ключ не показывается). */
+    public String providerApiUrl() {
+        return config.apiUrl();
+    }
+
+    /**
+     * Переключает профиль провайдера (/model): создаёт Config из профиля,
+     * меняет таймаут запроса и запоминает имя активного профиля.
+     * История, состояние диалога, память и задачи не изменяются.
+     * Неизвестный/невалидный провайдер (например http вне loopback)
+     * отклоняется проверкой Config — состояние до броска не меняется.
+     * Корректность имени проверяет вызывающий код ({@link ModelProfiles}).
+     */
+    public void switchToProfile(ModelProfiles.Profile profile) {
+        Objects.requireNonNull(profile, "profile");
+        Config newConfig = new Config(profile.apiKey(), profile.apiUrl(), profile.model());
+        this.config = newConfig;
+        this.settings = settings.withRequestTimeoutSeconds(profile.requestTimeoutSeconds());
+        this.profileName = profile.name();
+    }
+
+    /** Имя текущего профиля провайдера (cloud по умолчанию). */
+    public String currentProfileName() {
+        return profileName;
+    }
+
+    /** Профиль cloud: конфигурация и таймаут старта, для /model cloud. */
+    ModelProfiles.Profile cloudProfile() {
+        return ModelProfiles.cloud(cloudConfig, cloudRequestTimeoutSeconds);
     }
 
     /**
