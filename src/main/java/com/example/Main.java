@@ -1,6 +1,7 @@
 package com.example;
 
 import java.math.BigDecimal;
+import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -100,7 +101,10 @@ public final class Main {
                     InvariantStore.openDefault());
             TerminalUi ui = TerminalUi.create(plainRequested);
             try {
-                exitCode = runLoop(ui, agent, config.model());
+                // Сохранённый профиль /model применяется до приветствия,
+                // чтобы заголовок и приглашение показали актуальную модель.
+                applySavedModelProfile(agent);
+                exitCode = runLoop(ui, agent, agent.modelName());
             } finally {
                 ui.close();
             }
@@ -359,7 +363,7 @@ public final class Main {
                                 ui.showSystem(demoRef.demo.metricsAfterAnswer());
                                 showSessionLimitNoticeIfAny(ui, activeAgent);
                             } else {
-                                showAnswerNotes(ui, agent, model);
+                                showAnswerNotes(ui, agent, agent.modelName());
                             }                        } catch (ConversationSaveException e) {
                             // Ответ уже получен и показывается; повторный платный
                             // запрос не выполняется. Продолжать чат нельзя: контекст
@@ -2103,10 +2107,16 @@ public final class Main {
         if (demoRef.demo != null) {
             return;
         }
+        // Переключённый (/model) профиль — краткая пометка модели в приглашении:
+        // приглашение показывает актуального провайдера без проверки команд.
+        String modelLabel = ModelProfiles.CLOUD.equals(agent.currentProfileName())
+                ? null : "модель: " + agent.modelName();
         if (agent.currentSettings().contextStrategy() == ContextStrategy.BRANCHING) {
-            ui.setActiveModeLabel("ветка: " + agent.activeBranchName());
+            ui.setActiveModeLabel(modelLabel == null
+                    ? "ветка: " + agent.activeBranchName()
+                    : "ветка: " + agent.activeBranchName() + " · " + modelLabel);
         } else {
-            ui.setActiveModeLabel(null);
+            ui.setActiveModeLabel(modelLabel);
         }
         ui.setPromptTask(agent.currentTask());
     }
@@ -3310,7 +3320,7 @@ public final class Main {
             case "/status" -> ui.showSystem(formatStatus(agent));
             case "/history" -> ui.showHistory(agent.getHistory());
             case "/mcp" -> handleMcpCommand(ui, command, agent, mcpSnapshot);
-            case "/tokens" -> ui.showSystem(formatTokens(agent, model));
+            case "/tokens" -> ui.showSystem(formatTokens(agent, agent.modelName()));
             case "/stats" -> ui.showSystem(formatStats(agent));
             case "/limit" -> handleLimitCommand(ui, agent, "/limit");
             case "/clear" -> handleClearCommand(ui, agent, demoRef, mcpSnapshot);
@@ -3356,6 +3366,8 @@ public final class Main {
                     handleRagCommand(ui, agent, command, ragRef);
                 } else if (normalized.equals("/mode") || normalized.startsWith("/mode ")) {
                     handleModeCommand(ui, agent, normalized);
+                } else if (normalized.equals("/model") || normalized.startsWith("/model ")) {
+                    handleModelCommand(ui, agent, command, demoRef);
                 } else if (normalized.equals("/limit") || normalized.startsWith("/limit ")) {
                     handleLimitCommand(ui, agent, normalized);
                 } else {
@@ -4795,6 +4807,123 @@ public final class Main {
                     + ". Действует до конца текущего запуска.");
         } catch (AgentException e) {
             ui.showError(e.getMessage());
+        }
+    }
+
+    /**
+     * /model — показ активного профиля провайдера и переключение
+     * cloud/ollama без правки .env и без перезапуска. История, состояние
+     * диалога, память и задачи агента не изменяются. Профиль ollama требует
+     * запущенного локального сервера: быстрый GET /api/tags с коротким
+     * таймаутом, при недоступности переключение не выполняется.
+     * Выбранный профиль сохраняется в ModelProfileStore и переживает
+     * перезапуск; ключи не показываются.
+     */
+    private static void handleModelCommand(TerminalUi ui, LlmAgent agent, String raw,
+                                           DemoRef demoRef) {
+        if (demoRef.demo != null) {
+            ui.showSystem("В режиме измерения токенов переключение провайдера отключено. "
+                    + "Завершите режим (/demo stop) и повторите.");
+            return;
+        }
+        String prefix = "/model";
+        String argument = raw.length() > prefix.length()
+                ? raw.substring(prefix.length()).trim() : "";
+        if (argument.isEmpty()) {
+            StringBuilder text = new StringBuilder("Активный профиль: ")
+                    .append(agent.currentProfileName())
+                    .append(" · модель ").append(agent.modelName())
+                    .append(" · ").append(agent.providerApiUrl())
+                    .append(" · таймаут ").append(agent.currentSettings().requestTimeoutSeconds())
+                    .append(" с\nПереключение: /model ")
+                    .append(ModelProfiles.namesForHelp()).append('\n');
+            if (ModelProfiles.OLLAMA.equals(agent.currentProfileName())) {
+                text.append("Примечание: RAG-ответы с цитатами на локальной 3B-модели ")
+                        .append("менее надёжны.\n");
+            }
+            ui.showSystem(text.toString().stripTrailing());
+            return;
+        }
+        String profileName = argument.toLowerCase(java.util.Locale.ROOT);
+        if (!ModelProfiles.known(profileName)) {
+            ui.showError("Неизвестный профиль модели: " + argument + ". Доступны: "
+                    + ModelProfiles.namesForHelp() + ". Активный профиль не изменён: "
+                    + agent.currentProfileName() + ".");
+            return;
+        }
+        ModelProfiles.Profile profile;
+        try {
+            profile = ModelProfiles.resolve(profileName, agent.cloudProfile());
+        } catch (AgentException e) {
+            ui.showError(e.getMessage());
+            return;
+        }
+        if (ModelProfiles.OLLAMA.equals(profile.name()) && !ModelProfiles.reachable(profile)) {
+            ui.showSystem("Ollama недоступна: " + ModelProfiles.origin(profile)
+                    + " не отвечает (проверка /api/tags).\nЗапустите локальный "
+                    + "сервер: ollama serve (или приложение Ollama). Активный профиль "
+                    + "не изменён: " + agent.currentProfileName() + ".");
+            return;
+        }
+        try {
+            agent.switchToProfile(profile);
+        } catch (AgentException e) {
+            ui.showError("Профиль не переключен: " + e.getMessage());
+            return;
+        }
+        updatePromptLabels(ui, agent, demoRef);
+        StringBuilder confirmed = new StringBuilder("✓ Профиль: ").append(profile.name())
+                .append(" · модель ").append(agent.modelName())
+                .append(" · ").append(agent.providerApiUrl())
+                .append(" · таймаут ").append(agent.currentSettings().requestTimeoutSeconds())
+                .append(" с");
+        if (ModelProfiles.OLLAMA.equals(profile.name())) {
+            confirmed.append("\nПримечание: RAG-ответы с цитатами на локальной 3B-модели ")
+                    .append("менее надёжны.");
+        }
+        try {
+            ModelProfileStore.defaultStore().save(profile.name());
+        } catch (IOException e) {
+            confirmed.append("\nПредупреждение: профиль применён, но не сохранён ")
+                    .append("для перезапуска: ").append(e.getMessage());
+        }
+        ui.showSystem(confirmed.toString());
+    }
+
+    /**
+     * Восстанавливает сохранённый профиль /model при старте (без UI).
+     * ollama недоступна — профиль не применяется, действует cloud, файл
+     * не изменяется (повторная попытка при следующем явном переключении).
+     * Ошибка чтения файла — cloud молча (одну строку в stderr).
+     */
+    private static void applySavedModelProfile(LlmAgent agent) {
+        String saved;
+        try {
+            saved = ModelProfileStore.defaultStore().load();
+        } catch (IOException e) {
+            System.err.println("Профиль /model не прочитан (действует cloud): "
+                    + e.getMessage());
+            return;
+        }
+        if (saved == null || !ModelProfiles.known(saved)
+                || ModelProfiles.CLOUD.equalsIgnoreCase(saved.trim())) {
+            return;
+        }
+        try {
+            ModelProfiles.Profile profile = ModelProfiles.resolve(saved.trim(),
+                    agent.cloudProfile());
+            if (ModelProfiles.OLLAMA.equals(profile.name())
+                    && !ModelProfiles.reachable(profile)) {
+                System.err.println("Сохранённый профиль /model ollama не применён: "
+                        + "Ollama недоступна. Действует cloud. Запустите: ollama serve");
+                return;
+            }
+            agent.switchToProfile(profile);
+            System.err.println("Профиль /model восстановлен: "
+                    + agent.currentProfileName() + " · " + agent.modelName());
+        } catch (AgentException e) {
+            System.err.println("Сохранённый профиль /model " + saved
+                    + " не применён: " + e.getMessage() + ". Действует cloud.");
         }
     }
 

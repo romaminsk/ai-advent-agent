@@ -57,6 +57,57 @@ final class UxChecks extends SelfTestSupport {
     static void run() throws Exception {
         checkUxGroup();
         checkDialogStateCommandUx();
+        checkModelCommandUx();
+    }
+
+     static void checkModelCommandUx() throws Exception {
+        boolean listed = false;
+        for (String name : TerminalUi.chatCommandNames()) {
+            if (name.equals("/model")) {
+                listed = true;
+            }
+        }
+        expect("/model входит в список известных команд (подсказки опечаток)", listed);
+        expect("полный индекс /help all содержит /model в группе «Режимы»",
+                TerminalUi.chatIndex(80).contains("/model"));
+        String commandHelp = TerminalUi.chatCommandHelp("/model");
+        expect("у /model есть подробная справка с профилями и сохранением",
+                commandHelp != null && commandHelp.contains("/model ollama")
+                        && commandHelp.contains("перезапуск"));
+
+        // /model без аргумента: активный профиль и URL, ключ не показывается.
+        LlmAgent agent = newMemoryAgent(new Config("secret-test-key",
+                        "https://cloud.example.com/v1/chat/completions", "glm-5.3-flash"),
+                HttpClient.newHttpClient(), Map.of());
+        FakeUi ui = new FakeUi(
+                TerminalUi.Input.command("/model"),
+                TerminalUi.Input.command("/model supercloud"),
+                TerminalUi.Input.command("/exit"));
+        Main.runLoop(ui, agent, agent.modelName());
+        String joined = String.join("\n", ui.systems) + "\n"
+                + String.join("\n", ui.errors);
+        expect("/model показывает активный профиль cloud и URL",
+                joined.contains("Активный профиль: cloud")
+                        && joined.contains("https://cloud.example.com/v1/chat/completions")
+                        && joined.contains("glm-5.3-flash"));
+        expect("/model не показывает ключ API",
+                !joined.contains("secret-test-key"));
+        expect("неизвестный профиль даёт ошибку со списком и не меняет профиль",
+                ui.errors.stream().anyMatch(s -> s.contains("Неизвестный профиль")
+                        && s.contains("cloud, ollama"))
+                        && ModelProfiles.CLOUD.equals(agent.currentProfileName()));
+        expect("промпт cloud-профиля без пометки модели",
+                ui.modeLabels.stream().noneMatch(l -> l != null && l.contains("модель:")));
+
+        // После переключения на не-cloud профиль приглашение показывает модель.
+        agent.switchToProfile(new ModelProfiles.Profile("ollama",
+                "https://127.0.0.1:1/v1/chat/completions", "qwen2.5:3b", "ollama", 300));
+        FakeUi switchedUi = new FakeUi(TerminalUi.Input.command("/exit"));
+        Main.runLoop(switchedUi, agent, agent.modelName());
+        expect("приглашение показывает модель не-cloud профиля",
+                switchedUi.modeLabels.stream().anyMatch(
+                        l -> "модель: qwen2.5:3b".equals(l))
+                        && "qwen2.5:3b".equals(switchedUi.welcomedModels.getLast()));
     }
 
      static void checkDialogStateCommandUx() throws Exception {

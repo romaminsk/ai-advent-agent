@@ -68,6 +68,43 @@ final class StoreChecks extends SelfTestSupport {
         checkSessionTokenLimitSettings();
         checkDialogStatePersistence();
         checkDefaultHistoryContinuation();
+        checkModelProfileStore();
+    }
+
+     static void checkModelProfileStore() throws IOException {
+        // Отсутствующий файл — cloud: прежнее поведение по умолчанию.
+        Path directory = Files.createTempDirectory(baseTempDir, "model-profiles-");
+        ModelProfileStore store = new ModelProfileStore(directory.resolve("model-profile.json"));
+        expect("нет файла профиля — действует cloud",
+                ModelProfiles.CLOUD.equals(store.load()));
+
+        store.save("ollama");
+        expect("сохранённый профиль читается round-trip",
+                "ollama".equals(new ModelProfileStore(store.file()).load()));
+        expect("файл профиля валидный JSON с полем profile",
+                MAPPER.readTree(store.file().toFile()).path("profile").asText()
+                        .equals("ollama"));
+
+        store.save(ModelProfiles.CLOUD);
+        expect("повторная запись перезаписывает профиль (cloud)",
+                ModelProfiles.CLOUD.equals(store.load()));
+
+        // Изоляция через свойство: defaultStore уходит во временный каталог.
+        Path isolated = directory.resolve("isolated").resolve("model-profile.json");
+        System.setProperty("ai-agent.model-profile-file", isolated.toString());
+        try {
+            ModelProfileStore isolatedStore = ModelProfileStore.defaultStore();
+            expect("свойство задаёт путь defaultStore",
+                    isolatedStore.file().equals(isolated));
+            expect("изолированный файл ещё не создан — cloud",
+                    ModelProfiles.CLOUD.equals(isolatedStore.load()));
+            isolatedStore.save("ollama");
+            expect("изолированный файл создан и читается",
+                    "ollama".equals(isolatedStore.load())
+                            && Files.isRegularFile(isolated));
+        } finally {
+            System.clearProperty("ai-agent.model-profile-file");
+        }
     }
 
      static void checkConversationStore() throws IOException {
