@@ -9,6 +9,52 @@ OpenAI-совместимый эндпоинт, полный контроль к
 - Секреты только из переменных окружения; в файле истории — только
   переписка, без ключей и служебных полей ответов модели.
 
+## Локальная LLM (Ollama)
+
+Агент может работать полностью офлайн: чат-модель и эмбеддинги —
+локальный Ollama по OpenAI-совместимому эндпоинту.
+
+Установка (один раз):
+
+```bash
+# Ollama: https://ollama.com/download (или: brew install ollama)
+ollama serve                  # или приложение Ollama; адрес http://localhost:11434
+ollama pull qwen2.5:3b        # чат-модель
+ollama pull bge-m3            # эмбеддинги для RAG /index (если нужна полнотекстовая память)
+curl http://localhost:11434/api/tags   # проверка: обе модели в списке
+```
+
+Быстрая демонстрация без агента (три запроса разной сложности, с временем):
+
+```bash
+./scripts/ollama_demo.sh
+```
+
+Включение в ai-agent — в `.env` проекта (ключ не требуется, если клиент
+требует непустой, подставляется заглушка; `http://` разрешён только
+для localhost):
+
+```bash
+export LLM_API_URL="http://localhost:11434/v1/chat/completions"
+export LLM_MODEL="qwen2.5:3b"
+export LLM_API_KEY="ollama"
+export LLM_REQUEST_TIMEOUT_SECONDS="300"   # локальная генерация медленнее облачной
+export EMBEDDING_BASE_URL="http://localhost:11434/v1"
+export EMBEDDING_MODEL="bge-m3"
+```
+
+Затем обычный запуск: `ai-agent` (пересборка не нужна — настройки читаются
+при старте; .env не коммитится).
+
+Возврат на облачную модель — вернуть прежние значения:
+
+```bash
+export LLM_API_URL="https://opencode.ai/zen/go/v1/chat/completions"
+export LLM_MODEL="glm-5.3-flash"
+export LLM_API_KEY="<ваш ключ из .env>"
+# по желанию убрать LLM_REQUEST_TIMEOUT_SECONDS
+```
+
 ## Возможности
 
 | Функция | Что делает |
