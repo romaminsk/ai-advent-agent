@@ -99,6 +99,10 @@ public final class SelfTest extends SelfTestSupport {
         // состояние по умолчанию (режим выключен).
         System.setProperty("ai-agent.rag.settings-file",
                 baseTempDir.resolve("rag-settings.json").toString());
+        // Изоляция активного профиля /model: self-tests не пишут реальный
+        // ~/.ai-advent-agent/model-profile.json пользователя.
+        System.setProperty("ai-agent.model-profile-file",
+                baseTempDir.resolve("model-profile.json").toString());
         try {
             for (Map.Entry<String, TestGroup> entry : selected) {
                 int beforePassed = passed;

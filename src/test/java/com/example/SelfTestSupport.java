@@ -1104,10 +1104,22 @@ class SelfTestSupport {
         boolean interactiveMenusEnabled = false;
         final List<String> promptTasks = new ArrayList<>();
         final List<String> commandHelps = new ArrayList<>();
+        final List<String> modeLabels = new ArrayList<>();
+        final List<String> welcomedModels = new ArrayList<>();
 
         @Override
         public boolean interactiveMenus() {
             return interactiveMenusEnabled;
+        }
+
+        @Override
+        public void setActiveModeLabel(String label) {
+            modeLabels.add(label);
+        }
+
+        @Override
+        public void showWelcome(String model) {
+            welcomedModels.add(model);
         }
 
         @Override
@@ -1130,10 +1142,6 @@ class SelfTestSupport {
                 return TerminalUi.Input.eof();
             }
             return script.get(cursor++);
-        }
-
-        @Override
-        public void showWelcome(String model) {
         }
 
         @Override

@@ -62,6 +62,7 @@ final class DialogChecks extends SelfTestSupport {
         checkContextLimit();
         checkErrorClassification();
         checkLocalOllamaConfig();
+        checkModelProfileSwitch();
     }
 
      static void checkConfigErrors() {
@@ -710,6 +711,113 @@ final class DialogChecks extends SelfTestSupport {
         if (plainLoopbackServer != null) {
             plainLoopbackServer.stop(0);
             plainLoopbackServer = null;
+        }
+    }
+
+     static void checkModelProfileSwitch() throws Exception {
+        // Профиль ollama по умолчанию (без env): URL, модель, ключ-заглушка, таймаут.
+        ModelProfiles.Profile ollamaDefaults =
+                ModelProfiles.ollama(java.util.Map.of());
+        expect("профиль ollama по умолчанию: URL, модель, ключ, таймаут",
+                "ollama".equals(ollamaDefaults.name())
+                        && "http://localhost:11434/v1/chat/completions"
+                        .equals(ollamaDefaults.apiUrl())
+                        && "qwen2.5:3b".equals(ollamaDefaults.model())
+                        && "ollama".equals(ollamaDefaults.apiKey())
+                        && ollamaDefaults.requestTimeoutSeconds() == 300);
+
+        // Проверка доступности: закрытый порт — недоступна, живой /api/tags — доступна.
+        ModelProfiles.Profile closedOllama = new ModelProfiles.Profile("ollama",
+                "http://127.0.0.1:1/v1/chat/completions", "qwen2.5:3b", "ollama", 300);
+        expect("недоступная ollama (закрытый порт) распознаётся",
+                !ModelProfiles.reachable(closedOllama));
+
+        // Переключение на живом агенте: URL/модель/таймаут меняются, ключ не печатается.
+        int[] portHolder = startPlainEphemeralServer();
+        try {
+            Config cloudConfig = new Config("secret-test-key",
+                    "https://always-cloud.example.com/v1/chat/completions",
+                    "glm-5.3-flash");
+            JsonConversationStore store = tempStore();
+            ModelSettings settings = ModelSettings.defaults();
+            LlmAgent agent = new LlmAgent(cloudConfig, settings,
+                    HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build(),
+                    store, tempMemoryStore());
+            expect("профиль по умолчанию — cloud", ModelProfiles.CLOUD
+                    .equals(agent.currentProfileName()));
+            expect("конфигурация cloud не изменилась до переключения",
+                    agent.modelName().equals("glm-5.3-flash")
+                            && agent.providerApiUrl()
+                            .equals("https://always-cloud.example.com/v1/chat/completions")
+                            && agent.currentSettings().requestTimeoutSeconds() == 180);
+
+            // Один обмен на cloud (локально, без API), затем переключение и
+            // второй обмен на ollama-конфиг: история и состояние диалога
+            // непрерывны.
+            String question1 = "первый вопрос";
+            String answer1 = agent.recordLocalAnswer(question1, "Привет");
+            expect("пара на cloud записана локально", "Привет".equals(answer1));
+            List<ChatMessage> historyAfterCloud = agent.getHistory();
+            DialogTaskState stateAfterCloud = agent.dialogState();
+
+            ModelProfiles.Profile ollamaLive = new ModelProfiles.Profile("ollama",
+                    "http://127.0.0.1:" + portHolder[0] + "/v1/chat/completions",
+                    "qwen2.5:3b", "ollama", 300);
+            agent.switchToProfile(ollamaLive);
+            expect("после переключения обновлены профиль, модель и таймаут",
+                    "ollama".equals(agent.currentProfileName())
+                            && "qwen2.5:3b".equals(agent.modelName())
+                            && agent.providerApiUrl()
+                            .contains(String.valueOf(portHolder[0]))
+                            && agent.currentSettings().requestTimeoutSeconds() == 300);
+            expect("история сохранилась при переключении профиля",
+                    agent.getHistory().equals(historyAfterCloud));
+            expect("состояние диалога сохранилось при переключении профиля",
+                    agent.dialogState().equals(stateAfterCloud));
+
+            String answer2 = agent.ask("второй вопрос");
+            expect("второй обмен прошёл через ollama-конфигурацию",
+                    "Привет".equals(answer2));
+
+            // http на внешнем хосте отклонён Config-проверкой; состояние не меняется.
+            String modelBeforeRejection = agent.modelName();
+            String nameBeforeRejection = agent.currentProfileName();
+            boolean rejectedRemoteHttp;
+            try {
+                agent.switchToProfile(new ModelProfiles.Profile("ollama",
+                        "http://example.com/v1/chat/completions", "other-model",
+                        "ollama", 300));
+                rejectedRemoteHttp = false;
+            } catch (AgentException e) {
+                rejectedRemoteHttp = e.getMessage().contains("HTTPS");
+            }
+            expect("удалённый http-профиль отклонён, состояние не изменилось",
+                    rejectedRemoteHttp
+                            && agent.modelName().equals(modelBeforeRejection)
+                            && agent.currentProfileName().equals(nameBeforeRejection));
+
+            // Неизвестное имя профиля — ошибка со списком доступных.
+            boolean unknownReported;
+            try {
+                ModelProfiles.resolve("gpt", agent.cloudProfile());
+                unknownReported = false;
+            } catch (AgentException e) {
+                unknownReported = e.getMessage().contains("Неизвестный профиль")
+                        && e.getMessage().contains("cloud, ollama");
+            }
+            expect("неизвестное имя профиля даёт ошибку со списком", unknownReported);
+
+            // Возврат на cloud: прежние URL, модель и таймаут.
+            agent.switchToProfile(agent.cloudProfile());
+            expect("возврат на cloud восстанавливает конфигурацию и таймаут",
+                    ModelProfiles.CLOUD.equals(agent.currentProfileName())
+                            && "glm-5.3-flash".equals(agent.modelName())
+                            && agent.providerApiUrl()
+                            .equals("https://always-cloud.example.com/v1/chat/completions")
+                            && agent.currentSettings().requestTimeoutSeconds() == 180);
+            store.close();
+        } finally {
+            stopPlainEphemeralServer();
         }
     }
 }
