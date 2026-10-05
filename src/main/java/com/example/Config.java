@@ -8,7 +8,12 @@ import java.net.URI;
  *
  * Ожидаемые переменные:
  * - LLM_API_KEY  — ключ доступа к API (не логируем и не выводим);
+ *   для локальных моделей без аутентификации допускается заглушка
+ *   (например, "ollama"), в запрос она подставляется как любой ключ;
  * - LLM_API_URL  — полный URL эндпоинта chat/completions;
+ *   облачным провайдерам нужен HTTPS; открытый HTTP разрешён только
+ *   для loopback-адресов (localhost/127.0.0.1/::1) — локальная
+ *   LLM вроде Ollama (http://localhost:11434/v1) без шифрования;
  * - LLM_MODEL    — идентификатор модели, например glm-5.3-flash.
  */
 public final class Config {
@@ -21,7 +26,7 @@ public final class Config {
         this.apiKey = requireNonBlank(apiKey, "LLM_API_KEY");
         this.apiUrl = requireNonBlank(apiUrl, "LLM_API_URL");
         this.model = requireNonBlank(model, "LLM_MODEL");
-        checkHttpsUrl(this.apiUrl, "LLM_API_URL");
+        checkApiUrl(this.apiUrl, "LLM_API_URL");
     }
 
     /** Загружает конфигурацию из переменных окружения. */
@@ -58,8 +63,8 @@ public final class Config {
         return value;
     }
 
-    /** URL должен быть корректным адресом, пригодным для HTTPS-запроса. */
-    private static void checkHttpsUrl(String url, String name) {
+    /** URL должен быть HTTPS-адресом; loopback дополнительно допускает открытый HTTP. */
+    private static void checkApiUrl(String url, String name) {
         URI uri;
         try {
             uri = URI.create(url);
@@ -67,9 +72,40 @@ public final class Config {
             throw new AgentException(
                     name + " не является корректным URL: " + url, e);
         }
-        if (!"https".equalsIgnoreCase(uri.getScheme()) || uri.getHost() == null) {
+        String scheme = uri.getScheme();
+        if (uri.getHost() == null || scheme == null) {
             throw new AgentException(
-                    name + " должен быть HTTPS-адресом вида https://host/..., получено: " + url);
+                    name + " должен быть адресом вида https://host/... (или "
+                            + "http://localhost:port/... для локальной LLM), получено: " + url);
+        }
+        if ("https".equalsIgnoreCase(scheme)) {
+            return;
+        }
+        if ("http".equalsIgnoreCase(scheme) && isLoopbackHost(uri.getHost())) {
+            return;
+        }
+        throw new AgentException(
+                name + " должен быть HTTPS-адресом вида https://host/...; открытый HTTP "
+                        + "допускается только для локальной LLM на loopback "
+                        + "(localhost/127.0.0.1/::1), получено: " + url);
+    }
+
+    /** true для loopback-хостов: localhost, домен localhost.* и литеральные адреса. */
+    private static boolean isLoopbackHost(String host) {
+        if (host == null) {
+            return false;
+        }
+        String normalized = host.toLowerCase(java.util.Locale.ROOT);
+        if (normalized.equals("localhost")
+                || normalized.startsWith("localhost.")
+                || normalized.endsWith(".localhost")
+                || normalized.equals("localhost.localdomain")) {
+            return true;
+        }
+        try {
+            return java.net.InetAddress.getByName(host).isLoopbackAddress();
+        } catch (java.net.UnknownHostException e) {
+            return false;
         }
     }
 }

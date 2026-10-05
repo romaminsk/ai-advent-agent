@@ -61,6 +61,7 @@ final class DialogChecks extends SelfTestSupport {
         checkRequestParameters();
         checkContextLimit();
         checkErrorClassification();
+        checkLocalOllamaConfig();
     }
 
      static void checkConfigErrors() {
@@ -616,6 +617,99 @@ final class DialogChecks extends SelfTestSupport {
         } finally {
             server.stop(0);
             Files.deleteIfExists(keyStore);
+        }
+    }
+
+     static void checkLocalOllamaConfig() throws Exception {
+        // Конфиг Ollama: открытый HTTP на loopback допускается только для localhost;
+        // ключ не требуется, но включается (заглушка) и уходит как обычный Bearer.
+        expect("Ollama http://localhost:11434/v1 принимается",
+                new Config("ollama", "http://localhost:11434/v1", "qwen2.5:3b") != null);
+        expect("127.0.0.1 на HTTP допускается для локальной LLM",
+                new Config("ollama", "http://127.0.0.1:11434/v1", "qwen2.5:3b") != null);
+        expect("непринимаемый HTTP-хост без HTTPS отклоняется",
+                expectConfigError("test-key", "http://example.com/v1/chat/completions",
+                        "glm-5.3-flash").contains("HTTPS"));
+        expect("пустой ключ Ollama не принят без заглушки",
+                expectConfigError(null, "http://localhost:11434/v1", "qwen2.5:3b")
+                        .contains("LLM_API_KEY"));
+
+        // Диалог через plain HTTP loopback: ответ модели и модель в теле запроса.
+        int[] portHolder = startPlainEphemeralServer();
+        try {
+            Config config = new Config("ollama",
+                    "http://localhost:" + portHolder[0] + "/v1/chat/completions",
+                    "qwen2.5:3b");
+            Map<String, String> env = new java.util.HashMap<>();
+            env.put("LLM_REQUEST_TIMEOUT_SECONDS", "300");
+            JsonConversationStore store = tempStore();
+            HttpClient httpClient = HttpClient.newBuilder()
+                    .connectTimeout(Duration.ofSeconds(30)).build();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.from(env), httpClient,
+                    store, tempMemoryStore());
+            String answer = agent.ask("Скажи одно слово: привет");
+            expect("Ollama-конфиг даёт ответ через plain HTTP loopback",
+                    "Привет".equals(answer));
+            expect("в запросе уходит configured модель qwen2.5:3b",
+                    agent.modelName().equals("qwen2.5:3b"));
+            expect("таймаут из LLM_REQUEST_TIMEOUT_SECONDS применён в настройках",
+                    agent.currentSettings().requestTimeoutSeconds() == 300);
+
+            // Значения по умолчанию (без env) прежние: HTTPS требуется, таймаут 180.
+            expect("режим по умолчанию: таймаут 180 с без настройки",
+                    ModelSettings.defaults().requestTimeoutSeconds() == 180);
+            expect("режим по умолчанию не поддерживает удалённый HTTP",
+                    expectConfigError("test-key",
+                            "http://cloud.example.com:8080/v1/chat/completions",
+                            "glm-5.3-flash")
+                            .contains("HTTPS"));
+            store.close();
+        } finally {
+            stopPlainEphemeralServer();
+        }
+    }
+
+    /** Общий ephemeral plain-HTTP-сервер для проверки локальной Ollama-конфигурации. */
+    private static int[] lastPlainPort;
+    private static com.sun.net.httpserver.HttpServer plainLoopbackServer;
+
+    private static int[] startPlainEphemeralServer() throws Exception {
+        plainLoopbackServer = com.sun.net.httpserver.HttpServer.create(
+                new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+        plainLoopbackServer.createContext("/v1/chat/completions", exchange -> {
+            String requestBody =
+                    new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            // Минимальный OpenAI-совместимый ответ, как у Ollama /v1/chat/completions.
+            byte[] body = ("{\"choices\":[{\"finish_reason\":\"stop\","
+                    + "\"message\":{\"role\":\"assistant\",\"content\":\"Привет\"}}],"
+                    + "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,"
+                    + "\"total_tokens\":12},\"model\":\"qwen2.5:3b\"}")
+                    .getBytes(StandardCharsets.UTF_8);
+            if (!requestBody.contains("qwen2.5:3b")) {
+                body = "{\"error\":{\"message\":\"model mismatch\"}}"
+                        .getBytes(StandardCharsets.UTF_8);
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                exchange.sendResponseHeaders(400, body.length);
+                try (var out = exchange.getResponseBody()) {
+                    out.write(body);
+                }
+                return;
+            }
+            exchange.getResponseHeaders().set("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, body.length);
+            try (var out = exchange.getResponseBody()) {
+                out.write(body);
+            }
+        });
+        plainLoopbackServer.start();
+        lastPlainPort = new int[]{plainLoopbackServer.getAddress().getPort()};
+        return lastPlainPort;
+    }
+
+    private static void stopPlainEphemeralServer() {
+        if (plainLoopbackServer != null) {
+            plainLoopbackServer.stop(0);
+            plainLoopbackServer = null;
         }
     }
 }
