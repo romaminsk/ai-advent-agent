@@ -2104,7 +2104,7 @@ public final class Main {
      * задача. В режиме измерений метка занята и не перезаписывается.
      */
     private static void updatePromptLabels(TerminalUi ui, LlmAgent agent, DemoRef demoRef) {
-        if (demoRef.demo != null) {
+        if (demoRef != null && demoRef.demo != null) {
             return;
         }
         // Переключённый (/model) профиль — краткая пометка модели в приглашении:
@@ -3367,7 +3367,7 @@ public final class Main {
                 } else if (normalized.equals("/mode") || normalized.startsWith("/mode ")) {
                     handleModeCommand(ui, agent, normalized);
                 } else if (normalized.equals("/model") || normalized.startsWith("/model ")) {
-                    handleModelCommand(ui, agent, command, demoRef);
+                    handleModelCommand(ui, agent, command, demoRef, ModelProfiles.ollama());
                 } else if (normalized.equals("/limit") || normalized.startsWith("/limit ")) {
                     handleLimitCommand(ui, agent, normalized);
                 } else {
@@ -4818,10 +4818,14 @@ public final class Main {
      * таймаутом, при недоступности переключение не выполняется.
      * Выбранный профиль сохраняется в ModelProfileStore и переживает
      * перезапуск; ключи не показываются.
+     *
+     * ollamaProfile — инъекция для stub-тестов (закрытый порт / живой локальный
+     * сервер); боевой маршрут передаёт ModelProfiles.ollama() из окружения.
+     * demoRef допустим null: тесты вызывают обработчик вне runLoop.
      */
-    private static void handleModelCommand(TerminalUi ui, LlmAgent agent, String raw,
-                                           DemoRef demoRef) {
-        if (demoRef.demo != null) {
+    static void handleModelCommand(TerminalUi ui, LlmAgent agent, String raw,
+                                   DemoRef demoRef, ModelProfiles.Profile ollamaProfile) {
+        if (demoRef != null && demoRef.demo != null) {
             ui.showSystem("В режиме измерения токенов переключение провайдера отключено. "
                     + "Завершите режим (/demo stop) и повторите.");
             return;
@@ -4852,14 +4856,14 @@ public final class Main {
             return;
         }
         ModelProfiles.Profile profile;
-        try {
-            profile = ModelProfiles.resolve(profileName, agent.cloudProfile());
-        } catch (AgentException e) {
-            ui.showError(e.getMessage());
-            return;
+        if (ModelProfiles.CLOUD.equals(profileName)) {
+            profile = agent.cloudProfile();
+        } else {
+            profile = ollamaProfile;
         }
-        if (ModelProfiles.OLLAMA.equals(profile.name()) && !ModelProfiles.reachable(profile)) {
-            ui.showSystem("Ollama недоступна: " + ModelProfiles.origin(profile)
+        if (ModelProfiles.OLLAMA.equals(profile.name())
+                && !ModelProfiles.reachable(ollamaProfile)) {
+            ui.showSystem("Ollama недоступна: " + ModelProfiles.origin(ollamaProfile)
                     + " не отвечает (проверка /api/tags).\nЗапустите локальный "
                     + "сервер: ollama serve (или приложение Ollama). Активный профиль "
                     + "не изменён: " + agent.currentProfileName() + ".");
@@ -4880,6 +4884,10 @@ public final class Main {
         if (ModelProfiles.OLLAMA.equals(profile.name())) {
             confirmed.append("\nПримечание: RAG-ответы с цитатами на локальной 3B-модели ")
                     .append("менее надёжны.");
+            String longHistory = modelOllamaLongHistoryHint(agent);
+            if (longHistory != null) {
+                confirmed.append("\n").append(longHistory);
+            }
         }
         try {
             ModelProfileStore.defaultStore().save(profile.name());
@@ -4891,12 +4899,25 @@ public final class Main {
     }
 
     /**
+     * Подсказка при переключении на ollama: длинная история ослабляет ответы
+     * маленькой модели; /clear очищает историю (автоматической очистки нет).
+     * null — история короткая, подсказка не нужна.
+     */
+    static String modelOllamaLongHistoryHint(LlmAgent agent) {
+        int exchanges = agent.getHistory().size() / 2;
+        return exchanges > 6
+                ? "Длинная история ухудшает ответы 3B-модели; /clear очищает историю."
+                : null;
+    }
+
+    /**
      * Восстанавливает сохранённый профиль /model при старте (без UI).
      * ollama недоступна — профиль не применяется, действует cloud, файл
      * не изменяется (повторная попытка при следующем явном переключении).
      * Ошибка чтения файла — cloud молча (одну строку в stderr).
      */
-    private static void applySavedModelProfile(LlmAgent agent) {
+     static void applySavedModelProfile(LlmAgent agent,
+                                        ModelProfiles.Profile ollamaProfile) {
         String saved;
         try {
             saved = ModelProfileStore.defaultStore().load();
@@ -4910,12 +4931,22 @@ public final class Main {
             return;
         }
         try {
-            ModelProfiles.Profile profile = ModelProfiles.resolve(saved.trim(),
-                    agent.cloudProfile());
+            // Инъекция профиля ollama (stub-тесты): сохранённое имя может быть
+            // «ollama» с env-переопределениями, а не дефолтным профилем resolve.
+            ModelProfiles.Profile profile =
+                    ModelProfiles.OLLAMA.equalsIgnoreCase(saved.trim())
+                            ? ollamaProfile : agent.cloudProfile();
             if (ModelProfiles.OLLAMA.equals(profile.name())
                     && !ModelProfiles.reachable(profile)) {
-                System.err.println("Сохранённый профиль /model ollama не применён: "
-                        + "Ollama недоступна. Действует cloud. Запустите: ollama serve");
+                // Откат файла на cloud: недоступная ollama не должна каждый
+                // запуск откатывать сессию молча; вернуть ollama — /model ollama.
+                try {
+                    ModelProfileStore.defaultStore().save(ModelProfiles.CLOUD);
+                } catch (IOException e) {
+                    System.err.println("Файл профиля /model не откатан на cloud: "
+                            + e.getMessage());
+                }
+                System.err.println("Ollama недоступна, использую cloud.");
                 return;
             }
             agent.switchToProfile(profile);
@@ -4925,6 +4956,11 @@ public final class Main {
             System.err.println("Сохранённый профиль /model " + saved
                     + " не применён: " + e.getMessage() + ". Действует cloud.");
         }
+    }
+
+    /** Дефолтный маршрут: ollama-профиль из текущего окружения. Seама для stub-тестов. */
+    private static void applySavedModelProfile(LlmAgent agent) {
+        applySavedModelProfile(agent, ModelProfiles.ollama());
     }
 
     /** Справка по запуску приложения; не требует API-ключа и не обращается к API. */
