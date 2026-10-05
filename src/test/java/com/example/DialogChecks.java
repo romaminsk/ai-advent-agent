@@ -63,6 +63,105 @@ final class DialogChecks extends SelfTestSupport {
         checkErrorClassification();
         checkLocalOllamaConfig();
         checkModelProfileSwitch();
+        checkModelProfileStartupRollback();
+        checkModelCommandHistoryHints();
+    }
+
+     static void checkModelProfileStartupRollback() throws IOException {
+        // Изоляция: свойство указывает на файл во временном каталоге suite.
+        Path directory = Files.createTempDirectory(baseTempDir, "model-rollback-");
+        Path file = directory.resolve("model-profile.json");
+        System.setProperty("ai-agent.model-profile-file", file.toString());
+        try {
+            new ModelProfileStore(file).save("ollama");
+            Config cloudConfig = new Config("test-key",
+                    "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash");
+            LlmAgent agent = newAgentWithTempStore(cloudConfig);
+            // Закрытый порт: ollama недоступна → откат в cloud.
+            ModelProfiles.Profile closedOllama = new ModelProfiles.Profile("ollama",
+                    "http://127.0.0.1:1/v1/chat/completions", "qwen2.5:3b", "ollama", 300);
+            Main.applySavedModelProfile(agent, closedOllama);
+            expect("после старта с недоступной ollama файл профиля откатан на cloud",
+                    ModelProfiles.CLOUD.equals(new ModelProfileStore(file).load()));
+            expect("после отката сессия действует cloud без смены модели",
+                    ModelProfiles.CLOUD.equals(agent.currentProfileName())
+                            && "glm-5.3-flash".equals(agent.modelName())
+                            && agent.currentSettings().requestTimeoutSeconds() == 180);
+        } finally {
+            System.clearProperty("ai-agent.model-profile-file");
+        }
+    }
+
+     static void checkModelCommandHistoryHints() throws Exception {
+        // Порог подсказки: 6 обменов — нет строки, 7 — есть.
+        Config cloudConfig = new Config("secret-stub-key",
+                "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash");
+        LlmAgent agent = newAgentWithTempStore(cloudConfig);
+        for (int i = 0; i < 6; i++) {
+            agent.recordLocalAnswer("вопрос " + i, "ответ " + i);
+        }
+        expect("6 обменов в истории — подсказки длинной истории нет",
+                Main.modelOllamaLongHistoryHint(agent) == null);
+        agent.recordLocalAnswer("вопрос 6", "ответ 6");
+        String hint = Main.modelOllamaLongHistoryHint(agent);
+        expect("7 обменов — подсказка про длинную историю и /clear",
+                hint != null && hint.contains("Длинная история")
+                        && hint.contains("/clear"));
+
+        // Переключение на ollama через обработчик с живым stub /api/tags:
+        // примечание RAG + подсказка по порогу; ключ не печатается; файл сохранён.
+        Path directory = Files.createTempDirectory(baseTempDir, "model-hint-");
+        Path file = directory.resolve("model-profile.json");
+        System.setProperty("ai-agent.model-profile-file", file.toString());
+        try {
+            int[] portHolder = startPlainEphemeralServer();
+            try {
+                ModelProfiles.Profile liveOllama = new ModelProfiles.Profile("ollama",
+                        "http://127.0.0.1:" + portHolder[0] + "/v1/chat/completions",
+                        "qwen2.5:3b", "stub-key-secret", 300);
+                FakeUi ui = new FakeUi();
+                Main.handleModelCommand(ui, agent, "/model ollama", null, liveOllama);
+                String joined = String.join("\n", ui.systems) + "\n"
+                        + String.join("\n", ui.errors);
+                expect("/model ollama на живом stub переключает профиль",
+                        joined.contains("✓ Профиль: ollama")
+                                && "ollama".equals(agent.currentProfileName())
+                                && "qwen2.5:3b".equals(agent.modelName())
+                                && agent.currentSettings().requestTimeoutSeconds() == 300);
+                expect("подсказка ключей истории: RAG-примечание и /clear присутствуют",
+                        joined.contains("менее надёжны")
+                                && joined.contains("Длинная история"));
+                expect("вывод переключения не содержит ключ профиля",
+                        !joined.contains("stub-key-secret"));
+                expect("профиль сохранён в изолированный файл",
+                        "ollama".equals(new ModelProfileStore(file).load()));
+            } finally {
+                stopPlainEphemeralServer();
+            }
+
+            // Короткая история: примечание есть, строки про длинную историю нет.
+            int[] secondPort = startPlainEphemeralServer();
+            try {
+                Config shortCloud = new Config("test-key",
+                        "https://127.0.0.1:1/v1/chat/completions", "glm-5.3-flash");
+                LlmAgent shortAgent = newAgentWithTempStore(shortCloud);
+                ModelProfiles.Profile liveOllama = new ModelProfiles.Profile("ollama",
+                        "http://127.0.0.1:" + secondPort[0] + "/v1/chat/completions",
+                        "qwen2.5:3b", "ollama", 300);
+                FakeUi stillUi = new FakeUi();
+                Main.handleModelCommand(stillUi, shortAgent, "/model ollama", null,
+                        liveOllama);
+                String stillJoined = String.join("\n", stillUi.systems) + "\n"
+                        + String.join("\n", stillUi.errors);
+                expect("короткая история: без строки про длинную историю",
+                        stillJoined.contains("менее надёжны")
+                                && !stillJoined.contains("Длинная история"));
+            } finally {
+                stopPlainEphemeralServer();
+            }
+        } finally {
+            System.clearProperty("ai-agent.model-profile-file");
+        }
     }
 
      static void checkConfigErrors() {
@@ -677,6 +776,16 @@ final class DialogChecks extends SelfTestSupport {
     private static int[] startPlainEphemeralServer() throws Exception {
         plainLoopbackServer = com.sun.net.httpserver.HttpServer.create(
                 new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+        // Эмуляция проверки доступности Ollama: /api/tags отвечает списком моделей.
+        plainLoopbackServer.createContext("/api/tags", exchange -> {
+            byte[] body = "{\"models\":[{\"name\":\"qwen2.5:3b\"}]}"
+                    .getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, body.length);
+            try (var out = exchange.getResponseBody()) {
+                out.write(body);
+            }
+        });
         plainLoopbackServer.createContext("/v1/chat/completions", exchange -> {
             String requestBody =
                     new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);

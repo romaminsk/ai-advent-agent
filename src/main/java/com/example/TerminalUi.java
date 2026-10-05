@@ -193,7 +193,7 @@ public interface TerminalUi extends AutoCloseable {
                         "жёсткие ограничения, которые агент не нарушает"),
                 new Row("Контекст", "/context /summary /strategy /facts /branch",
                         "что уходит в запрос к модели"),
-                new Row("Диалог", "/clear /reset", "удалить текущую историю"),
+                new Row("Диалог", "/clear /reset", "удалить историю (при каждом запуске подгружается последняя: «Восстановлено: N обменов»)"),
                 new Row("Режимы", "/mode /model /multiline /paste /demo",
                         "формат ответа, провайдер, длинный ввод, измерения"),
                 new Row("Статистика", "/tokens /stats /limit /status",
