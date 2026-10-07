@@ -1183,8 +1183,14 @@ public final class LlmAgent {
                                                             int maxOutputTokens) throws Exception {
         ParsedAnswer parsed = statelessCall(systemPrompt, userMessage,
                 effectiveRagOutputTokens(maxOutputTokens));
+        if (parsed.content() == null) {
+            // Контракт как у askWithoutHistory: пустой ответ — исключение,
+            // RagService повторяет его один раз (EMPTY_RESPONSE_RETRIES).
+            throw emptyAnswerError(parsed.finishReason(),
+                    effectiveRagOutputTokens(maxOutputTokens));
+        }
         return new RagService.Completion(
-                parsed.content() == null ? "" : AnsiSanitizer.sanitize(parsed.content()),
+                AnsiSanitizer.sanitize(parsed.content()),
                 parsed.usage() != null ? parsed.usage().promptTokens() : null,
                 parsed.usage() != null ? parsed.usage().completionTokens() : null,
                 parsed.finishReason());

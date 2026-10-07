@@ -4762,24 +4762,43 @@ public final class Main {
          */
         private static String askRagWithProfile(LlmAgent agent, String system, String user,
                                                 int maxOutputTokens) throws Exception {
+            return askRagWithProfileUsage(agent, system, user, maxOutputTokens).text();
+        }
+
+        /** Usage-вариант: фактические токены для обоих профилей. */
+        private static com.example.rag.RagService.Completion askRagWithProfileUsage(
+                LlmAgent agent, String system, String user, int maxOutputTokens) throws Exception {
             recordRagRoute(agent);
-            if (!ModelProfiles.OLLAMA.equals(agent.currentProfileName())) {
-                return agent.askWithoutHistory(system, user, maxOutputTokens);
-            }
             com.example.rag.RagService.Completion completion =
                     agent.statelessRagCall(system, user, maxOutputTokens);
+            if (!ModelProfiles.OLLAMA.equals(agent.currentProfileName())) {
+                return completion;
+            }
             Integer numCtx = com.example.rag.OllamaContextProbe.contextLength(
                     agent.modelName(), agent.providerApiUrl());
             String warning = com.example.rag.RagContextGuard.warning(completion.promptTokens(),
                     ModelProfiles.localRagMaxOutputTokens(), numCtx);
-            return warning == null ? completion.text()
-                    : completion.text() + "\n" + warning;
+            return warning == null ? completion
+                    : new com.example.rag.RagService.Completion(
+                    completion.text() + "\n" + warning, completion.promptTokens(),
+                    completion.completionTokens(), completion.finishReason());
         }
 
         /** LlmClient агента с профильной обработкой (RagRef.service и бенч). */
         private static com.example.rag.RagService.LlmClient ragLlmClient(LlmAgent agent) {
-            return (system, user, maxOutputTokens) ->
-                    askRagWithProfile(agent, system, user, maxOutputTokens);
+            return new com.example.rag.RagService.LlmClient() {
+                @Override
+                public String complete(String system, String user, int maxOutputTokens)
+                        throws Exception {
+                    return askRagWithProfile(agent, system, user, maxOutputTokens);
+                }
+
+                @Override
+                public com.example.rag.RagService.Completion completeWithUsage(
+                        String system, String user, int maxOutputTokens) throws Exception {
+                    return askRagWithProfileUsage(agent, system, user, maxOutputTokens);
+                }
+            };
         }
 
         /** Учёт хоста контекстного вызова: профиль → host:port ×N. */
@@ -4864,11 +4883,6 @@ public final class Main {
                     routeSummary.append("[бенч] маршрут RAG: ").append(entry.getKey())
                             .append(" ×").append(entry.getValue()).append('\n');
                 }
-                String coldNote = "холодный старт ollama («Прогрев», не в метриках): "
-                        + (coldStartMs < 0 ? "пропущен" : coldStartMs + " мс; тег модели: " + modelTag)
-                        + ".\n" + routeSummary;
-                List<String> notes = new ArrayList<>(result.notes());
-                notes.add(coldNote.replace('\n', ' '));
                 return result.markdown() + "\nМаршруты (учёт хостов RAG-прогона):\n"
                         + (routeSummary.length() == 0 ? "- нет" : routeSummary.toString());
             } finally {

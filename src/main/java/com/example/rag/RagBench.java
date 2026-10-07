@@ -350,7 +350,7 @@ public final class RagBench {
                 notes, durationMs, null);
     }
 
-    /** Все повторы одного вопроса/профиля; force=true вызывает complete с порогом. */
+    /** Все повторы одного вопроса/профиля; force=true вызывает complete без порога. */
     private static void attemptQuestion(List<Attempt> attempts, Question question,
                                         String profile, RagService service, int repeats,
                                         boolean force, RagService.Prepared prepared,
