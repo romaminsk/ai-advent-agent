@@ -1,5 +1,7 @@
 package com.example;
 
+import com.example.JsonSupport;
+import com.fasterxml.jackson.databind.JsonNode;
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -22,6 +24,8 @@ import java.util.Objects;
  *   qwen2.5:3b, ключ-заглушка "ollama", таймаут 300 с; значения
  *   переопределяются необязательными переменными окружения
  *   OLLAMA_API_URL, OLLAMA_MODEL, OLLAMA_REQUEST_TIMEOUT_SECONDS.
+ *   Профиль жёстко ограничен loopback-адресами: даже https на внешний
+ *   узел отклоняется — RAG-путь в этом режиме не должен выходить в сеть.
  *
  * Правило транспорта проверяет Config (https для внешних адресов, открытый
  * HTTP только для loopback), поэтому профиль с http://example.com создастся
@@ -55,6 +59,37 @@ public final class ModelProfiles {
     /** Короткий таймаут проверки доступности локальной Ollama. */
     static final Duration OLLAMA_CHECK_TIMEOUT = Duration.ofSeconds(2);
 
+    /**
+     * Дефолтный лимит выхода RAG-ответа для локального 3B-профиля: вместе
+     * с num_ctx 8192 гарантирует запас на контекст. Настраивается
+     * OLLAMA_RAG_MAX_OUTPUT_TOKENS; профиль cloud использует
+     * RagConstants.RAG_MAX_OUTPUT_TOKENS без изменений.
+     */
+    public static final int LOCAL_PROFILE_RAG_MAX_OUTPUT_TOKENS = 1024;
+    public static final String LOCAL_RAG_MAX_OUTPUT_TOKENS_ENV = "OLLAMA_RAG_MAX_OUTPUT_TOKENS";
+
+    /** Лимит выхода RAG-ответа для ollama-профиля по окружению. */
+    public static int localRagMaxOutputTokens(Map<String, String> env) {
+        String raw = env.get(LOCAL_RAG_MAX_OUTPUT_TOKENS_ENV);
+        if (raw == null || raw.isBlank()) return LOCAL_PROFILE_RAG_MAX_OUTPUT_TOKENS;
+        try {
+            int value = Integer.parseInt(raw.trim());
+            if (value < 1) {
+                throw new AgentException(LOCAL_RAG_MAX_OUTPUT_TOKENS_ENV
+                        + " должна быть положительным числом, получено: " + value);
+            }
+            return value;
+        } catch (NumberFormatException e) {
+            throw new AgentException(LOCAL_RAG_MAX_OUTPUT_TOKENS_ENV
+                    + " должна быть целым числом, получено: " + raw.trim(), e);
+        }
+    }
+
+    /** Лимит выхода RAG-ответа для ollama-профиля по текущему окружению. */
+    public static int localRagMaxOutputTokens() {
+        return localRagMaxOutputTokens(System.getenv());
+    }
+
     private ModelProfiles() {
     }
 
@@ -71,6 +106,74 @@ public final class ModelProfiles {
 
     /** Профиль ollama по переданному окружению (для тестов). */
     public static Profile ollama(Map<String, String> env) {
+        Profile profile = buildOllamaProfile(env);
+        // Локальный профиль не должен отправлять RAG-запросы на внешние узлы:
+        // https-адрес Config бы пропустил, поэтому здесь проверка строже.
+        Config.requireLoopbackUrl(profile.apiUrl(), "OLLAMA_API_URL");
+        return profile;
+    }
+
+    /** Имя модели тега реально есть в /api/tags локального сервера. */
+    public static boolean modelExists(Profile profile) {
+        return modelExists(profile, OLLAMA_CHECK_TIMEOUT);
+    }
+
+    /** Вариант проверки с настраиваемым таймаутом (для тестов). */
+    static boolean modelExists(Profile profile, Duration timeout) {
+        String body = tagsBody(profile, timeout);
+        if (body == null) return false;
+        try {
+            JsonNode models = JsonSupport.MAPPER.readTree(body).path("models");
+            if (!models.isArray()) return false;
+            String target = profile.model();
+            for (JsonNode item : models) {
+                String name = item.path("name").asText("");
+                if (name.equals(target)) return true;
+            }
+            return false;
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    /** Тело /api/tags или null (сеть/таймаут/не-2xx). */
+    private static String tagsBody(Profile profile, Duration timeout) {
+        URI uri;
+        try {
+            uri = URI.create(profile.apiUrl());
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+        String scheme = uri.getScheme() == null ? "" : uri.getScheme();
+        String host = uri.getHost();
+        int port = uri.getPort();
+        if (host == null || scheme.isEmpty()) {
+            return null;
+        }
+        URI tags = URI.create(scheme + "://" + host
+                + (port > 0 ? ":" + port : "") + "/api/tags");
+        HttpClient client = HttpClient.newBuilder()
+                .connectTimeout(timeout)
+                .build();
+        try {
+            HttpResponse<String> response = client.send(HttpRequest.newBuilder(tags)
+                            .timeout(timeout)
+                            .GET()
+                            .build(),
+                    HttpResponse.BodyHandlers.ofString());
+            return response.statusCode() >= 200 && response.statusCode() < 300
+                    ? response.body() : null;
+        } catch (HttpTimeoutException e) {
+            return null;
+        } catch (IOException e) {
+            return null;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
+        }
+    }
+
+    private static Profile buildOllamaProfile(Map<String, String> env) {
         String url = firstNonBlank(env.get("OLLAMA_API_URL"), OLLAMA_DEFAULT_URL);
         String model = firstNonBlank(env.get("OLLAMA_MODEL"), OLLAMA_DEFAULT_MODEL);
         String key = firstNonBlank(env.get("OLLAMA_API_KEY"), OLLAMA_DEFAULT_KEY);
@@ -128,44 +231,14 @@ public final class ModelProfiles {
      * массивом models — как у Ollama).
      */
     public static boolean reachable(Profile profile) {
-        return reachable(profile, OLLAMA_CHECK_TIMEOUT);
+        String body = tagsBody(profile, OLLAMA_CHECK_TIMEOUT);
+        return body != null && body.contains("models");
     }
 
     /** Вариант проверки с настраиваемым таймаутом (для тестов). */
     static boolean reachable(Profile profile, Duration timeout) {
-        URI uri;
-        try {
-            uri = URI.create(profile.apiUrl());
-        } catch (IllegalArgumentException e) {
-            return false;
-        }
-        String scheme = uri.getScheme() == null ? "" : uri.getScheme();
-        String host = uri.getHost();
-        int port = uri.getPort();
-        if (host == null || scheme.isEmpty()) {
-            return false;
-        }
-        URI tags = URI.create(scheme + "://" + host
-                + (port > 0 ? ":" + port : "") + "/api/tags");
-        HttpClient client = HttpClient.newBuilder()
-                .connectTimeout(timeout)
-                .build();
-        try {
-            HttpResponse<String> response = client.send(HttpRequest.newBuilder(tags)
-                            .timeout(timeout)
-                            .GET()
-                            .build(),
-                    HttpResponse.BodyHandlers.ofString());
-            return response.statusCode() >= 200 && response.statusCode() < 300
-                    && response.body().contains("models");
-        } catch (HttpTimeoutException e) {
-            return false;
-        } catch (IOException e) {
-            return false;
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return false;
-        }
+        String body = tagsBody(profile, timeout);
+        return body != null && body.contains("models");
     }
 
     private static String firstNonBlank(String value, String fallback) {

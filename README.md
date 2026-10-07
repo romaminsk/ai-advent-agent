@@ -69,6 +69,51 @@ export LLM_API_KEY="<ваш ключ из .env>"
 # по желанию убрать LLM_REQUEST_TIMEOUT_SECONDS
 ```
 
+## Полностью локальный RAG (ollama + bge-m3)
+
+RAG-режим работает целиком на локальном Ollama: retrieval-эмбеддинги —
+`bge-m3` через `EMBEDDING_BASE_URL`/`EMBEDDING_MODEL` (по умолчанию уже
+`http://localhost:11434/v1` + `bge-m3`), генерация — профиль `ollama`
+(qwen2.5:3b). При профиле `ollama` все сетевые вызовы RAG-пути
+ограничены loopback (localhost/127.0.0.1/::1): профиль с внешним адресом
+отклоняется, не-loopback `EMBEDDING_BASE_URL` даёт явную ошибку.
+
+Контекст локальной модели. Дефолтный num_ctx у Ollama — 4096; при этом
+Ollama молча усекает промпт (записывается только фактический
+prompt_tokens после усечения). Для RAG-промпта (контекст до 6000 символов
++ ответ) создан тег с num_ctx 8192:
+
+```bash
+./scripts/ollama_rag_model.sh          # создаёт qwen2.5:3b-rag8k (Modelfile: PARAMETER num_ctx 8192)
+# затем в .env проекта: export OLLAMA_MODEL="qwen2.5:3b-rag8k"
+```
+
+Системные настройки Ollama (OLLAMA_CONTEXT_LENGTH, env сервиса) не
+требуются и не меняются. Если тег из `OLLAMA_MODEL` отсутствует в
+`/api/tags`, `/model ollama` выводит явное предупреждение. Ограничение
+выхода RAG-ответа на локальном профиле — 1024 токена
+(`OLLAMA_RAG_MAX_OUTPUT_TOKENS` переопределяет); у cloud лимит прежний
+(4096). Приближение промпта к контексту (prompt_tokens ≥ 90% num_ctx или
+prompt_tokens + max_tokens > num_ctx) выводит явное предупреждение
+(`RagContextGuard`), фактический num_ctx берётся из loopback
+`/api/ps`/`/api/show`.
+
+Включение: `/rag on` (режим обычного диалога) или `/rag ask <вопрос>`;
+профиль — `/model ollama`.
+
+Бенчмарк локального против облачного:
+
+```
+/rag-bench --quick                                  # 5 вопросов, 1 повтор
+/rag-bench docs/rag-bench-questions.json 3          # полный прогон, 3 повтора
+```
+
+Retrieval выполняется один раз на вопрос (bge-m3, без rewrite) и оба
+профиля получают одинаковые чанки; метрики — факты (any-of группы),
+цитаты, «не знаю» (порог против ответа модели), медиана/p95 времени и
+стабильность исходов. Отчёт: `~/.ai-advent-agent/rag-results/rag-bench-<дата>.md`;
+сводный документ с выводами ведётся отдельно в `docs/rag-local-vs-cloud.md`.
+
 ## Возможности
 
 | Функция | Что делает |

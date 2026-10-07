@@ -1,0 +1,8 @@
+# Modelfile тега для полностью локального RAG: qwen2.5:3b с num_ctx 8192.
+# Дефолтный контекст ollama-сервера 4096 не вмещает RAG-промпт
+# (контекст + вопрос) вместе с ответом; жёстко менять системные
+# настройки (OLLAMA_CONTEXT_LENGTH) не нужно — достаточно тега.
+#
+# Создание: ./scripts/ollama_rag_model.sh
+FROM qwen2.5:3b
+PARAMETER num_ctx 8192

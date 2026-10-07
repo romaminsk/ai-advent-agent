@@ -25,6 +25,23 @@ public final class RagService {
     @FunctionalInterface
     public interface LlmClient {
         String complete(String system, String user, int maxOutputTokens) throws Exception;
+
+        /**
+         * Вариант с фактическим usage ответа (RAG-путь и бенчмарк): текст
+         * плюс фактические prompt/completion tokens и finish_reason;
+         * null — данных нет. Дефолт оборачивает complete(...) с usage == null,
+         * поэтому существующие String-returning клиенты не меняются.
+         */
+        default Completion completeWithUsage(String system, String user,
+                                             int maxOutputTokens) throws Exception {
+            return new Completion(complete(system, user, maxOutputTokens),
+                    null, null, null);
+        }
+    }
+
+    /** Ответ LLM с фактическим usage; null-поля — «нет данных», не ноль. */
+    public record Completion(String text, Integer promptTokens, Integer completionTokens,
+                             String finishReason) {
     }
 
     public record Prepared(String question, RagPromptBuilder.Prompt prompt,
@@ -87,6 +104,12 @@ public final class RagService {
     private final RagQueryRewriter rewriter;
     private final RagSettings settings;
     private final long llmCallTimeoutSeconds;
+    private volatile Completion lastCompletion = new Completion("", null, null, null);
+
+    /** Usage последнего завершённого LLM-вызова (для бенчмарка и guard). */
+    public Completion lastCompletion() {
+        return lastCompletion;
+    }
 
     public RagService(RagRetriever retriever, RagPromptBuilder promptBuilder,
                       String offSystemPrompt, LlmClient llm) {
@@ -111,6 +134,11 @@ public final class RagService {
         this.rewriter = rewriter;
         if (llmCallTimeoutSeconds < 1) throw new IllegalArgumentException("timeout должен быть > 0");
         this.llmCallTimeoutSeconds = llmCallTimeoutSeconds;
+    }
+
+    /** Настройки RAG, с которыми построен сервис (для prepareChat вызывающего кода). */
+    public RagSettings settings() {
+        return settings;
     }
 
     public Prepared prepare(String question) throws Exception {
@@ -350,10 +378,12 @@ public final class RagService {
     }
 
     private String completeOneCall(String system, String user) throws Exception {
-        Future<String> future = LLM_EXECUTOR.submit(() ->
-                llm.complete(system, user, RagConstants.RAG_MAX_OUTPUT_TOKENS));
+        Future<Completion> future = LLM_EXECUTOR.submit(() ->
+                llm.completeWithUsage(system, user, RagConstants.RAG_MAX_OUTPUT_TOKENS));
         try {
-            return future.get(llmCallTimeoutSeconds, TimeUnit.SECONDS);
+            Completion completion = future.get(llmCallTimeoutSeconds, TimeUnit.SECONDS);
+            lastCompletion = completion;
+            return completion.text();
         } catch (TimeoutException timeout) {
             future.cancel(true);
             throw new LlmCallTimeoutException("Таймаут LLM-вызова ("

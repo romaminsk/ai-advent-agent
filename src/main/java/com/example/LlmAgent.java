@@ -1,5 +1,6 @@
 package com.example;
 
+import com.example.rag.RagService;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -900,7 +901,8 @@ public final class LlmAgent {
         for (int attempt = 0; ; attempt++) {
             try {
                 return askInternal(userMessage, systemInstruction, outboundUserMessage,
-                        com.example.rag.RagConstants.RAG_MAX_OUTPUT_TOKENS);
+                        effectiveRagOutputTokens(
+                                com.example.rag.RagConstants.RAG_MAX_OUTPUT_TOKENS));
             } catch (EmptyLlmAnswerException empty) {
                 if (attempt >= com.example.rag.RagConstants.EMPTY_RESPONSE_RETRIES) {
                     throw empty;
@@ -1167,7 +1169,39 @@ public final class LlmAgent {
 
     /** RAG/stateless call with an explicit output ceiling and current sampling parameters. */
     public String askWithoutHistory(String systemPrompt, String userMessage, int maxOutputTokens) {
-        return askWithoutHistory(systemPrompt, userMessage, maxOutputTokens, true);
+        return askWithoutHistory(systemPrompt, userMessage,
+                effectiveRagOutputTokens(maxOutputTokens), true);
+    }
+
+    /**
+     * Stateless RAG-вызов с фактическим usage: текст и prompt/completion
+     * tokens из ответа (null — провайдер не вернул). Лимит выхода — как
+     * у askWithoutHistory, с профильным сокращением для ollama. Расход
+     * учитывается в sessionStats так же, как в обычном запросе.
+     */
+    public RagService.Completion statelessRagCall(String systemPrompt, String userMessage,
+                                                            int maxOutputTokens) throws Exception {
+        ParsedAnswer parsed = statelessCall(systemPrompt, userMessage,
+                effectiveRagOutputTokens(maxOutputTokens));
+        if (parsed.content() == null) {
+            // Контракт как у askWithoutHistory: пустой ответ — исключение,
+            // RagService повторяет его один раз (EMPTY_RESPONSE_RETRIES).
+            throw emptyAnswerError(parsed.finishReason(),
+                    effectiveRagOutputTokens(maxOutputTokens));
+        }
+        return new RagService.Completion(
+                AnsiSanitizer.sanitize(parsed.content()),
+                parsed.usage() != null ? parsed.usage().promptTokens() : null,
+                parsed.usage() != null ? parsed.usage().completionTokens() : null,
+                parsed.finishReason());
+    }
+
+    /** Сокращает лимит выхода RAG-ответа на локальном 3B-профиле. */
+    private int effectiveRagOutputTokens(int requested) {
+        if (!ModelProfiles.OLLAMA.equals(profileName)) {
+            return requested;
+        }
+        return Math.min(requested, ModelProfiles.localRagMaxOutputTokens());
     }
 
     /** Makes a stateless call while retaining only safe-to-inspect response diagnostics. */
@@ -1194,19 +1228,31 @@ public final class LlmAgent {
 
     private String askWithoutHistory(String systemPrompt, String userMessage,
                                      int maxOutputTokens, boolean applyTemperature) {
+        ParsedAnswer parsed = statelessCall(systemPrompt, userMessage,
+                maxOutputTokens, applyTemperature);
+        if (parsed.content() == null) {
+            throw emptyAnswerError(parsed.finishReason(), maxOutputTokens);
+        }
+        return AnsiSanitizer.sanitize(parsed.content());
+    }
+
+    /** Общий stateless-путь: без истории, расход по Purpose.REGULAR. */
+    private ParsedAnswer statelessCall(String systemPrompt, String userMessage,
+                                       int maxOutputTokens) throws Exception {
+        return statelessCall(systemPrompt, userMessage, maxOutputTokens, true);
+    }
+
+    private ParsedAnswer statelessCall(String systemPrompt, String userMessage,
+                                       int maxOutputTokens, boolean applyTemperature) {
         if (systemPrompt == null || systemPrompt.isBlank() || userMessage == null || userMessage.isBlank()) {
             throw new AgentException("Пустой запрос оркестрации.");
         }
         if (maxOutputTokens < 1) {
             throw new IllegalArgumentException("maxOutputTokens должен быть положительным");
         }
-        ParsedAnswer parsed = executeCall(List.of(new ChatMessage("system", systemPrompt),
+        return executeCall(List.of(new ChatMessage("system", systemPrompt),
                 new ChatMessage("user", userMessage)), maxOutputTokens,
                 UUID.randomUUID().toString(), applyTemperature, SessionTokenStats.Purpose.REGULAR);
-        if (parsed.content() == null) {
-            throw emptyAnswerError(parsed.finishReason(), maxOutputTokens);
-        }
-        return AnsiSanitizer.sanitize(parsed.content());
     }
 
     /** Прогноз контекстного бюджета: оценка входа плюс резерв выхода (max_tokens). */

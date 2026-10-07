@@ -1,5 +1,7 @@
 package com.example;
 
+import com.example.rag.CitationValidator;
+import com.example.rag.RagService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -65,6 +67,126 @@ final class DialogChecks extends SelfTestSupport {
         checkModelProfileSwitch();
         checkModelProfileStartupRollback();
         checkModelCommandHistoryHints();
+        checkRagContextGuardLogic();
+        checkRagBenchPureLogic();
+        checkOllamaProfileLoopbackGuard();
+        checkOllamaContextProbeParsing();
+    }
+
+    /** RagContextGuard: пороги чисто, без сети. */
+    private static void checkRagContextGuardLogic() {
+        Integer numCtx = 8192;
+        String proximity = com.example.rag.RagContextGuard.warning(
+                7373, 818, numCtx);
+        expect("guard: prompt_tokens на границе 90% num_ctx даёт предупреждение",
+                proximity != null && proximity.contains("90%") && proximity.contains("8192"));
+        String overflow = com.example.rag.RagContextGuard.warning(
+                1254, 1024, 2048);
+        expect("guard: prompt_tokens + max_tokens > num_ctx даёт предупреждение",
+                overflow != null && overflow.contains("превышает")
+                        && overflow.contains("num_ctx=2048"));
+        String quiet = com.example.rag.RagContextGuard.warning(
+                300, 1024, numCtx);
+        expect("guard: маленький промпт — предупреждения нет", quiet == null);
+        String unknown = com.example.rag.RagContextGuard.warning(
+                1500, 1024, null);
+        expect("guard: неизвестный num_ctx явно предупреждает, не молчит",
+                unknown != null && unknown.contains("не определён"));
+        String nullTokens = com.example.rag.RagContextGuard.warning(
+                null, 1024, numCtx);
+        expect("guard: нет данных usage — предупреждения нет", nullTokens == null);
+    }
+
+    /** RagBench: any-of факты, цитаты, медиана/p95, стабильность. */
+    private static void checkRagBenchPureLogic() {
+        List<List<String>> groups = List.of(
+                List.of("800", "восемьсот"),
+                List.of("перекрытие", "overlay"));
+        expect("RagBench.anyOfHit находит любой вариант группы без учёта регистра",
+                com.example.rag.RagBench.anyOfHit("Окно ВосемьСот символов", groups.get(0))
+                        && com.example.rag.RagBench.anyOfHit("Перекрытие 100", groups.get(1)));
+        expect("RagBench.anyOfHit не находит отсутствующее",
+                !com.example.rag.RagBench.anyOfHit("ничего не найдено", groups.get(0)));
+        expect("RagBench.factGroupsShare считает долю групп",
+                Math.abs(com.example.rag.RagBench.factGroupsShare(
+                        "окно 800 и перекрытие", groups) - 1.0) < 1e-9
+                        && Math.abs(com.example.rag.RagBench.factGroupsShare(
+                        "окно 800", groups) - 0.5) < 1e-9);
+        List<Long> values = List.of(300L, 100L, 200L, 400L);
+        expect("RagBench.median по отсортированным значениям с интерполяцией",
+                Math.abs(com.example.rag.RagBench.median(values) - 250) < 1e-9
+                        && Math.abs(com.example.rag.RagBench.median(List.of(7L)) - 7) < 1e-9);
+        expect("RagBench.percentile95 возвращает p95 с линейной интерполяцией",
+                Math.abs(com.example.rag.RagBench.percentile95(List.of(
+                        10L, 20L, 30L, 40L, 50L, 60L, 70L, 80L, 90L, 100L)) - 95.5) < 1e-9);
+        // Стабильность: 2 вопроса, у 1 исходы одинаковые, у 2 — разные.
+        List<com.example.rag.RagBench.Attempt> attempts = List.of(
+                benchAttempt("q1", "ok"), benchAttempt("q1", "ok"),
+                benchAttempt("q2", "ok"), benchAttempt("q2", "timeout"));
+        expect("RagBench.stableShare: одинаковый исход у половины вопросов",
+                Math.abs(com.example.rag.RagBench.stableShare(attempts) - 0.5) < 1e-9);
+        // Исходы через RagService.Result поверх предсказуемых AnswerStatus.
+        expect("RagBench.correctNoAnswer требует пустых подтверждённых цитат",
+                !com.example.rag.RagBench.correctNoAnswer(new RagService.Result(
+                        "НЕ ЗНАЮ", List.of(), List.of(), 0, 0,
+                        RagService.Status.OK, null, 0, false, false, "q", 0,
+                        "off", CitationValidator.AnswerStatus.IDK_MODEL,
+                        new CitationValidator.Validation(List.of(), List.of(
+                                new CitationValidator.Quote(1, "q")), 1, 0, 0))));
+        expect("RagBench.outcome различает пустой и ошибочный статус",
+                com.example.rag.RagBench.outcome(new RagService.Result(
+                        "", List.of(), List.of(), 0, 0, RagService.Status.EMPTY, "e",
+                        0, false, false, "q", 0, "off")).equals("empty"));
+    }
+
+    private static com.example.rag.RagBench.Attempt benchAttempt(String id, String outcome) {
+        return new com.example.rag.RagBench.Attempt(id, "ollama", 1, outcome,
+                0, 0, 0, null, null, 0, 0, 0, false, List.of(), "");
+    }
+
+    /** Профиль ollama жёстко ограничен loopback (не-https внешние узлы и https). */
+    private static void checkOllamaProfileLoopbackGuard() {
+        try {
+            ModelProfiles.ollama(Map.of("OLLAMA_API_URL",
+                    "https://api.example.com/v1/chat/completions"));
+            expect("профиль ollama на не-loopback отклоняется", false);
+        } catch (AgentException expected) {
+            expect("профиль ollama на не-loopback отклоняется",
+                    expected.getMessage().contains("loopback"));
+        }
+        try {
+            Config.requireLoopbackUrl("http://example.com/v1", "EMBEDDING_BASE_URL");
+            expect("requireLoopbackUrl отклоняет внешний адрес", false);
+        } catch (AgentException expected) {
+            expect("requireLoopbackUrl отклоняет внешний адрес",
+                    expected.getMessage().contains("loopback"));
+        }
+        try {
+            Config.requireLoopbackUrl("http://localhost:11434/v1", "EMBEDDING_BASE_URL");
+            expect("requireLoopbackUrl допускает loopback", true);
+        } catch (AgentException unexpected) {
+            expect("requireLoopbackUrl допускает loopback", false);
+        }
+    }
+
+    /** Разбор /api/ps и /api/show без сети (строки для OllamaContextProbe). */
+    private static void checkOllamaContextProbeParsing() {
+        Integer live = com.example.rag.OllamaContextProbe.fromPs(
+                "{\"models\":[{\"name\":\"qwen2.5:3b-rag8k\",\"context_length\":8192}]}",
+                "qwen2.5:3b-rag8k");
+        expect("Probe.fromPs извлекает context_length загруженного тега",
+                live != null && live == 8192);
+        Integer parameters = com.example.rag.OllamaContextProbe.fromShowParameters(
+                "{\"parameters\":\"seed 0\\nnum_ctx 8192\\nstop <s>\"}");
+        expect("Probe.fromShowParameters извлекает num_ctx из Modelfile-параметров",
+                parameters != null && parameters == 8192);
+        expect("Probe.fromShowParameters не находит num_ctx в пустом ответе",
+                com.example.rag.OllamaContextProbe.fromShowParameters(
+                        "{\"parameters\":\"\"}") == null);
+        expect("Probe.fromPs не находит чужую модель",
+                com.example.rag.OllamaContextProbe.fromPs(
+                        "{\"models\":[{\"name\":\"other\",\"context_length\":4096}]}",
+                        "qwen2.5:3b-rag8k") == null);
     }
 
      static void checkModelProfileStartupRollback() throws IOException {

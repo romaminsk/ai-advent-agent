@@ -1,0 +1,98 @@
+[
+  {
+    "id": "fixed-limits",
+    "question": "Какая стратегия использует окно 800 символов с перекрытием 100 и по чему делается разрез?",
+    "type": "fact",
+    "facts": [["800", "восемьсот"], ["100", "перекрытие"]],
+    "source": "src/main/java/com/example/index/FixedChunker.java",
+    "note": "FixedChunker.CHUNK_SIZE=800, FixedChunker.OVERLAP=100."
+  },
+  {
+    "id": "structure-limits",
+    "question": "Что делает чанкер structure с разделом больше 1500 символов и с куском меньше 200?",
+    "type": "fact",
+    "facts": [["1500"], ["дорезается", "разрезается", "окном", "режется"], ["склеив"]],
+    "source": "src/main/java/com/example/index/StructureChunker.java",
+    "note": "MAX_SECTION=1500, MIN_MERGE=200: раздел больше 1500 дорезается, куски меньше 200 склеиваются с соседом."
+  },
+  {
+    "id": "embedding-batch",
+    "question": "Каков лимит батча эмбеддингов в OpenAiEmbedder?",
+    "type": "fact",
+    "facts": [["16"]],
+    "source": "src/main/java/com/example/index/OpenAiEmbedder.java",
+    "note": "OpenAiEmbedder.BATCH_LIMIT=16."
+  },
+  {
+    "id": "embed-retry-pauses",
+    "question": "С какими паузами повторяются неудачные запросы эмбеддингов при 429 или 5xx?",
+    "type": "fact",
+    "facts": [["2 и 5", "2000", "2 с", "2 сек"], ["5 секунд", "5000", "5 с", "5 сек"]],
+    "source": "src/main/java/com/example/index/OpenAiEmbedder.java",
+    "note": "RETRY_PAUSE_MS = {2000, 5000}: повторы через 2 и 5 секунд, максимум 2 повтора."
+  },
+  {
+    "id": "rag-free-tokens",
+    "question": "Какой лимит генерации и какой таймаут использует RAG-вызов?",
+    "type": "multi",
+    "facts": [["4096"], ["120"]],
+    "source": "src/main/java/com/example/rag/RagService.java",
+    "note": "RagConstants.RAG_MAX_OUTPUT_TOKENS=4096, RagService.LLM_CALL_TIMEOUT_SECONDS=120."
+  },
+  {
+    "id": "citation-quote-limits",
+    "question": "В каких пределах должна быть длина дословной цитаты у валидатора?",
+    "type": "fact",
+    "facts": [["20"], ["300"]],
+    "source": "src/main/java/com/example/rag/CitationValidator.java",
+    "note": "Цитата короче 20 и длиннее 300 символов отбраковывается."
+  },
+  {
+    "id": "task-status-set",
+    "question": "Какие статусы задачи есть в агенте?",
+    "type": "fact",
+    "facts": [["ACTIVE", "Активная"], ["PAUSED", "Пауза"], ["BLOCKED", "Заблокирована"]],
+    "source": "src/main/java/com/example/TaskStatus.java",
+    "note": "TaskStatus: ACTIVE, PAUSED, BLOCKED (+ правила переходов)."
+  },
+  {
+    "id": "monitor-store-file",
+    "question": "В каком файле хранится состояние мониторинга репозитория?",
+    "type": "fact",
+    "facts": [["git-monitor.json"]],
+    "source": "src/main/java/com/example/MonitorStore.java",
+    "note": "MonitorStore пишет git-monitor.json в ~/.ai-advent-agent."
+  },
+  {
+    "id": "conversation-lock",
+    "question": "Что делает хранилище истории, если два запуска агента открыли один и тот же файл переписки?",
+    "type": "multi",
+    "facts": [["lock-файл", "лодукроя", "FileLock"], ["второй запуск", "второй процесс", "ошибка", "не изменяется"]],
+    "source": "src/main/java/com/example/JsonConversationStore.java",
+    "note": "Отдельный lock-файл: второй запуск получает ошибку; замена атомарная."
+  },
+  {
+    "id": "memory-file",
+    "question": "В каком файле по умолчанию хранится долговременная память агента?",
+    "type": "fact",
+    "facts": [["memory.json"]],
+    "source": "src/main/java/com/example/MemoryStore.java",
+    "note": "MemoryStore: ~/.ai-advent-agent/memory.json, LLM_MEMORY_FILE переопределяет."
+  },
+  {
+    "id": "no-answer-maintainer",
+    "question": "Кто основной контрибьютор этого репозитория и в какой стране он живёт?",
+    "type": "no-answer",
+    "facts": [],
+    "source": "",
+    "note": "Ожидается отказ: персоональных сведений в коде нет."
+  },
+  {
+    "id": "no-answer-study",
+    "question": "Сколько времени заняла у команды разработка агентной системы по калейндарному плану?",
+    "type": "no-answer",
+    "facts": [],
+    "source": "",
+    "note": "Ожидается отказ: в календарном плане проекта schedule нет."
+  }
+]

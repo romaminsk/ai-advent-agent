@@ -202,6 +202,8 @@ public interface TerminalUi extends AutoCloseable {
                         "сборка, статистика, поиск и сравнение индекса"),
                 new Row("RAG", "/rag on/off/config/set/retrieval/ask/eval cite/threshold-scan/idk-scan",
                         "ответы с проверяемыми цитатами, источниками и отказом при слабом контексте"),
+                new Row("RAG benchmark", "/rag-bench [файл] [повторов] [--quick]",
+                        "сравнение ollama и cloud по фактам, цитатам и скорости"),
                 new Row("Прочее", "/mcp /monitor /help /exit (также exit, quit)",
                         "подключения, мониторинг и справка"),
         };
@@ -233,7 +235,7 @@ public interface TerminalUi extends AutoCloseable {
                 "/profile", "/skill", "/pipeline", "/invariant", "/clear", "/reset",
                 "/mode", "/model", "/multiline", "/paste", "/demo",
                 "/context", "/summary", "/strategy", "/facts", "/branch",
-                "/tokens", "/stats", "/limit", "/status", "/mcp", "/monitor", "/index", "/rag", "/exit",
+                "/tokens", "/stats", "/limit", "/status", "/mcp", "/monitor", "/index", "/rag", "/rag-bench", "/exit",
         };
     }
 
@@ -723,7 +725,40 @@ public interface TerminalUi extends AutoCloseable {
                       Финальная генерация: max_tokens=4096, пустой ответ повторяется один раз.
                       Отчёты: ~/.ai-advent-agent/rag-results/ и artifacts/.
 
-                    Связано: /index stats, /help all.""";
+                    Связано: /index stats, /rag-bench, /help all.""";
+            case "/rag-bench" -> """
+                    /rag-bench — бенчмарк локального и облачного RAG (ollama vs cloud)
+
+                    Использование
+                      /rag-bench [файл] [повторов] [--quick]
+
+                    По умолчанию: docs/rag-bench-questions.json, 3 повтора;
+                    --quick — один повтор и первые 5 вопросов.
+
+                    Примеры
+                      /rag-bench
+                      /rag-bench --quick
+                      /rag-bench docs/rag-bench-questions.json 3
+
+                    Эффекты
+                      Retrieval выполняется один раз на вопрос (bge-m3, без
+                      rewrite — как в чат-пути) и единые чанки получают оба
+                      профиля. Провайдеры прогоняются по отдельным
+                      изолированным агентам с temp-хранилищами: история
+                      пользователя и model-profile.json не изменяются.
+                      Прогрев ollama перед замерами отдельно (холодный
+                      старт показан, но не входит в метрики). Для вопросов
+                      «без ответа» дополнительно вызывается модель
+                      (суффикс -force), если порог отказал LLM.
+                      Cloud при отсутствии ключа/сети пропускается
+                      с явной пометкой. Прогресс печатается по вопросам;
+                      отчёт сохраняется в
+                      ~/.ai-advent-agent/rag-results/rag-bench-<дата>.md.
+                      Локальный профиль требует num_ctx тега
+                      (scripts/ollama_rag_model.sh), иначе — явное
+                      предупреждение RagContextGuard.
+
+                    Связано: /rag, /model, /help all.""";
             case "/mode" -> """
                     /mode — профиль ответа
 
