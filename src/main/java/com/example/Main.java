@@ -8,7 +8,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.function.Consumer;
 
 /**
  * Консольное приложение агента. Координирует работу: создаёт конфигурацию,
@@ -22,6 +24,8 @@ import java.nio.file.Path;
  */
 public final class Main {
 
+    /** Учёт маршрутов RAG-вызовов: «профиль → host:port» ×N (бенч и guard). */
+    static final Map<String, Integer> RAG_ROUTE_HOSTS = new java.util.concurrent.ConcurrentHashMap<>();
     /**
      * Дополнение системного промпта только для RAG-режима обычного чата
      * (не затрагивает /rag ask и eval): диагностика волны UNVERIFIED показала,
@@ -335,8 +339,12 @@ public final class Main {
                                                 prepared.prompt().user());
                                         ragResult = activeRagService.evaluateAnswer(prepared, rawAnswer,
                                                 com.example.rag.RagService.elapsedMs(ragLlmStart));
-                                        answer = com.example.rag.RagAnswerFormatter.format(ragResult,
-                                                activeAgent.currentSettings().diagnostics(), true);
+                                         answer = com.example.rag.RagAnswerFormatter.format(ragResult,
+                                                 activeAgent.currentSettings().diagnostics(), true);
+                                         String chatGuard = ragChatContextGuard(activeAgent);
+                                         if (chatGuard != null) {
+                                             ui.showSystem(warn(chatGuard));
+                                         }
                                         // Отказ модели или проверки: вопрос открыт,
                                         // состояние диалога не портится.
                                         if (ragResult.answerStatus()
@@ -3362,7 +3370,9 @@ public final class Main {
                     }
                 } else if (normalized.equals("/index") || normalized.startsWith("/index ")) {
                     handleIndexCommand(ui, command);
-                } else if (normalized.equals("/rag") || normalized.startsWith("/rag ")) {
+                } else if (normalized.equals("/rag") || normalized.startsWith("/rag ")
+                        || normalized.equals("/rag-bench")
+                        || normalized.startsWith("/rag-bench ")) {
                     handleRagCommand(ui, agent, command, ragRef);
                 } else if (normalized.equals("/mode") || normalized.startsWith("/mode ")) {
                     handleModeCommand(ui, agent, normalized);
@@ -4133,8 +4143,65 @@ public final class Main {
         }
     }
 
+    /**
+     * /rag-bench [файл] [повторов] [--quick] — бенчмарк ollama vs cloud.
+     * По умолчанию docs/rag-bench-questions.json, 3 повтора; --quick —
+     * один повтор и первые 5 вопросов. Прогресс печатается в терминал;
+     * отчёт — docs/rag-local-vs-cloud.md и копия в rag-results/.
+     */
+    private static void handleRagBenchCommand(TerminalUi ui, LlmAgent agent, String raw,
+                                              RagRef ragRef) {
+        String rest = raw.length() > "/rag-bench".length()
+                ? raw.substring("/rag-bench".length()).trim() : "";
+        List<String> tokens = new ArrayList<>();
+        for (String item : rest.split("\\s+")) {
+            if (!item.isBlank()) tokens.add(item);
+        }
+        boolean quick = tokens.remove("--quick");
+        Path questionsFile = Path.of("docs", "rag-bench-questions.json");
+        int repeats = quick ? 1 : 3;
+        for (String token : tokens) {
+            if (looksLikeInt(token)) {
+                repeats = Math.max(1, Integer.parseInt(token));
+            } else {
+                questionsFile = Path.of(token);
+            }
+        }
+        try {
+            List<com.example.rag.RagBench.Question> questions =
+                    com.example.rag.RagBench.loadQuestions(questionsFile);
+            if (quick) {
+                questions = questions.subList(0, Math.min(5, questions.size()));
+            }
+            ui.showSystem("Бенчмарк RAG: вопросов " + questions.size()
+                    + ", повторов " + repeats
+                    + (quick ? " (--quick)" : "") + ", файл " + questionsFile);
+            String markdown = ragRef.ragBench(questions, repeats, quick, ui::showSystem);
+            Path home = Path.of(System.getProperty("user.home"));
+            Path reportPath = home.resolve(".ai-advent-agent").resolve("rag-results")
+                    .resolve("rag-bench-" + java.time.LocalDate.now() + ".md");
+            com.example.rag.RagEval.writeReport(reportPath, markdown);
+            ui.showSystem("Отчёт бенчмарка: " + reportPath);
+        } catch (Exception e) {
+            ui.showError("Ошибка /rag-bench: " + safeError(e));
+            if (agent.currentSettings().diagnostics()) {
+                java.io.StringWriter stack = new java.io.StringWriter();
+                e.printStackTrace(new java.io.PrintWriter(stack));
+                ui.showSystem(stack.toString());
+            }
+        }
+    }
+
+    private static boolean looksLikeInt(String value) {
+        return value != null && value.matches("\\d+");
+    }
+
     private static void handleRagCommand(TerminalUi ui, LlmAgent agent, String raw,
                                         RagRef ragRef) {
+        if (raw.equals("/rag-bench") || raw.startsWith("/rag-bench ")) {
+            handleRagBenchCommand(ui, agent, raw, ragRef);
+            return;
+        }
         String argument = raw.length() > "/rag".length()
                 ? raw.substring("/rag".length()).trim() : "";
         String lower = argument.toLowerCase(java.util.Locale.ROOT);
@@ -4151,8 +4218,7 @@ public final class Main {
             ui.showSystem(formatRagConfig(ragRef));
             return;
         }
-        if (lower.startsWith("rewrite-test ")) {
-            String[] parts = argument.substring("rewrite-test".length()).trim().split("\\s+");
+        if (lower.startsWith("rewrite-test ")) {            String[] parts = argument.substring("rewrite-test".length()).trim().split("\\s+");
             if (parts.length < 1 || parts[0].isBlank() || parts.length > 3) {
                 ui.showError("Использование: /rag rewrite-test <question-id> [max_tokens timeout_s]");
                 return;
@@ -4672,14 +4738,14 @@ public final class Main {
             if (injectedService) {
                 return service;
             }
+            requireLocalRagSurfaces(agent);
             ensureRetrievers();
             if (service == null || serviceAgent != agent || !strategy.equals(serviceStrategy)) {
                 com.example.rag.RagRetriever selectedRetriever = "fixed".equals(strategy)
                         ? fixedRetriever : structureRetriever;
                 service = new com.example.rag.RagService(selectedRetriever,
                         new com.example.rag.RagPromptBuilder(), ContextBuilder.BASE_SYSTEM_PROMPT,
-                        (system, user, maxOutputTokens) ->
-                                agent.askWithoutHistory(system, user, maxOutputTokens), settings,
+                        ragLlmClient(agent), settings,
                         new com.example.rag.RagQueryRewriter((system, question) ->
                                 agent.askWithoutHistory(system, question,
                                         com.example.rag.RagQueryRewriter.DEFAULT_MAX_OUTPUT_TOKENS)));
@@ -4687,6 +4753,175 @@ public final class Main {
                 serviceStrategy = strategy;
             }
             return service;
+        }
+
+        /**
+         * LLM-оборот RAG-пути с учётом активного профиля: cloud — поведение
+         * прежнее (String-клиент, без usage); ollama — вызов с фактическим
+         * usage и предупреждением RagContextGuard при приближении к num_ctx.
+         */
+        private static String askRagWithProfile(LlmAgent agent, String system, String user,
+                                                int maxOutputTokens) throws Exception {
+            recordRagRoute(agent);
+            if (!ModelProfiles.OLLAMA.equals(agent.currentProfileName())) {
+                return agent.askWithoutHistory(system, user, maxOutputTokens);
+            }
+            com.example.rag.RagService.Completion completion =
+                    agent.statelessRagCall(system, user, maxOutputTokens);
+            Integer numCtx = com.example.rag.OllamaContextProbe.contextLength(
+                    agent.modelName(), agent.providerApiUrl());
+            String warning = com.example.rag.RagContextGuard.warning(completion.promptTokens(),
+                    ModelProfiles.localRagMaxOutputTokens(), numCtx);
+            return warning == null ? completion.text()
+                    : completion.text() + "\n" + warning;
+        }
+
+        /** LlmClient агента с профильной обработкой (RagRef.service и бенч). */
+        private static com.example.rag.RagService.LlmClient ragLlmClient(LlmAgent agent) {
+            return (system, user, maxOutputTokens) ->
+                    askRagWithProfile(agent, system, user, maxOutputTokens);
+        }
+
+        /** Учёт хоста контекстного вызова: профиль → host:port ×N. */
+        private static void recordRagRoute(LlmAgent agent) {
+            try {
+                java.net.URI uri = java.net.URI.create(agent.providerApiUrl());
+                int port = uri.getPort() > 0 ? uri.getPort()
+                        : ("https".equalsIgnoreCase(uri.getScheme()) ? 443 : 80);
+                RAG_ROUTE_HOSTS.merge(agent.currentProfileName() + " → "
+                        + uri.getHost() + ":" + port, 1, Integer::sum);
+            } catch (Exception ignored) {
+                // Учёт не должен ломать основной вызов.
+            }
+        }
+
+        /**
+         * Прогон бенчмарка: два изолированных агента (temp-хранилища;
+         * история пользователя и model-profile.json не затрагиваются),
+         * retrieval один раз на вопрос (prepareChat с rewrite=off),
+         * генерации профилей на одних чанках. Прогрев ollama — перед
+         * замерами, отдельно, без участия в метриках.
+         */
+        private String ragBench(List<com.example.rag.RagBench.Question> questions,
+                                int repeats, boolean quick, Consumer<String> progress) throws Exception {
+            ensureRetrievers();
+            com.example.rag.RagRetriever retriever = "fixed".equals(strategy)
+                    ? fixedRetriever : structureRetriever;
+            com.example.rag.RagSettings benchSettings = settings.withRewrite(false);
+            Config cloudConfig = null;
+            try {
+                cloudConfig = Config.fromEnv();
+            } catch (Exception ignored) {
+                // Без cloud-конфигурации bench пропускает cloud с явной пометкой.
+            }
+            boolean cloudAvailable = cloudConfig != null;
+
+            Path tempOllamaDir = Files.createTempDirectory("ai-agent-bench-");
+            Path tempCloudDir = Files.createTempDirectory("ai-agent-bench-");
+            JsonConversationStore ollamaStore = new JsonConversationStore(
+                    tempOllamaDir.resolve("history.json"), true);
+            JsonConversationStore cloudStore = new JsonConversationStore(
+                    tempCloudDir.resolve("history.json"), true);
+            LlmAgent ollamaAgent = new LlmAgent(ollamaConfig(),
+                    com.example.ModelSettings.defaults(), ollamaStore);
+            LlmAgent cloudAgent = cloudAvailable ? new LlmAgent(cloudConfig,
+                    com.example.ModelSettings.defaults(), cloudStore) : null;
+            try {
+                com.example.rag.RagService ollamaService = null;
+                long coldStartMs = -1;
+                String modelTag = "—";
+                if (com.example.ModelProfiles.reachable(com.example.ModelProfiles.ollama())) {
+                    ollamaAgent.switchToProfile(com.example.ModelProfiles.ollama());
+                    // Прогрев: один холостой stateless-вызов локальной модели,
+                    // в метрики бенча не входит; время холодного старта отдельно.
+                    long warmStart = System.nanoTime();
+                    ollamaAgent.statelessRagCall("Ты отвечаешь одним словом.",
+                            "Прогрев: ответь словом ГОТОВ.", 8);
+                    coldStartMs = com.example.rag.RagService.elapsedMs(warmStart);
+                    modelTag = ollamaAgent.modelName();
+                    ollamaService = new com.example.rag.RagService(retriever,
+                            new com.example.rag.RagPromptBuilder(),
+                            ContextBuilder.BASE_SYSTEM_PROMPT, ragLlmClient(ollamaAgent),
+                            benchSettings, null);
+                } else {
+                    progress.accept("[бенч] ollama недоступна ("
+                            + com.example.ModelProfiles.origin(com.example.ModelProfiles.ollama())
+                            + " не отвечает): профиль ollama пропускается.");
+                }
+                com.example.rag.RagService cloudService = cloudAvailable
+                        ? new com.example.rag.RagService(retriever,
+                        new com.example.rag.RagPromptBuilder(),
+                        ContextBuilder.BASE_SYSTEM_PROMPT, ragLlmClient(cloudAgent),
+                        benchSettings, null)
+                        : null;
+                Main.RAG_ROUTE_HOSTS.clear();
+                com.example.rag.RagBench.RunResult result = com.example.rag.RagBench.execute(
+                        questions, repeats, com.example.rag.RagBench.OLLAMA_PROFILE,
+                        ollamaService, com.example.rag.RagBench.CLOUD_PROFILE,
+                        cloudService, cloudAvailable, progress);
+                StringBuilder routeSummary = new StringBuilder();
+                for (Map.Entry<String, Integer> entry : Main.RAG_ROUTE_HOSTS.entrySet()) {
+                    routeSummary.append("[бенч] маршрут RAG: ").append(entry.getKey())
+                            .append(" ×").append(entry.getValue()).append('\n');
+                }
+                String coldNote = "холодный старт ollama («Прогрев», не в метриках): "
+                        + (coldStartMs < 0 ? "пропущен" : coldStartMs + " мс; тег модели: " + modelTag)
+                        + ".\n" + routeSummary;
+                List<String> notes = new ArrayList<>(result.notes());
+                notes.add(coldNote.replace('\n', ' '));
+                return result.markdown() + "\nМаршруты (учёт хостов RAG-прогона):\n"
+                        + (routeSummary.length() == 0 ? "- нет" : routeSummary.toString());
+            } finally {
+                ollamaStore.close();
+                cloudStore.close();
+                deleteTempDirectory(tempOllamaDir);
+                deleteTempDirectory(tempCloudDir);
+            }
+        }
+
+        /** Профиль ollama как конфигурация агента (loopback гарантирован профилем). */
+        private static Config ollamaConfig() {
+            com.example.ModelProfiles.Profile profile = com.example.ModelProfiles.ollama();
+            return new Config(profile.apiKey(), profile.apiUrl(), profile.model());
+        }
+
+        /** Удаление временного каталога бенча (лень сложности ради двух строк). */
+        private static void deleteTempDirectory(Path directory) {
+            if (!Files.isDirectory(directory)) return;
+            try (var entries = Files.list(directory)) {
+                entries.forEach(entry -> {
+                    try {
+                        Files.deleteIfExists(entry);
+                    } catch (IOException ignored) {
+                        // temp-каталоги чистятся ОС, не критичен.
+                    }
+                });
+            } catch (IOException ignored) {
+                // temp-каталоги чистятся ОС, не критичен.
+            }
+            try {
+                Files.deleteIfExists(directory);
+            } catch (IOException ignored) {
+                // temp-каталоги чистятся ОС, не критичен.
+            }
+        }
+
+        /**
+         * Защита полностью локального RAG: при профиле ollama все сетевые
+         * поверхности RAG-пути (эмбеддер из EMBEDDING_BASE_URL, генерация,
+         * rewrite) обязаны быть loopback; иначе — явная ошибка.
+         */
+        private void requireLocalRagSurfaces(LlmAgent agent) {
+            if (!ModelProfiles.OLLAMA.equals(agent.currentProfileName())) {
+                return;
+            }
+            String baseUrl = System.getenv("EMBEDDING_BASE_URL");
+            if (baseUrl == null || baseUrl.isBlank()) {
+                throw new AgentException("Профиль ollama требует EMBEDDING_BASE_URL"
+                        + " (локальная эмбеддинг-модель); переменная не задана.");
+            }
+            com.example.Config.requireLoopbackUrl(baseUrl, "EMBEDDING_BASE_URL");
+            com.example.ModelProfiles.ollama(); // проверка loopback профильного URL
         }
 
         private com.example.rag.RagEval.RetrievalReport retrieval()
@@ -4869,6 +5104,16 @@ public final class Main {
                     + "не изменён: " + agent.currentProfileName() + ".");
             return;
         }
+        if (ModelProfiles.OLLAMA.equals(profile.name())
+                && !ModelProfiles.modelExists(ollamaProfile)) {
+            // Явное предупреждение вместо молчаливого фолбэка: профиль
+            // применяется, но каждый обращённый к тегу запрос завершится
+            // ошибкой Ollama, пока тег не создан (scripts/ollama_rag_model.sh).
+            ui.showSystem(warn("Предупреждение: модель тега «" + ollamaProfile.model()
+                    + "» нет в /api/tags сервера " + ModelProfiles.origin(ollamaProfile)
+                    + ". Создайте тег: scripts/ollama_rag_model.sh"
+                    + " (см. README «Полностью локальный RAG»)."));
+        }
         try {
             agent.switchToProfile(profile);
         } catch (AgentException e) {
@@ -4908,6 +5153,25 @@ public final class Main {
         return exchanges > 6
                 ? "Длинная история ухудшает ответы 3B-модели; /clear очищает историю."
                 : null;
+    }
+
+    /**
+     * Предупреждение о близости RAG-чат-промпта к контексту локальной модели:
+     * используется фактический usage последнего запроса (lastDiagnostics) и
+     * num_ctx тега из loopback /api/ps|/api/show. Не меняет истории и ответ.
+     */
+    static String ragChatContextGuard(LlmAgent agent) {
+        if (!ModelProfiles.OLLAMA.equals(agent.currentProfileName())) {
+            return null;
+        }
+        RequestDiagnostics diagnostics = agent.getLastDiagnostics();
+        if (diagnostics == null || diagnostics.promptTokens() == null) {
+            return null;
+        }
+        Integer numCtx = com.example.rag.OllamaContextProbe.contextLength(
+                agent.modelName(), agent.providerApiUrl());
+        return com.example.rag.RagContextGuard.warning(diagnostics.promptTokens(),
+                diagnostics.effectiveMaxOutputTokens(), numCtx);
     }
 
     /**

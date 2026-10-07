@@ -63,9 +63,27 @@ public final class Config {
         return value;
     }
 
-    /** URL должен быть HTTPS-адресом; loopback дополнительно допускает открытый HTTP. */
-    private static void checkApiUrl(String url, String name) {
+    /**
+     * Для полностью локального RAG: адрес обязан быть loopback
+     * (localhost/127.0.0.1/::1). Используется профилем ollama и защитой
+     * эмбеддера EMBEDDING_BASE_URL; бросает AgentException на другой адрес.
+     */
+    public static void requireLoopbackUrl(String url, String name) {
         URI uri;
+        try {
+            uri = URI.create(url);
+        } catch (IllegalArgumentException e) {
+            throw new AgentException(name + " не является корректным URL: " + url, e);
+        }
+        if (!isLoopbackHost(uri.getHost())) {
+            throw new AgentException(
+                    name + " в локальном режиме должен указывать на loopback "
+                            + "(localhost, 127.0.0.1, ::1), получено: " + url);
+        }
+    }
+
+    /** URL должен быть HTTPS-адресом; loopback дополнительно допускает открытый HTTP. */
+    private static void checkApiUrl(String url, String name) {        URI uri;
         try {
             uri = URI.create(url);
         } catch (IllegalArgumentException e) {
