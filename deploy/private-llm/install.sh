@@ -15,6 +15,12 @@ sudo install -m 0644 "$ROOT/ollama-override.conf" /etc/systemd/system/ollama.ser
 sudo systemctl daemon-reload
 sudo systemctl restart ollama
 
+for _ in $(seq 1 30); do
+    curl --silent --fail http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && break
+    sleep 1
+done
+curl --silent --fail http://127.0.0.1:11434/api/tags >/dev/null
+
 MODEL=$(sed -n 's/^FROM[[:space:]]\+//p' "$ROOT/Modelfile")
 [ -n "$MODEL" ]
 ollama pull "$MODEL"
