@@ -170,6 +170,7 @@ public final class SelfTest extends SelfTestSupport {
         groups.put("task-state", new TestGroup("Состояние задачи", true, TaskStateChecks::run));
         groups.put("context", new TestGroup("Контекст", true, ContextChecks::run));
         groups.put("commands", new TestGroup("Команды", true, CommandChecks::run));
+        groups.put("private-chat", new TestGroup("Приватный чат", true, PrivateChatChecks::run));
         groups.put("invariant-guard", new TestGroup("InvariantGuard", true, InvariantGuardChecks::run));
         groups.put("ux", new TestGroup("UX", true, UxChecks::run));
         groups.put("mcp", new TestGroup("MCP", true,
