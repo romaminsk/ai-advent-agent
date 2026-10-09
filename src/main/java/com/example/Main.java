@@ -43,6 +43,11 @@ public final class Main {
             ответь ровно: НЕ ЗНАЮ.""";
 
     public static void main(String[] args) {
+        if (args.length >= 1 && "private-chat".equals(args[0])) {
+            int exitCode = PrivateChatClient.run(java.util.Arrays.copyOfRange(args, 1, args.length));
+            if (exitCode != 0) System.exit(exitCode);
+            return;
+        }
         if (args.length >= 2 && "--mcp-server".equals(args[0])) {
             int exitCode = switch (args[1]) {
                 case "git-monitor" -> GitMonitorMcpServer.run();
@@ -5246,6 +5251,7 @@ public final class Main {
         out.println("AI Advent Agent — интерактивный CLI-чат с LLM.");
         out.println();
         out.println("Использование: ai-agent [параметры]");
+        out.println("  private-chat [вопрос] — приватный чат через SSH-туннель");
         out.println("  --help    — эта справка");
         out.println("  --plain   — упрощённый режим: без цветов, спиннера и сложного редактирования");
         out.println();
