@@ -30,6 +30,7 @@ final class AssistantChecks extends SelfTestSupport {
         checkRouting();
         checkMasking();
         checkDocsThreshold();
+        checkBranchAndChat();
         Path repo = checkGitTools();
         checkAnswers();
         checkMcpRoundTrip(repo);
@@ -213,6 +214,53 @@ final class AssistantChecks extends SelfTestSupport {
         expect("ASSIST-10 три неудачи → запасной вывод «модель не дала ответ» и источники из найденных чанков",
                 fallback.text().contains("Модель не дала ответ") && fallback.sources().size() == 1
                         && failedCalls.get() >= 3);
+    }
+
+    static void checkBranchAndChat() throws Exception {
+        expect("ASSIST-11 вопрос про ветку распознаётся (положительные примеры)",
+                DevAssistant.isBranchOnly("В какой я сейчас ветке?") && DevAssistant.isBranchOnly("Какая ветка?")
+                        && DevAssistant.isBranchOnly("Какая у меня branch?") && DevAssistant.isBranchOnly("в какой я ветке"));
+        expect("ASSIST-11 не про ветку: файлы, борщ, смешанные вопросы (отрицательные примеры)",
+                !DevAssistant.isBranchOnly("Какие файлы изменены?")
+                        && !DevAssistant.isBranchOnly("В какой ветке и какие файлы изменены?")
+                        && !DevAssistant.isBranchOnly("Какая структура проекта и ветка?")
+                        && !DevAssistant.isBranchOnly("Что в документации про ветки?")
+                        && !DevAssistant.isBranchOnly("В какой ветке diff?")
+                        && !DevAssistant.isBranchOnly("Как приготовить борщ?"));
+        expect("ASSIST-12 «/help X» и «X» дают один вопрос",
+                DevAssistant.questionOf("/help В какой я ветке?").equals("В какой я ветке?")
+                        && DevAssistant.questionOf("В какой я ветке?").equals("В какой я ветке?")
+                        && DevAssistant.questionOf("/help").isEmpty() && DevAssistant.questionOf("   ").isEmpty()
+                        && DevAssistant.questionOf("/helpful x").equals("/helpful x"));
+        expect("ASSIST-12 выход по /exit и /quit без учёта регистра",
+                DevAssistant.isExit("/exit") && DevAssistant.isExit("/QUIT") && !DevAssistant.isExit("exit"));
+
+        List<String> asked = new ArrayList<>();
+        DevAssistant.runChat(new java.io.BufferedReader(new java.io.StringReader(
+                "/help Вопрос1\n\nВопрос2\n/exit\nВопрос3\n")), new java.io.PrintStream(new java.io.ByteArrayOutputStream(),
+                true, StandardCharsets.UTF_8), asked::add);
+        expect("ASSIST-12 цикл: пустые строки пропускаются, /exit завершает сеанс",
+                asked.equals(List.of("Вопрос1", "Вопрос2")));
+        List<String> eof = new ArrayList<>();
+        DevAssistant.runChat(new java.io.BufferedReader(new java.io.StringReader("Вопрос4")),
+                new java.io.PrintStream(new java.io.ByteArrayOutputStream(), true, StandardCharsets.UTF_8), eof::add);
+        expect("ASSIST-12 цикл: конец ввода (Ctrl+D) завершает сеанс без зависания", eof.equals(List.of("Вопрос4")));
+
+        java.io.ByteArrayOutputStream outBytes = new java.io.ByteArrayOutputStream();
+        java.io.ByteArrayOutputStream errBytes = new java.io.ByteArrayOutputStream();
+        int okCode = DevAssistant.branchAnswer(tools -> Map.of("git_branch", "ветка: feature-x"),
+                new java.io.PrintStream(outBytes, true, StandardCharsets.UTF_8),
+                new java.io.PrintStream(errBytes, true, StandardCharsets.UTF_8));
+        expect("ASSIST-13 ответ ветки одной строкой из MCP без LLM",
+                okCode == 0 && outBytes.toString(StandardCharsets.UTF_8).equals("Текущая git-ветка: feature-x\n"));
+        java.io.ByteArrayOutputStream failOut = new java.io.ByteArrayOutputStream();
+        java.io.ByteArrayOutputStream failErr = new java.io.ByteArrayOutputStream();
+        int failCode = DevAssistant.branchAnswer(tools -> { throw new java.io.IOException("нет связи"); },
+                new java.io.PrintStream(failOut, true, StandardCharsets.UTF_8),
+                new java.io.PrintStream(failErr, true, StandardCharsets.UTF_8));
+        expect("ASSIST-13 недоступный MCP: понятная ошибка на русском, exit != 0, без стектрейса",
+                failCode != 0 && failOut.size() == 0
+                        && failErr.toString(StandardCharsets.UTF_8).startsWith("Не удалось определить ветку"));
     }
 
     static void checkDocsThreshold() {
