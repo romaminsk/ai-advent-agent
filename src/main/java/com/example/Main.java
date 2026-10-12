@@ -67,13 +67,15 @@ public final class Main {
             if (exitCode != 0) System.exit(exitCode);
             return;
         }
-        if (args.length == 1 && "index".equals(args[0])) {
-            int exitCode = com.example.assistant.DevAssistant.index(System.out, System.err);
+        if (args.length >= 1 && "index".equals(args[0])) {
+            int exitCode = com.example.assistant.DevAssistant.index(
+                    java.util.Arrays.copyOfRange(args, 1, args.length), System.out, System.err);
             if (exitCode != 0) System.exit(exitCode);
             return;
         }
-        if (args.length == 1 && "chat-help".equals(args[0])) {
+        if (args.length >= 1 && "chat-help".equals(args[0])) {
             int exitCode = com.example.assistant.DevAssistant.chat(
+                    java.util.Arrays.copyOfRange(args, 1, args.length),
                     new java.io.BufferedReader(new java.io.InputStreamReader(System.in,
                             java.nio.charset.StandardCharsets.UTF_8)), System.out, System.err);
             if (exitCode != 0) System.exit(exitCode);
@@ -5279,6 +5281,8 @@ public final class Main {
         out.println("  index     — индекс документации проекта для ассистента разработчика");
         out.println("  help [вопрос] — ответ ассистента разработчика с источниками [n] и данными Git");
         out.println("  chat-help — интерактивный ассистент разработчика (выход: /exit, /quit или Ctrl+D)");
+        out.println("  --project <путь> — папка Git-проекта для index, help и chat-help (иначе PROJECT_DIR из .env,");
+        out.println("                     иначе текущая папка)");
         out.println("  mcp-git   — MCP stdio-сервер Git (только чтение)");
         out.println("  --help    — эта справка");
         out.println("  --plain   — упрощённый режим: без цветов, спиннера и сложного редактирования");

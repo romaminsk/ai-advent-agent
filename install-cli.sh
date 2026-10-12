@@ -177,6 +177,23 @@ LAUNCHER_BODY
 } > "$TARGET" || fail "не удалось записать $TARGET"
 chmod 755 "$TARGET"
 
+# PROJECT_DIR в .env — путь репозитория, из которого ставится команда. Существующее значение не меняем.
+ENV_FILE="$PROJECT_DIR/.env"
+if [ -f "$ENV_FILE" ]; then
+    if grep -Eq '^[[:space:]]*(export[[:space:]]+)?PROJECT_DIR=' "$ENV_FILE"; then
+        echo "PROJECT_DIR уже задан в .env — оставлен без изменений."
+    else
+        if [ -s "$ENV_FILE" ] && [ -n "$(tail -c 1 "$ENV_FILE")" ]; then
+            printf '\n' >> "$ENV_FILE" || fail "не удалось дописать .env"
+        fi
+        printf 'PROJECT_DIR=%s\n' "$PROJECT_DIR" >> "$ENV_FILE" || fail "не удалось дописать PROJECT_DIR в .env"
+        chmod 600 "$ENV_FILE" 2>/dev/null || true
+        echo "В .env добавлен PROJECT_DIR=$PROJECT_DIR"
+    fi
+else
+    echo "Предупреждение: файл .env не найден в $PROJECT_DIR — PROJECT_DIR не записан."
+fi
+
 echo "Установлено: $TARGET"
 echo "Артефакт: $JAR_PATH"
 
