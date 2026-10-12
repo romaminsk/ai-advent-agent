@@ -61,6 +61,23 @@ public final class Main {
             if (exitCode != 0) System.exit(exitCode);
             return;
         }
+        if (args.length >= 1 && "mcp-git".equals(args[0])) {
+            int exitCode = com.example.assistant.GitToolsMcpServer.run(
+                    java.util.Arrays.copyOfRange(args, 1, args.length));
+            if (exitCode != 0) System.exit(exitCode);
+            return;
+        }
+        if (args.length == 1 && "index".equals(args[0])) {
+            int exitCode = com.example.assistant.DevAssistant.index(System.out, System.err);
+            if (exitCode != 0) System.exit(exitCode);
+            return;
+        }
+        if (args.length >= 1 && "help".equals(args[0])) {
+            int exitCode = com.example.assistant.DevAssistant.help(
+                    java.util.Arrays.copyOfRange(args, 1, args.length), System.out, System.err);
+            if (exitCode != 0) System.exit(exitCode);
+            return;
+        }
         if (args.length == 1 && "--background".equals(args[0])) {
             int exitCode = new MonitorWorker().run();
             if (exitCode != 0) System.exit(exitCode);
@@ -5252,6 +5269,9 @@ public final class Main {
         out.println();
         out.println("Использование: ai-agent [параметры]");
         out.println("  private-chat [вопрос] — приватный чат через SSH-туннель");
+        out.println("  index     — индекс документации проекта для ассистента разработчика");
+        out.println("  help [вопрос] — ответ ассистента разработчика с источниками [n] и данными Git");
+        out.println("  mcp-git   — MCP stdio-сервер Git (только чтение)");
         out.println("  --help    — эта справка");
         out.println("  --plain   — упрощённый режим: без цветов, спиннера и сложного редактирования");
         out.println();

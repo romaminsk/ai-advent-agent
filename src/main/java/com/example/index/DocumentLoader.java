@@ -33,6 +33,23 @@ public final class DocumentLoader {
     /** Тип документа — определяет стратегию структурного chunking. */
     public enum DocType { MD, JAVA, TXT }
 
+    /** Режим документации ассистента: README и файлы .md/.txt в docs/ (рекурсивно), до 200 КБ. */
+    public static final long DOCS_MAX_FILE_BYTES = 200 * 1024;
+
+    private final boolean docsOnly;
+
+    public DocumentLoader() {
+        this(false);
+    }
+
+    private DocumentLoader(boolean docsOnly) {
+        this.docsOnly = docsOnly;
+    }
+
+    public static DocumentLoader docsOnly() {
+        return new DocumentLoader(true);
+    }
+
     /** Сбор документов относительно corpusRoot (по умолчанию корень проекта). */
     public List<Document> load(Path corpusRoot) throws IOException {
         List<Document> documents = new ArrayList<>();
@@ -58,11 +75,27 @@ public final class DocumentLoader {
             public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
                 String name = file.getFileName() == null ? "" : file.getFileName().toString();
                 DocType type = docType(name);
-                if (type == null || attrs.size() > MAX_FILE_BYTES) {
+                if (type == null || attrs.size() > (docsOnly ? DOCS_MAX_FILE_BYTES : MAX_FILE_BYTES)) {
                     return FileVisitResult.CONTINUE;
                 }
-                String relative = root.relativize(file).toString();
+                String relative = root.relativize(file).toString().replace('\\', '/');
                 if (isExcluded(relative)) {
+                    return FileVisitResult.CONTINUE;
+                }
+                if (docsOnly) {
+                    boolean readme = !relative.contains("/") && name.toLowerCase().startsWith("readme");
+                    boolean doc = relative.startsWith("docs/") && (type == DocType.MD || type == DocType.TXT);
+                    if (!readme && !doc) {
+                        return FileVisitResult.CONTINUE;
+                    }
+                    try {
+                        String content = Files.readString(file, StandardCharsets.UTF_8);
+                        if (!looksBinary(content)) {
+                            documents.add(new Document(file, relative, content, type));
+                        }
+                    } catch (IOException ignored) {
+                        // Нечитаемый файл пропускаем — индекс собирается по остальным.
+                    }
                     return FileVisitResult.CONTINUE;
                 }
                 boolean inSrc = file.startsWith(root.resolve("src"));
