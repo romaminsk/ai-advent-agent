@@ -113,7 +113,15 @@ public final class DevAssistant {
         return tools;
     }
 
-    public static int index(PrintStream out, PrintStream err) {
+    public static int index(String[] args, PrintStream out, PrintStream err) {
+        Project project;
+        try {
+            project = resolveProject(parseArgs(args).project());
+        } catch (IllegalArgumentException | IllegalStateException e) {
+            err.println(e.getMessage());
+            return 1;
+        }
+        err.println(projectLine(project));
         String baseUrl = System.getenv("EMBEDDING_BASE_URL");
         String model = System.getenv("EMBEDDING_MODEL");
         if (baseUrl == null || model == null || baseUrl.isBlank() || model.isBlank()) {
@@ -121,7 +129,7 @@ public final class DevAssistant {
             return 1;
         }
         try {
-            Path root = projectRoot();
+            Path root = project.path();
             IndexStore store = new IndexStore(indexDirectory());
             Embedder embedder = new OpenAiEmbedder(baseUrl, model);
             IndexService.BuildReport report = new IndexService(store).build(STRATEGY, root.toString(),
@@ -145,37 +153,133 @@ public final class DevAssistant {
     }
 
     public static int help(String[] args, PrintStream out, PrintStream err) {
-        String question = String.join(" ", args).strip();
-        if (question.isEmpty()) {
-            out.println("Ассистент разработчика: отвечает по README и docs/ проекта и по данным Git.");
-            out.println("Сначала соберите индекс: ai-agent index");
-            out.println("Примеры: ai-agent help \"Какая у проекта структура?\"");
-            out.println("         ai-agent help \"В какой я сейчас ветке?\"");
-            out.println("         ai-agent help \"Какие файлы изменены?\"");
-            return 0;
-        }
-        if (isBranchOnly(question)) {
-            try (GitSession git = new GitSession(projectRoot(), System.getProperty("java.class.path"))) {
-                return branchAnswer(git, out, err);
+        try {
+            Args parsed = parseArgs(args);
+            String question = String.join(" ", parsed.rest()).strip();
+            if (question.isEmpty()) {
+                out.println("Ассистент разработчика: отвечает по README и docs/ проекта и по данным Git.");
+                out.println("Сначала соберите индекс: ai-agent index");
+                out.println("Примеры: ai-agent help \"Какая у проекта структура?\"");
+                out.println("         ai-agent help \"В какой я сейчас ветке?\"");
+                out.println("         ai-agent help \"Какие файлы изменены?\"");
+                return 0;
             }
-        }
-        try (Session session = Session.open()) {
-            return session.ask(question, out, err);
-        } catch (IllegalStateException e) {
+            Project project = resolveProject(parsed.project());
+            err.println(projectLine(project));
+            if (isBranchOnly(question)) {
+                try (GitSession git = new GitSession(project.path(), System.getProperty("java.class.path"))) {
+                    return branchAnswer(git, out, err);
+                }
+            }
+            try (Session session = Session.open(project.path())) {
+                return session.ask(question, out, err);
+            }
+        } catch (IllegalArgumentException | IllegalStateException e) {
             err.println(e.getMessage());
             return 1;
         }
     }
 
     /** Интерактивный режим: «Вопрос ›», выход по /exit, /quit или Ctrl+D; сессия (индекс, MCP) одна на все вопросы. */
-    public static int chat(BufferedReader in, PrintStream out, PrintStream err) {
-        try (Session session = Session.open()) {
-            runChat(in, out, question -> session.ask(question, out, err));
-            return 0;
-        } catch (IllegalStateException | IOException e) {
+    public static int chat(String[] args, BufferedReader in, PrintStream out, PrintStream err) {
+        try {
+            Project project = resolveProject(parseArgs(args).project());
+            err.println(projectLine(project));
+            try (Session session = Session.open(project.path())) {
+                runChat(in, out, question -> session.ask(question, out, err));
+                return 0;
+            }
+        } catch (IllegalArgumentException | IllegalStateException | IOException e) {
             err.println(e.getMessage());
             return 1;
         }
+    }
+
+    /** Аргументы команды: --project <путь> (или --project=<путь>) в любой позиции; остальное — вопрос. */
+    public record Args(String project, List<String> rest) {
+    }
+
+    public static Args parseArgs(String[] args) {
+        String project = null;
+        List<String> rest = new ArrayList<>();
+        for (int i = 0; i < args.length; i++) {
+            String arg = args[i];
+            if (arg.equals("--project")) {
+                if (i + 1 >= args.length || args[i + 1].isBlank()) {
+                    throw new IllegalArgumentException("Ошибка: после --project нужен путь к папке проекта.");
+                }
+                project = args[++i];
+            } else if (arg.startsWith("--project=")) {
+                String value = arg.substring("--project=".length());
+                if (value.isBlank()) {
+                    throw new IllegalArgumentException("Ошибка: после --project= нужен путь к папке проекта.");
+                }
+                project = value;
+            } else {
+                rest.add(arg);
+            }
+        }
+        return new Args(project, rest);
+    }
+
+    /** Проект: путь к git-репозиторию и источник пути (--project, PROJECT_DIR или текущая папка). */
+    public record Project(Path path, String source) {
+    }
+
+    public static Project resolveProject(String projectArg) {
+        return resolveProject(projectArg, System.getenv("PROJECT_DIR"),
+                Path.of("").toAbsolutePath().normalize());
+    }
+
+    /** Приоритет: --project, затем PROJECT_DIR (пустое значение игнорируется), затем текущая папка. */
+    public static Project resolveProject(String projectArg, String envValue, Path cwd) {
+        String raw;
+        String source;
+        if (projectArg != null) {
+            raw = projectArg;
+            source = "--project";
+        } else if (envValue != null && !envValue.isBlank()) {
+            raw = envValue.strip();
+            source = "PROJECT_DIR";
+        } else {
+            raw = cwd.toString();
+            source = "текущая папка";
+        }
+        Path path;
+        try {
+            path = normalizePath(raw, cwd);
+        } catch (IOException | RuntimeException e) {
+            throw new IllegalStateException("Ошибка: папка проекта не найдена: " + raw + " (источник: " + source + ")");
+        }
+        if (!Files.isDirectory(path)) {
+            throw new IllegalStateException("Ошибка: папка проекта не найдена: " + raw + " (источник: " + source + ")");
+        }
+        try {
+            GitReadTools.repositoryRoot(path);
+        } catch (IOException | InterruptedException e) {
+            throw new IllegalStateException("Ошибка: папка проекта не является Git-репозиторием: " + path
+                    + " (источник: " + source + ")");
+        }
+        return new Project(path, source);
+    }
+
+    /** «~», относительные пути и симлинки приводятся к настоящему абсолютному пути. */
+    public static Path normalizePath(String raw, Path cwd) throws IOException {
+        String expanded = raw;
+        if (raw.equals("~")) {
+            expanded = System.getProperty("user.home");
+        } else if (raw.startsWith("~/")) {
+            expanded = System.getProperty("user.home") + raw.substring(1);
+        }
+        Path path = Path.of(expanded);
+        if (!path.isAbsolute()) {
+            path = cwd.resolve(path);
+        }
+        return path.normalize().toRealPath();
+    }
+
+    static String projectLine(Project project) {
+        return "Проект: " + project.path() + " (источник: " + project.source() + ")";
     }
 
     public static void runChat(BufferedReader in, PrintStream out, Consumer<String> ask) throws IOException {
@@ -246,7 +350,7 @@ public final class DevAssistant {
             this.git = git;
         }
 
-        static Session open() {
+        static Session open(Path root) {
             IndexStore store = new IndexStore(indexDirectory());
             if (!store.exists(STRATEGY)) {
                 throw new IllegalStateException("Индекс не найден. Соберите его командой: ai-agent index");
@@ -285,7 +389,7 @@ public final class DevAssistant {
                             return agent.statelessRagCall(system, user, maxOutputTokens);
                         }
                     }, settings, null, LLM_TIMEOUT_SECONDS);
-            return new Session(service, new GitSession(projectRoot(), System.getProperty("java.class.path")));
+            return new Session(service, new GitSession(root, System.getProperty("java.class.path")));
         }
 
         int ask(String question, PrintStream out, PrintStream err) {
@@ -508,12 +612,4 @@ public final class DevAssistant {
         return new LlmAgent(Config.fromEnv(), ModelSettings.fromEnv(), store);
     }
 
-    private static Path projectRoot() {
-        Path cwd = Path.of("").toAbsolutePath().normalize();
-        try {
-            return GitReadTools.repositoryRoot(cwd);
-        } catch (Exception e) {
-            return cwd;
-        }
-    }
 }

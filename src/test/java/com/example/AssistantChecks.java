@@ -31,6 +31,7 @@ final class AssistantChecks extends SelfTestSupport {
         checkMasking();
         checkDocsThreshold();
         checkBranchAndChat();
+        checkProjectPath();
         Path repo = checkGitTools();
         checkAnswers();
         checkMcpRoundTrip(repo);
@@ -261,6 +262,74 @@ final class AssistantChecks extends SelfTestSupport {
         expect("ASSIST-13 недоступный MCP: понятная ошибка на русском, exit != 0, без стектрейса",
                 failCode != 0 && failOut.size() == 0
                         && failErr.toString(StandardCharsets.UTF_8).startsWith("Не удалось определить ветку"));
+    }
+
+    static void checkProjectPath() throws Exception {
+        Path repoA = Files.createDirectory(baseTempDir.resolve("proj-a"));
+        Path repoB = Files.createDirectory(baseTempDir.resolve("proj-b"));
+        Path repoCwd = Files.createDirectory(baseTempDir.resolve("proj-cwd"));
+        for (Path repo : List.of(repoA, repoB, repoCwd)) {
+            runGit(repo, "init", "-q");
+        }
+        Path a = repoA.toRealPath();
+        Path b = repoB.toRealPath();
+        Path c = repoCwd.toRealPath();
+
+        DevAssistant.Project byArg = DevAssistant.resolveProject(repoA.toString(), repoB.toString(), repoCwd);
+        expect("ASSIST-14 приоритет: --project сильнее PROJECT_DIR и текущей папки",
+                byArg.path().equals(a) && byArg.source().equals("--project"));
+        DevAssistant.Project byEnv = DevAssistant.resolveProject(null, repoB.toString(), repoCwd);
+        expect("ASSIST-14 приоритет: PROJECT_DIR сильнее текущей папки",
+                byEnv.path().equals(b) && byEnv.source().equals("PROJECT_DIR"));
+        DevAssistant.Project byCwd = DevAssistant.resolveProject(null, null, repoCwd);
+        expect("ASSIST-14 приоритет: без --project и PROJECT_DIR берётся текущая папка",
+                byCwd.path().equals(c) && byCwd.source().equals("текущая папка"));
+        DevAssistant.Project blankEnv = DevAssistant.resolveProject(null, "   ", repoCwd);
+        expect("ASSIST-14 пустой PROJECT_DIR игнорируется", blankEnv.path().equals(c));
+
+        DevAssistant.Args after = DevAssistant.parseArgs(new String[]{"--project", "/x", "Вопрос", "а"});
+        DevAssistant.Args inside = DevAssistant.parseArgs(new String[]{"Вопрос", "--project=/y", "б"});
+        DevAssistant.Args tail = DevAssistant.parseArgs(new String[]{"a", "b", "--project", "/z"});
+        DevAssistant.Args none = DevAssistant.parseArgs(new String[]{"Вопрос"});
+        expect("ASSIST-15 разбор --project в начале, середине и конце; без него project = null",
+                "/x".equals(after.project()) && after.rest().equals(List.of("Вопрос", "а"))
+                        && "/y".equals(inside.project()) && inside.rest().equals(List.of("Вопрос", "б"))
+                        && "/z".equals(tail.project()) && tail.rest().equals(List.of("a", "b"))
+                        && none.project() == null);
+        boolean missingValue;
+        try {
+            DevAssistant.parseArgs(new String[]{"Вопрос", "--project"});
+            missingValue = false;
+        } catch (IllegalArgumentException e) {
+            missingValue = true;
+        }
+        expect("ASSIST-15 --project без значения — понятная ошибка", missingValue);
+
+        String home = System.getProperty("user.home");
+        expect("ASSIST-15 нормализация «~» и «~/»",
+                DevAssistant.normalizePath("~", repoCwd).equals(Path.of(home).toRealPath())
+                        && DevAssistant.normalizePath("~/", repoCwd).equals(Path.of(home).toRealPath()));
+        expect("ASSIST-15 относительный путь и «..» разрешаются от текущей папки",
+                DevAssistant.normalizePath("../proj-a", repoCwd).equals(a));
+
+        String missingMessage = "";
+        try {
+            DevAssistant.resolveProject(baseTempDir.resolve("no-such-project").toString(), null, repoCwd);
+        } catch (IllegalStateException e) {
+            missingMessage = e.getMessage();
+        }
+        expect("ASSIST-15 несуществующая папка: ошибка с путём и источником",
+                missingMessage.contains("папка проекта не найдена") && missingMessage.contains("(источник: --project)"));
+
+        Path plain = Files.createTempDirectory("aa-nogit-");
+        String nonGitMessage = "";
+        try {
+            DevAssistant.resolveProject(null, plain.toString(), repoCwd);
+        } catch (IllegalStateException e) {
+            nonGitMessage = e.getMessage();
+        }
+        expect("ASSIST-15 папка не из git: ошибка с путём и источником PROJECT_DIR",
+                nonGitMessage.contains("не является Git-репозиторием") && nonGitMessage.contains("(источник: PROJECT_DIR)"));
     }
 
     static void checkDocsThreshold() {

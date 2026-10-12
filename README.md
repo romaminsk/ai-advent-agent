@@ -380,6 +380,9 @@ ai-agent --mcp-server git-monitor
 - `ai-agent chat-help` — интерактивный режим: вопросы вводятся после «Вопрос ›», выход по
   `/exit`, `/quit` или Ctrl+D. `/help <вопрос>` и `<вопрос>` обрабатываются одинаково; индекс и MCP
   открываются один раз на сессию, история диалога не сохраняется.
+- Папка Git-проекта для `index`, `help` и `chat-help`: `--project <путь>` (в любой позиции), иначе
+  `PROJECT_DIR` из `.env` (install-cli.sh дописывает его, если строки нет), иначе текущая папка.
+  Источник пути печатается в stderr строкой «Проект: … (источник: …)».
 - `ai-agent mcp-git [--repo-root <путь>]` — MCP stdio-сервер (только чтение). Инструменты:
   `git_branch` (ветка или короткий хеш при detached HEAD), `git_status` (`git status --short`),
   `git_diff` (статистика и diff до 8 КБ, параметр `staged`; строки с KEY/TOKEN/SECRET/PASSWORD
