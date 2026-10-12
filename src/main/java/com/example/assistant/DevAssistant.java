@@ -22,6 +22,8 @@ import io.modelcontextprotocol.client.transport.StdioClientTransport;
 import io.modelcontextprotocol.json.jackson3.JacksonMcpJsonMapperSupplier;
 import io.modelcontextprotocol.spec.McpSchema;
 
+import java.io.BufferedReader;
+import java.io.IOException;
 import java.io.PrintStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -33,6 +35,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Consumer;
 import java.util.regex.Pattern;
 
 /** Ассистент разработчика: индекс документации, справка с цитатами и данные Git через MCP. */
@@ -63,6 +66,8 @@ public final class DevAssistant {
     private static final Pattern BRANCH_QUESTION = Pattern.compile("ветк|branch");
     private static final Pattern CHANGE_QUESTION = Pattern.compile("измен|статус|diff|коммит|правк");
     private static final Pattern FILES_QUESTION = Pattern.compile("файл|структур|папк|модул|где лежит");
+    private static final Pattern OTHER_TOPIC = Pattern.compile(
+            "файл|diff|структур|документ|readme|docs|папк|модул|где лежит|измен|статус|коммит|правк");
 
     private DevAssistant() {
     }
@@ -149,21 +154,122 @@ public final class DevAssistant {
             out.println("         ai-agent help \"Какие файлы изменены?\"");
             return 0;
         }
+        if (isBranchOnly(question)) {
+            try (GitSession git = new GitSession(projectRoot(), System.getProperty("java.class.path"))) {
+                return branchAnswer(git, out, err);
+            }
+        }
+        try (Session session = Session.open()) {
+            return session.ask(question, out, err);
+        } catch (IllegalStateException e) {
+            err.println(e.getMessage());
+            return 1;
+        }
+    }
+
+    /** Интерактивный режим: «Вопрос ›», выход по /exit, /quit или Ctrl+D; сессия (индекс, MCP) одна на все вопросы. */
+    public static int chat(BufferedReader in, PrintStream out, PrintStream err) {
+        try (Session session = Session.open()) {
+            runChat(in, out, question -> session.ask(question, out, err));
+            return 0;
+        } catch (IllegalStateException | IOException e) {
+            err.println(e.getMessage());
+            return 1;
+        }
+    }
+
+    public static void runChat(BufferedReader in, PrintStream out, Consumer<String> ask) throws IOException {
+        while (true) {
+            out.print("Вопрос › ");
+            out.flush();
+            String line = in.readLine();
+            if (line == null) {
+                out.println();
+                return;
+            }
+            String text = line.strip();
+            if (isExit(text)) {
+                return;
+            }
+            String question = questionOf(text);
+            if (!question.isEmpty()) {
+                ask.accept(question);
+            }
+        }
+    }
+
+    public static boolean isExit(String line) {
+        return line.equalsIgnoreCase("/exit") || line.equalsIgnoreCase("/quit");
+    }
+
+    /** «/help X» и «X» дают один и тот же вопрос; «/help» без текста — пустой вопрос. */
+    public static String questionOf(String line) {
+        String text = line.strip();
+        if (text.equals("/help")) {
+            return "";
+        }
+        if (text.startsWith("/help ") || text.startsWith("/help\t")) {
+            return text.substring("/help".length()).strip();
+        }
+        return text;
+    }
+
+    /** Вопрос только про ветку: есть слово про ветку и нет слов про файлы, diff, структуру или документацию. */
+    public static boolean isBranchOnly(String question) {
+        String lower = question.toLowerCase(Locale.ROOT);
+        return BRANCH_QUESTION.matcher(lower).find() && !OTHER_TOPIC.matcher(lower).find();
+    }
+
+    /** Ответ одной строкой из MCP git_branch: без RAG, LLM и цитат. */
+    public static int branchAnswer(McpSource git, PrintStream out, PrintStream err) {
         try {
+            String value = git.call(List.of(GitToolsMcpServer.BRANCH)).get(GitToolsMcpServer.BRANCH);
+            if (value == null || value.startsWith("ошибка:")) {
+                throw new IllegalStateException();
+            }
+            out.println("Текущая git-ветка: " + value.replaceFirst("^ветка: ", ""));
+            return 0;
+        } catch (Exception e) {
+            err.println("Не удалось определить ветку: MCP-сервер git недоступен или вернул ошибку. "
+                    + "Проверьте, что команда запущена внутри Git-репозитория.");
+            return 1;
+        }
+    }
+
+    /** Сеанс ассистента: индекс, LLM и один MCP-клиент на весь сеанс. */
+    static final class Session implements AutoCloseable {
+        private final RagService service;
+        private final GitSession git;
+
+        private Session(RagService service, GitSession git) {
+            this.service = service;
+            this.git = git;
+        }
+
+        static Session open() {
             IndexStore store = new IndexStore(indexDirectory());
             if (!store.exists(STRATEGY)) {
-                err.println("Индекс не найден. Соберите его командой: ai-agent index");
-                return 1;
+                throw new IllegalStateException("Индекс не найден. Соберите его командой: ai-agent index");
             }
             String baseUrl = System.getenv("EMBEDDING_BASE_URL");
             String model = System.getenv("EMBEDDING_MODEL");
             if (baseUrl == null || model == null || baseUrl.isBlank() || model.isBlank()) {
-                err.println("Ошибка: не заданы EMBEDDING_BASE_URL и EMBEDDING_MODEL (добавьте их в .env).");
-                return 1;
+                throw new IllegalStateException(
+                        "Ошибка: не заданы EMBEDDING_BASE_URL и EMBEDDING_MODEL (добавьте их в .env).");
             }
-            RagSettings settings = RagSettingsStore.defaultStore().load().settings().withRewrite(false)
-                    .withMinScore(DOCS_IDK_THRESHOLD).withIdkThreshold(DOCS_IDK_THRESHOLD);
-            LlmAgent agent = newAgent();
+            RagSettings settings;
+            try {
+                settings = RagSettingsStore.defaultStore().load().settings().withRewrite(false)
+                        .withMinScore(DOCS_IDK_THRESHOLD).withIdkThreshold(DOCS_IDK_THRESHOLD);
+            } catch (IOException e) {
+                throw new IllegalStateException("Не удалось прочитать настройки RAG: " + e.getMessage(), e);
+            }
+            LlmAgent agent;
+            try {
+                agent = newAgent();
+            } catch (Exception e) {
+                throw new IllegalStateException("Не удалось создать LLM-агент: " + e.getMessage(), e);
+            }
             RagService service = new RagService(
                     new RagRetriever(store, new OpenAiEmbedder(baseUrl, model), STRATEGY, TOP_K),
                     new RagPromptBuilder(), SYSTEM_PROMPT,
@@ -179,24 +285,37 @@ public final class DevAssistant {
                             return agent.statelessRagCall(system, user, maxOutputTokens);
                         }
                     }, settings, null, LLM_TIMEOUT_SECONDS);
-            Path root = projectRoot();
-            long started = System.nanoTime();
-            Answer answer = answer(question, service, gitSource(root));
-            out.println(answer.text());
-            err.println("диагностика: повторов LLM=" + answer.retries() + ", время="
-                    + (System.nanoTime() - started) / 1_000_000 + " мс");
-            if (!answer.sources().isEmpty()) {
-                out.println();
-                out.println("Источники:");
-                for (int i = 0; i < answer.sources().size(); i++) {
-                    RagRetriever.Chunk chunk = answer.sources().get(i);
-                    out.println("[" + (i + 1) + "] " + chunk.source() + " › " + chunk.section());
-                }
+            return new Session(service, new GitSession(projectRoot(), System.getProperty("java.class.path")));
+        }
+
+        int ask(String question, PrintStream out, PrintStream err) {
+            if (isBranchOnly(question)) {
+                return branchAnswer(git, out, err);
             }
-            return 0;
-        } catch (Exception e) {
-            err.println("Ошибка ассистента: " + e.getMessage());
-            return 1;
+            try {
+                long started = System.nanoTime();
+                Answer answer = answer(question, service, git);
+                out.println(answer.text());
+                err.println("диагностика: повторов LLM=" + answer.retries() + ", время="
+                        + (System.nanoTime() - started) / 1_000_000 + " мс");
+                if (!answer.sources().isEmpty()) {
+                    out.println();
+                    out.println("Источники:");
+                    for (int i = 0; i < answer.sources().size(); i++) {
+                        RagRetriever.Chunk chunk = answer.sources().get(i);
+                        out.println("[" + (i + 1) + "] " + chunk.source() + " › " + chunk.section());
+                    }
+                }
+                return 0;
+            } catch (Exception e) {
+                err.println("Ошибка ассистента: " + e.getMessage());
+                return 1;
+            }
+        }
+
+        @Override
+        public void close() {
+            git.close();
         }
     }
 
@@ -314,17 +433,30 @@ public final class DevAssistant {
 
     public static McpSource gitSource(Path root, String classpath) {
         return tools -> {
-            Map<String, String> data = new LinkedHashMap<>();
-            Path java = Path.of(System.getProperty("java.home"), "bin", "java");
-            ServerParameters parameters = ServerParameters.builder(java.toString())
-                    .args(List.of("-cp", classpath, "com.example.Main",
-                            "mcp-git", GitToolsMcpServer.REPO_ROOT_ARGUMENT, root.toString()))
-                    .build();
-            StdioClientTransport transport = new StdioClientTransport(parameters,
-                    new JacksonMcpJsonMapperSupplier().get());
-            try (McpSyncClient client = McpClient.sync(transport)
-                    .initializationTimeout(MCP_TIMEOUT).requestTimeout(MCP_TIMEOUT).build()) {
-                client.initialize();
+            try (GitSession session = new GitSession(root, classpath)) {
+                return session.call(tools);
+            }
+        };
+    }
+
+    /** MCP-клиент «ai-agent mcp-git»: процесс открывается при первом вызове и закрывается в close(). */
+    public static final class GitSession implements McpSource, AutoCloseable {
+        private final Path root;
+        private final String classpath;
+        private McpSyncClient client;
+
+        public GitSession(Path root, String classpath) {
+            this.root = root;
+            this.classpath = classpath;
+        }
+
+        @Override
+        public Map<String, String> call(List<String> tools) throws Exception {
+            try {
+                if (client == null) {
+                    client = open();
+                }
+                Map<String, String> data = new LinkedHashMap<>();
                 for (String tool : tools) {
                     McpSchema.CallToolResult result = client.callTool(McpSchema.CallToolRequest.builder()
                             .name(tool).arguments(Map.of()).build());
@@ -335,9 +467,39 @@ public final class DevAssistant {
                             .reduce((a, b) -> a + "\n" + b).orElse("");
                     data.put(tool, Boolean.TRUE.equals(result.isError()) ? "ошибка: " + text : text);
                 }
+                return data;
+            } catch (Exception e) {
+                close();
+                throw e;
             }
-            return data;
-        };
+        }
+
+        private McpSyncClient open() {
+            Path java = Path.of(System.getProperty("java.home"), "bin", "java");
+            ServerParameters parameters = ServerParameters.builder(java.toString())
+                    .args(List.of("-cp", classpath, "com.example.Main",
+                            "mcp-git", GitToolsMcpServer.REPO_ROOT_ARGUMENT, root.toString()))
+                    .build();
+            StdioClientTransport transport = new StdioClientTransport(parameters,
+                    new JacksonMcpJsonMapperSupplier().get());
+            McpSyncClient opened = McpClient.sync(transport)
+                    .initializationTimeout(MCP_TIMEOUT).requestTimeout(MCP_TIMEOUT).build();
+            try {
+                opened.initialize();
+            } catch (RuntimeException e) {
+                opened.close();
+                throw e;
+            }
+            return opened;
+        }
+
+        @Override
+        public void close() {
+            if (client != null) {
+                client.close();
+                client = null;
+            }
+        }
     }
 
     private static LlmAgent newAgent() throws Exception {
