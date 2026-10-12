@@ -365,6 +365,22 @@ ai-agent --mcp-server git-monitor
 Внешние MCP-клиенты запускают этот же
 сервер напрямую: `ai-agent --mcp-server pipeline --results-dir <каталог>`.
 
+## Ассистент разработчика
+
+- `ai-agent index` — индекс документации: `README*` и `docs/**/*.md|*.txt` (файлы до 200 КБ;
+  `.env*`, `.idea/`, `artifacts/`, `.git/`, `target/`, `src/test/` исключаются). Индекс хранится в
+  `~/.ai-advent-agent/dev-assistant-index/`, отдельно от индекса обычного RAG. Нужны
+  `EMBEDDING_BASE_URL` и `EMBEDDING_MODEL` из `.env`.
+- `ai-agent help "вопрос"` — ответ по топ-5 фрагментам с цитатами `[n]` и списком источников.
+  Если top-1 ниже `idkThreshold` из `~/.ai-advent-agent/rag-settings.json`, выводится
+  «В документации проекта этого нет.». Вопросы про ветку, статус, файлы и diff отвечаются
+  данными Git через MCP. Без аргумента выводится краткая справка.
+- `ai-agent mcp-git [--repo-root <путь>]` — MCP stdio-сервер (только чтение). Инструменты:
+  `git_branch` (ветка или короткий хеш при detached HEAD), `git_status` (`git status --short`),
+  `git_diff` (статистика и diff до 8 КБ, параметр `staged`; строки с KEY/TOKEN/SECRET/PASSWORD
+  заменяются на «[скрыто]»), `list_files` (`git ls-files`, префикс, до 200 строк).
+  Git вызывается без shell, пути не выходят за корень репозитория, `.env` не показывается.
+
 ## Интерфейс терминала
 
 Компактный старт — две строки до приглашения:
