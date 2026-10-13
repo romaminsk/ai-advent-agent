@@ -1,0 +1,103 @@
+name: ai-review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Проверка доступа к секретам
+        id: gate
+        env:
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+          LLM_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          if [ "$IS_FORK" = "true" ] || [ -z "$LLM_KEY" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "## AI-ревью PR"
+              echo ""
+              if [ "$IS_FORK" = "true" ]; then
+                echo "Пропущено: PR из fork, секреты недоступны."
+              else
+                echo "Пропущено: не задан секрет LLM_API_KEY."
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Java 21
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Сборка
+        if: steps.gate.outputs.run == 'true'
+        run: mvn -q -DskipTests package
+
+      - name: Кэш индекса ревью
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/review-index
+          key: review-index-${{ runner.os }}-${{ github.event.pull_request.head.sha }}
+          restore-keys: review-index-${{ runner.os }}-
+
+      - name: AI-ревью
+        if: steps.gate.outputs.run == 'true'
+        id: review
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_API_URL: ${{ vars.LLM_API_URL }}
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
+          LLM_CONTEXT_WINDOW_TOKENS: ${{ vars.LLM_CONTEXT_WINDOW_TOKENS }}
+          EMBEDDING_BASE_URL: ${{ vars.EMBEDDING_BASE_URL }}
+          EMBEDDING_MODEL: ${{ vars.EMBEDDING_MODEL }}
+          EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
+          REVIEW_INDEX_DIR: ${{ runner.temp }}/review-index
+        run: |
+          set +e
+          java -jar target/ai-advent-agent-1.0-SNAPSHOT.jar review --base origin/${{ github.base_ref }} --head HEAD --out review.md 2> review.err
+          code=$?
+          cat review.err >&2
+          if [ ! -s review.md ]; then
+            reason=$(grep -h 'Авторевью недоступно' review.err | tail -n 1 | sed 's/^Авторевью недоступно: //')
+            if [ -z "$reason" ]; then
+              reason="внутренняя ошибка команды review (код $code), подробности в логе job"
+            fi
+            printf '%s\n## AI-ревью PR\n\nАвторевью недоступно: %s\n' '<!-- ai-review -->' "$reason" > review.md
+          fi
+          cat review.md >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - name: Публикация комментария
+        if: steps.gate.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          comment_id=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+            -q '.[] | select(.body | contains("<!-- ai-review -->")) | .id' | head -n 1)
+          if [ -n "$comment_id" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$comment_id" -F body=@review.md > /dev/null
+          else
+            gh pr comment "$PR_NUMBER" --body-file review.md
+          fi
