@@ -30,6 +30,7 @@ public final class OpenAiEmbedder implements Embedder {
     private final HttpClient http;
     private final Duration timeout;
     private final int batchLimit;
+    private final String apiKey;
 
     public OpenAiEmbedder(String baseUrl, String model) {
         this(baseUrl, model, REQUEST_TIMEOUT, BATCH_LIMIT);
@@ -37,11 +38,25 @@ public final class OpenAiEmbedder implements Embedder {
 
     /** Полный конструктор для тестов (таймаут и лимит батча подменяются). */
     public OpenAiEmbedder(String baseUrl, String model, Duration timeout, int batchLimit) {
+        this(baseUrl, model, timeout, batchLimit, null, false);
+    }
+
+    /**
+     * Эмбеддер для ревью PR: допускает http и https, передаёт EMBEDDING_API_KEY
+     * как Bearer, если ключ задан (облачный API). Для help/index не используется.
+     */
+    public static OpenAiEmbedder forReview(String baseUrl, String model, String apiKey) {
+        return new OpenAiEmbedder(baseUrl, model, REQUEST_TIMEOUT, BATCH_LIMIT, apiKey, true);
+    }
+
+    private OpenAiEmbedder(String baseUrl, String model, Duration timeout, int batchLimit,
+                           String apiKey, boolean allowHttps) {
         String clean = baseUrl == null ? "" : baseUrl.trim();
         if (clean.endsWith("/")) {
             clean = clean.substring(0, clean.length() - 1);
         }
-        if (clean.isBlank() || !clean.startsWith("http://")) {
+        if (clean.isBlank() || !(clean.startsWith("http://")
+                || (allowHttps && clean.startsWith("https://")))) {
             throw new IllegalArgumentException(
                     "EMBEDDING_BASE_URL должен начинаться с http:// или https://");
         }
@@ -55,6 +70,7 @@ public final class OpenAiEmbedder implements Embedder {
         this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(15)).build();
         this.timeout = timeout;
         this.batchLimit = batchLimit;
+        this.apiKey = apiKey == null || apiKey.isBlank() ? null : apiKey.strip();
     }
 
     @Override
@@ -79,9 +95,13 @@ public final class OpenAiEmbedder implements Embedder {
                     .toString());
         }
         body.append("]}");
-        HttpRequest request = HttpRequest.newBuilder(URI.create(endpoint))
+        HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(endpoint))
                 .timeout(timeout)
-                .header("Content-Type", "application/json")
+                .header("Content-Type", "application/json");
+        if (apiKey != null) {
+            builder.header("Authorization", "Bearer " + apiKey);
+        }
+        HttpRequest request = builder
                 .POST(HttpRequest.BodyPublishers.ofString(body.toString(), StandardCharsets.UTF_8))
                 .build();
         int attempt = 0;

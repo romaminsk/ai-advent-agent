@@ -73,6 +73,12 @@ public final class Main {
             if (exitCode != 0) System.exit(exitCode);
             return;
         }
+        if (args.length >= 1 && "review".equals(args[0])) {
+            int exitCode = com.example.review.ReviewCommand.run(
+                    java.util.Arrays.copyOfRange(args, 1, args.length), System.out, System.err);
+            if (exitCode != 0) System.exit(exitCode);
+            return;
+        }
         if (args.length >= 1 && "chat-help".equals(args[0])) {
             int exitCode = com.example.assistant.DevAssistant.chat(
                     java.util.Arrays.copyOfRange(args, 1, args.length),
@@ -5284,6 +5290,7 @@ public final class Main {
         out.println("  --project <путь> — папка Git-проекта для index, help и chat-help (иначе PROJECT_DIR из .env,");
         out.println("                     иначе текущая папка)");
         out.println("  mcp-git   — MCP stdio-сервер Git (только чтение)");
+        out.println("  review    — AI-ревью изменений между --base и --head (--out, --max-diff; см. README)");
         out.println("  --help    — эта справка");
         out.println("  --plain   — упрощённый режим: без цветов, спиннера и сложного редактирования");
         out.println();
