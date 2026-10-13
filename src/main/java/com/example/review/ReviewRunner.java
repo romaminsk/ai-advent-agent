@@ -40,9 +40,19 @@ public final class ReviewRunner {
     }
 
     /** Модель в порядке попыток: режим (облако|локально), имя, вызов и ключ (вычищается из причин сбоя). */
-    public record Model(String mode, String name, Llm llm, String secret) {
+    public record Model(String mode, String name, Llm llm, String secret, long timeoutSeconds) {
         public Model(String mode, String name, Llm llm) {
-            this(mode, name, llm, null);
+            this(mode, name, llm, null, LLM_TIMEOUT_SECONDS);
+        }
+
+        public Model(String mode, String name, Llm llm, String secret) {
+            this(mode, name, llm, secret, LLM_TIMEOUT_SECONDS);
+        }
+
+        /** Лимит ответа: локальной модели — не больше ReviewLlmConfig.LOCAL_OUTPUT_TOKENS. */
+        public int maxOutput(int requested) {
+            return ReviewLlmConfig.MODE_LOCAL.equals(mode)
+                    ? Math.min(requested, ReviewLlmConfig.LOCAL_OUTPUT_TOKENS) : requested;
         }
     }
 
@@ -190,7 +200,8 @@ public final class ReviewRunner {
             for (int attempt = 0; attempt <= MAX_RETRIES && answer == null; attempt++) {
                 attempts++;
                 try {
-                    String text = complete(model.llm(), ReviewPrompt.SYSTEM, user, maxOutput);
+                    String text = complete(model.llm(), ReviewPrompt.SYSTEM, user,
+                            model.maxOutput(maxOutput), model.timeoutSeconds());
                     if (ReviewReport.hasSections(text)) {
                         answer = text;
                         used = model;
@@ -220,13 +231,14 @@ public final class ReviewRunner {
                 retrieval.chunks().size(), budget, diffChars, elapsed(started), entries);
     }
 
-    private static String complete(Llm llm, String system, String user, int maxOutput) throws Exception {
+    private static String complete(Llm llm, String system, String user, int maxOutput,
+                                   long timeoutSeconds) throws Exception {
         Future<String> future = LLM_POOL.submit(() -> llm.complete(system, user, maxOutput));
         try {
-            return future.get(LLM_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            return future.get(timeoutSeconds, TimeUnit.SECONDS);
         } catch (TimeoutException e) {
             future.cancel(true);
-            throw new IllegalStateException("таймаут LLM (" + LLM_TIMEOUT_SECONDS + " с)");
+            throw new IllegalStateException("таймаут LLM (" + timeoutSeconds + " с)");
         } catch (ExecutionException e) {
             if (e.getCause() instanceof Exception cause) {
                 throw cause;

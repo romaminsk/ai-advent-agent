@@ -63,7 +63,8 @@ public final class ReviewCommand {
         ReviewLlmConfig.Selection selection = ReviewLlmConfig.select(values);
         warnings.addAll(selection.warnings());
         warnings.forEach(warning -> err.println("Внимание: " + warning));
-        List<ReviewRunner.Model> models = models(selection.backends());
+        List<ReviewRunner.Model> models = models(selection.backends(),
+                ReviewLlmConfig.localTimeoutSeconds(values));
         ReviewRunner.Input input = new ReviewRunner.Input(options.base(), options.head(), patches,
                 selection.windowTokens(), options.maxDiff());
         ReviewRunner.Result result = ReviewRunner.run(input, models,
@@ -102,10 +103,13 @@ public final class ReviewCommand {
     }
 
     /** Модели в порядке попыток; ошибка конфигурации становится причиной сбоя, а не падением. */
-    static List<ReviewRunner.Model> models(List<ReviewLlmConfig.Backend> backends) {
+    static List<ReviewRunner.Model> models(List<ReviewLlmConfig.Backend> backends, long localTimeoutSeconds) {
         List<ReviewRunner.Model> models = new ArrayList<>();
         for (ReviewLlmConfig.Backend backend : backends) {
-            models.add(new ReviewRunner.Model(backend.mode(), backend.model(), llmFor(backend), backend.apiKey()));
+            boolean local = ReviewLlmConfig.MODE_LOCAL.equals(backend.mode());
+            long timeout = local ? localTimeoutSeconds : ReviewRunner.LLM_TIMEOUT_SECONDS;
+            models.add(new ReviewRunner.Model(backend.mode(), backend.model(), llmFor(backend),
+                    backend.apiKey(), timeout));
         }
         return models;
     }
