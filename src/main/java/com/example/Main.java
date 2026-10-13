@@ -76,8 +76,7 @@ public final class Main {
         if (args.length >= 1 && "review".equals(args[0])) {
             int exitCode = com.example.review.ReviewCommand.run(
                     java.util.Arrays.copyOfRange(args, 1, args.length), System.out, System.err);
-            if (exitCode != 0) System.exit(exitCode);
-            return;
+            System.exit(exitCode);
         }
         if (args.length >= 1 && "chat-help".equals(args[0])) {
             int exitCode = com.example.assistant.DevAssistant.chat(

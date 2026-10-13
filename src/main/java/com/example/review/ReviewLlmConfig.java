@@ -24,11 +24,16 @@ public final class ReviewLlmConfig {
     public static final String LOCAL_URL = "http://localhost:11434/v1/chat/completions";
     public static final String LOCAL_DEFAULT_MODEL = "qwen2.5:3b-rag8k";
     public static final int LOCAL_DEFAULT_WINDOW = 8192;
+    /** Лимит ответа локальной модели (как у ollama-профиля проекта). */
+    public static final int LOCAL_OUTPUT_TOKENS = 1024;
+    /** Таймаут одной попытки локальной модели: CPU без GPU генерирует медленнее облака. */
+    public static final long LOCAL_DEFAULT_TIMEOUT_SECONDS = 300;
     /** Файл настроек по умолчанию (вне рабочей копии репозитория). */
     public static final String ENV_FILE_VARIABLE = "REVIEW_ENV_FILE";
 
     private static final Set<String> KEYS = Set.of("LLM_API_URL", "LLM_API_KEY", "LLM_MODEL",
             "LLM_CONTEXT_WINDOW_TOKENS", "REVIEW_LOCAL_MODEL", "REVIEW_LOCAL_CONTEXT_WINDOW_TOKENS",
+            "REVIEW_LOCAL_TIMEOUT_SECONDS",
             "EMBEDDING_BASE_URL", "EMBEDDING_MODEL");
     private static final Set<PosixFilePermission> OWNER_ONLY =
             EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE);
@@ -127,6 +132,12 @@ public final class ReviewLlmConfig {
         }
         backends.add(local);
         return new Selection(backends, window, warnings);
+    }
+
+    /** Таймаут попытки локальной модели: REVIEW_LOCAL_TIMEOUT_SECONDS или 300 с. */
+    public static long localTimeoutSeconds(Map<String, String> values) {
+        Integer configured = positive(values.get("REVIEW_LOCAL_TIMEOUT_SECONDS"));
+        return configured == null ? LOCAL_DEFAULT_TIMEOUT_SECONDS : configured;
     }
 
     /** Убирает значение ключа из текста ошибки (ключ может прийти в ответе сервера). */
