@@ -210,6 +210,12 @@ final class ReviewChecks extends SelfTestSupport {
         expect("REVIEW-7: облако выбрано при https и ключе, локальная модель остаётся откатом",
                 cloud.backends().size() == 2 && ReviewLlmConfig.MODE_CLOUD.equals(cloud.backends().get(0).mode())
                         && ReviewLlmConfig.MODE_LOCAL.equals(cloud.backends().get(1).mode()));
+        expect("REVIEW-7: локальная модель: таймаут 300 с по умолчанию и лимит ответа 1024",
+                ReviewLlmConfig.localTimeoutSeconds(Map.of()) == 300
+                        && ReviewLlmConfig.localTimeoutSeconds(Map.of("REVIEW_LOCAL_TIMEOUT_SECONDS", "120")) == 120
+                        && new ReviewRunner.Model(ReviewLlmConfig.MODE_LOCAL, "m", okLlm()).maxOutput(2048) == 1024
+                        && new ReviewRunner.Model(ReviewLlmConfig.MODE_CLOUD, "m", okLlm()).maxOutput(2048) == 2048
+                        && new ReviewRunner.Model(ReviewLlmConfig.MODE_CLOUD, "m", okLlm()).timeoutSeconds() == 60);
         expect("REVIEW-7: окно считается по минимуму облака и локальной модели",
                 cloud.windowTokens() == ReviewLlmConfig.LOCAL_DEFAULT_WINDOW);
         ReviewLlmConfig.Selection httpOnly = ReviewLlmConfig.select(Map.of(
