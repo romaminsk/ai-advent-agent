@@ -6,12 +6,16 @@ import com.example.review.ReviewPrompt;
 import com.example.review.ReviewReport;
 import com.example.review.ReviewRunner;
 
+import com.example.review.ReviewLlmConfig;
+
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -28,6 +32,9 @@ final class ReviewChecks extends SelfTestSupport {
         checkLlmFailure();
         checkSecretsMasked();
         checkCommentMarker();
+        checkModeSelection();
+        checkFallbackAndKeyHidden();
+        checkEnvFilePermissions();
     }
 
     private static void checkFilesAndSkips() throws Exception {
@@ -180,10 +187,89 @@ final class ReviewChecks extends SelfTestSupport {
                 workflow.contains("pull_request:") && !workflow.contains("pull_request_target"));
         expect("REVIEW-6: права и таймаут workflow",
                 workflow.contains("contents: read") && workflow.contains("pull-requests: write")
-                        && workflow.contains("timeout-minutes: 15"));
+                        && workflow.contains("timeout-minutes: 30"));
+        expect("REVIEW-6: fork-PR не запускаются на self-hosted раннере",
+                workflow.contains("if: github.event.pull_request.head.repo.full_name == github.repository"));
+        expect("REVIEW-6: workflow работает на self-hosted раннере без GitHub Secrets и Variables",
+                workflow.contains("runs-on: [self-hosted, linux]") && !workflow.contains("secrets.")
+                        && !workflow.contains("vars."));
         expect("REVIEW-6: сбой ревью не маскируется continue-on-error", !workflow.contains("continue-on-error"));
-        expect("REVIEW-6: кэш индекса ревью в Actions", workflow.contains("actions/cache@v4")
-                && workflow.contains("review-index"));
+        expect("REVIEW-6: индекс ревью постоянный на раннере", workflow.contains("REVIEW_INDEX_DIR=")
+                && !workflow.contains("actions/cache"));
+    }
+
+    private static void checkModeSelection() throws Exception {
+        ReviewLlmConfig.Selection local = ReviewLlmConfig.select(Map.of());
+        expect("REVIEW-7: без облачных переменных работает только локальная Ollama",
+                local.backends().size() == 1 && ReviewLlmConfig.MODE_LOCAL.equals(local.backends().get(0).mode())
+                        && local.backends().get(0).url().startsWith("http://localhost:11434"));
+        String key = "KEYTEST" + "12345678ABCDEF";
+        ReviewLlmConfig.Selection cloud = ReviewLlmConfig.select(Map.of(
+                "LLM_API_URL", "https://llm.example.com/v1/chat/completions",
+                "LLM_API_KEY", key, "LLM_MODEL", "cloud-model", "LLM_CONTEXT_WINDOW_TOKENS", "32768"));
+        expect("REVIEW-7: облако выбрано при https и ключе, локальная модель остаётся откатом",
+                cloud.backends().size() == 2 && ReviewLlmConfig.MODE_CLOUD.equals(cloud.backends().get(0).mode())
+                        && ReviewLlmConfig.MODE_LOCAL.equals(cloud.backends().get(1).mode()));
+        expect("REVIEW-7: окно считается по минимуму облака и локальной модели",
+                cloud.windowTokens() == ReviewLlmConfig.LOCAL_DEFAULT_WINDOW);
+        ReviewLlmConfig.Selection httpOnly = ReviewLlmConfig.select(Map.of(
+                "LLM_API_URL", "http://llm.example.com/v1", "LLM_API_KEY", key, "LLM_MODEL", "m"));
+        expect("REVIEW-7: http-адрес облака не выбирается, выдаётся предупреждение",
+                httpOnly.backends().size() == 1 && !httpOnly.warnings().isEmpty());
+        expect("REVIEW-7: ключ не попадает в описание режима",
+                !cloud.backends().get(0).toString().contains(key));
+    }
+
+    private static void checkFallbackAndKeyHidden() throws Exception {
+        String key = "KEYTEST" + "12345678ABCDEF";
+        List<GitDiff.FilePatch> patches = GitDiff.parse(synthetic("src/A.java", 3));
+        AtomicInteger cloudCalls = new AtomicInteger();
+        AtomicInteger localCalls = new AtomicInteger();
+        ReviewRunner.Llm cloudFails = (system, user, max) -> {
+            cloudCalls.incrementAndGet();
+            throw new IllegalStateException("таймаут сервера, ответ с ключом " + key);
+        };
+        ReviewRunner.Llm localOk = (system, user, max) -> {
+            localCalls.incrementAndGet();
+            return VALID_ANSWER;
+        };
+        ReviewRunner.Result result = ReviewRunner.run(new Input(patches, 32768).toRunnerInput(),
+                List.of(new ReviewRunner.Model(ReviewLlmConfig.MODE_CLOUD, "cloud-model",
+                                cloudFails, key),
+                        new ReviewRunner.Model(ReviewLlmConfig.MODE_LOCAL, "local-model", localOk)), null);
+        expect("REVIEW-8: сбой облака — три попытки в облаке, затем локальная модель",
+                cloudCalls.get() == 3 && localCalls.get() == 1 && result.unavailable() == null);
+        expect("REVIEW-8: отчёт указывает модель и режим локально и пометку о сбое облака",
+                result.markdown().contains("Модель: local-model, режим: локально.")
+                        && result.markdown().contains("Облако недоступно:"));
+        expect("REVIEW-8: ключ не попадает в отчёт даже из текста ошибки сервера",
+                !result.markdown().contains(key));
+        ReviewRunner.Result cloudOnly = ReviewRunner.run(new Input(patches, 32768).toRunnerInput(),
+                List.of(new ReviewRunner.Model(ReviewLlmConfig.MODE_CLOUD, "cloud-model", okLlm())), null);
+        expect("REVIEW-8: успешное облако — режим облако без пометки о сбое",
+                cloudOnly.markdown().contains("Модель: cloud-model, режим: облако.")
+                        && !cloudOnly.markdown().contains("Облако недоступно"));
+        expect("REVIEW-8: ключ замещается маркером при очистке текста",
+                ReviewLlmConfig.scrub("ошибка " + key, key).equals("ошибка [скрыто]"));
+    }
+
+    private static void checkEnvFilePermissions() throws Exception {
+        Path file = Files.createTempFile("review-env-", ".env");
+        Files.writeString(file, "LLM_API_URL=https://llm.example.com/v1/chat/completions\n"
+                + "LLM_API_KEY=\"KEYTEST12345678ABCDEF\"\nUNKNOWN_KEY=1\n", StandardCharsets.UTF_8);
+        List<String> warnings = new ArrayList<>();
+        Files.setPosixFilePermissions(file, PosixFilePermissions.fromString("rw-r--r--"));
+        Map<String, String> loose = ReviewLlmConfig.readEnvFile(file, warnings);
+        expect("REVIEW-9: файл .env не в режиме 600 не читается, есть предупреждение",
+                loose.isEmpty() && !warnings.isEmpty());
+        Files.setPosixFilePermissions(file, PosixFilePermissions.fromString("rw-------"));
+        Map<String, String> strict = ReviewLlmConfig.readEnvFile(file, warnings);
+        expect("REVIEW-9: файл .env в режиме 600 читается, неизвестные ключи отбрасываются",
+                strict.get("LLM_API_KEY").equals("KEYTEST12345678ABCDEF") && !strict.containsKey("UNKNOWN_KEY"));
+        Map<String, String> merged = ReviewLlmConfig.merged(Map.of("LLM_API_KEY", "fromEnv" + "VALUE123"), strict);
+        expect("REVIEW-9: переменная окружения важнее файла",
+                merged.get("LLM_API_KEY").equals("fromEnvVALUE123"));
+        Files.deleteIfExists(file);
     }
 
     /** Удобная обёртка над параметрами запуска для проверок. */
