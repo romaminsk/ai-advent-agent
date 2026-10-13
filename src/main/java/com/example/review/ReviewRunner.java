@@ -18,6 +18,8 @@ public final class ReviewRunner {
 
     public static final int MAX_RETRIES = 2;
     public static final long LLM_TIMEOUT_SECONDS = 60;
+    /** Общий потолок всего шага ревью (индекс, RAG и все попытки LLM). */
+    public static final long STEP_LIMIT_SECONDS = 600;
     /** Оценка символов на токен: консервативно для смеси русского текста и кода. */
     static final int CHARS_PER_TOKEN = 2;
     /** Запас от окна контекста на служебные накладные расходы. */
@@ -47,6 +49,11 @@ public final class ReviewRunner {
 
         public Model(String mode, String name, Llm llm, String secret) {
             this(mode, name, llm, secret, LLM_TIMEOUT_SECONDS);
+        }
+
+        /** Попыток на модель: облако — 1 + повторы, локальная запасная — одна (CPU медленный). */
+        public int attempts() {
+            return ReviewLlmConfig.MODE_LOCAL.equals(mode) ? 1 : MAX_RETRIES + 1;
         }
 
         /** Лимит ответа: локальной модели — не больше ReviewLlmConfig.LOCAL_OUTPUT_TOKENS. */
@@ -196,12 +203,18 @@ public final class ReviewRunner {
         String reason = null;
         String fallbackNote = null;
         int attempts = 0;
+        long deadline = started + STEP_LIMIT_SECONDS * 1_000_000_000L;
         for (Model model : models) {
-            for (int attempt = 0; attempt <= MAX_RETRIES && answer == null; attempt++) {
+            for (int attempt = 0; attempt < model.attempts() && answer == null; attempt++) {
+                long remaining = (deadline - System.nanoTime()) / 1_000_000_000L;
+                if (remaining < 1) {
+                    reason = "общий лимит шага ревью (" + STEP_LIMIT_SECONDS / 60 + " мин) исчерпан";
+                    break;
+                }
                 attempts++;
                 try {
                     String text = complete(model.llm(), ReviewPrompt.SYSTEM, user,
-                            model.maxOutput(maxOutput), model.timeoutSeconds());
+                            model.maxOutput(maxOutput), Math.min(model.timeoutSeconds(), remaining));
                     if (ReviewReport.hasSections(text)) {
                         answer = text;
                         used = model;

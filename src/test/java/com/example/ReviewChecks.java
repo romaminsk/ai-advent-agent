@@ -139,7 +139,8 @@ final class ReviewChecks extends SelfTestSupport {
             calls.incrementAndGet();
             throw new IOException("сеть недоступна");
         };
-        ReviewRunner.Result result = ReviewRunner.run(new Input(patches, 32768).toRunnerInput(), failing, null);
+        ReviewRunner.Result result = ReviewRunner.run(new Input(patches, 32768).toRunnerInput(),
+                List.of(new ReviewRunner.Model(ReviewLlmConfig.MODE_CLOUD, "stub", failing)), null);
         expect("REVIEW-4: сбой LLM даёт запасной вывод с причиной и без исключения",
                 result.unavailable() != null
                         && result.markdown().contains("Авторевью недоступно: сеть недоступна (попыток: 3)"));
@@ -244,8 +245,14 @@ final class ReviewChecks extends SelfTestSupport {
                 List.of(new ReviewRunner.Model(ReviewLlmConfig.MODE_CLOUD, "cloud-model",
                                 cloudFails, key),
                         new ReviewRunner.Model(ReviewLlmConfig.MODE_LOCAL, "local-model", localOk)), null);
-        expect("REVIEW-8: сбой облака — три попытки в облаке, затем локальная модель",
+        expect("REVIEW-8: сбой облака — три попытки в облаке, затем одна локальная попытка",
                 cloudCalls.get() == 3 && localCalls.get() == 1 && result.unavailable() == null);
+        ReviewRunner.Result localFails = ReviewRunner.run(new Input(patches, 32768).toRunnerInput(),
+                List.of(new ReviewRunner.Model(ReviewLlmConfig.MODE_CLOUD, "cloud-model", cloudFails, key),
+                        new ReviewRunner.Model(ReviewLlmConfig.MODE_LOCAL, "local-model",
+                                (system, user, max) -> { throw new IllegalStateException("локальная недоступна"); })), null);
+        expect("REVIEW-8: локальная запасная модель — одна попытка, ревью недоступно с причиной",
+                localFails.unavailable() != null && localFails.unavailable().contains("(попыток: 4)"));
         expect("REVIEW-8: отчёт указывает модель и режим локально и пометку о сбое облака",
                 result.markdown().contains("Модель: local-model, режим: локально.")
                         && result.markdown().contains("Облако недоступно:"));
