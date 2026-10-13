@@ -963,25 +963,45 @@ ai-agent review --base origin/main --head HEAD --out review.md
 
 | Переменная | Обязательна | Назначение |
 |---|---|---|
-| `LLM_API_KEY`, `LLM_API_URL`, `LLM_MODEL` | да | OpenAI-совместимый chat/completions (в проекте `LLM_API_URL` — полный URL, `LLM_BASE_URL` не используется) |
-| `LLM_CONTEXT_WINDOW_TOKENS` | рекомендуется | окно модели; от него считаются лимит diff и объём RAG. Без него лимит diff — 60000 симв. |
-| `EMBEDDING_BASE_URL`, `EMBEDDING_MODEL` | для RAG | OpenAI-совместимые эмбеддинги; без них ревью идёт без фрагментов с пометкой |
-| `EMBEDDING_API_KEY` | нет | Bearer-ключ эмбеддингов (нужен облачным API) |
+| `LLM_API_URL` (https) и `LLM_API_KEY` | нет | облачный режим: OpenAI-совместимый chat/completions. Без обоих — локальная Ollama |
+| `LLM_MODEL` | для облака | имя облачной модели |
+| `LLM_CONTEXT_WINDOW_TOKENS` | нет | окно облачной модели; бюджет считается по минимуму с локальным окном |
+| `REVIEW_LOCAL_MODEL` | нет | модель Ollama на localhost, по умолчанию `qwen2.5:3b-rag8k` |
+| `REVIEW_LOCAL_CONTEXT_WINDOW_TOKENS` | нет | окно локальной модели, по умолчанию 8192 (соответствует `num_ctx 8192`) |
+| `EMBEDDING_BASE_URL`, `EMBEDDING_MODEL` | для RAG | эмбеддинги **только локальные** (loopback), по умолчанию `bge-m3:latest` на `localhost:11434/v1` |
+| `REVIEW_ENV_FILE` | нет | файл настроек; по умолчанию `~/.ai-advent-agent/.env` |
 | `REVIEW_INDEX_DIR` | нет | каталог индекса ревью; по умолчанию `~/.ai-advent-agent/review-index` (индекс `help` не затрагивается) |
 
-Варианты запуска:
+Значения из окружения важнее файла `.env`. Файл читается только если его права `600` (`chmod 600`); иначе выводится предупреждение и значения не используются. Ключ нигде не печатается: из текстов ошибок он вычищается.
 
-- **A. Облачный API через GitHub Secrets (реализовано, основной путь).** Action `.github/workflows/ai-review.yml`. Секреты `LLM_API_KEY` и `EMBEDDING_API_KEY`, переменные `LLM_API_URL`, `LLM_MODEL`, `LLM_CONTEXT_WINDOW_TOKENS`, `EMBEDDING_BASE_URL`, `EMBEDDING_MODEL`. **Код PR (diff и фрагменты) уходит провайдеру LLM и эмбеддингов.**
-- **B. Self-hosted runner рядом с локальной LLM (не реализовано отдельно).** Тот же workflow на своём раннере с `runs-on: self-hosted`; `LLM_API_URL` и `EMBEDDING_BASE_URL` указывают на адреса внутри сети. Код команды не меняется, только переменные. Код не покидает периметр.
-- **C. Локальный запуск, Action публикует готовый файл (ручной путь).** `ai-agent review --base origin/main --head <ветка> --out review.md`, затем `gh pr comment <N> --body-file review.md`. Маркер `<!-- ai-review -->` уже в файле, повторная публикация через `gh api -X PATCH` обновит комментарий.
+Режим LLM:
+
+- **Локально (по умолчанию).** Ollama на `localhost:11434`, модель `REVIEW_LOCAL_MODEL`. Ничего не уходит за пределы машины.
+- **Облако.** Включается, если заданы `LLM_API_URL` (https) и `LLM_API_KEY`. Ключ берётся из окружения или файла `.env` на раннере. После 3 неудачных попыток облака (ошибка или таймаут 60 с) ревью повторяется локально, в отчёте указано «Облако недоступно: …; ревью выполнено локально».
+- В тексте ревью есть строка «Модель: <имя>, режим: облако|локально».
+
+**Внимание о приватности:** в облачном режиме **diff изменений и фрагменты кода из RAG уходят провайдеру LLM**. Эмбеддинги при этом остаются локальными. Для закрытого кода оставляйте облако выключенным.
+
+Как включить облако на VPS:
+
+1. Создайте файл настроек вне рабочей копии: `mkdir -p ~/.ai-advent-agent && touch ~/.ai-advent-agent/.env && chmod 600 ~/.ai-advent-agent/.env`.
+2. Добавьте в него строки `LLM_API_URL=https://…/chat/completions`, `LLM_API_KEY=…`, `LLM_MODEL=…`, при необходимости `LLM_CONTEXT_WINDOW_TOKENS=…`.
+3. Перезапуск раннера не нужен: файл читается при каждом запуске ревью. Чтобы вернуться к локальному режиму, удалите или очистите строки `LLM_API_URL`/`LLM_API_KEY`.
+
+Вариант запуска — self-hosted раннер на VPS (основной путь):
+
+- Action `.github/workflows/ai-review.yml` запускается на раннере с метками `self-hosted, linux`. Облачных Secrets и Variables нет: настройки берутся с раннера (файл `.env` и окружение).
+- Локальная Ollama на VPS: модели `bge-m3` (эмбеддинги) и `qwen2.5:3b-rag8k` (ревью); индекс хранится постоянно в `~/.ai-advent-agent/review-index`.
+- **Внимание:** на self-hosted раннере выполняется код PR. Не подключайте такой раннер к публичному репозиторию: fork-PR попадут на раннер без ограничений. Fork-логика в workflow убрана по запросу.
 
 Поведение Action:
 
-- триггер `pull_request` (opened, synchronize, reopened), без `pull_request_target`; права `contents: read`, `pull-requests: write`; `timeout-minutes: 15`;
-- checkout с `fetch-depth: 0` на SHA head-коммита, Java 21, кэш Maven и кэш индекса ревью;
-- fork-PR и отсутствие `LLM_API_KEY`: шаг пропускается, причина пишется в job summary;
+- триггер `pull_request` (opened, synchronize, reopened), без `pull_request_target`; права `contents: read`, `pull-requests: write`; `timeout-minutes: 30`;
+- checkout с `fetch-depth: 0` на SHA head-коммита, сборка `mvn -q -DskipTests package`, индекс не кэшируется (постоянный каталог);
 - сбой ревью не роняет job: отчёт «Авторевью недоступно: <причина>» попадает и в комментарий, и в job summary;
 - комментарий ищется по маркеру `<!-- ai-review -->` и обновляется, а не дублируется.
+
+Ручной путь без Action: `ai-agent review --base origin/main --head <ветка> --out review.md`, затем `gh pr comment <N> --body-file review.md`. Маркер `<!-- ai-review -->` уже в файле; повторная публикация через `gh api -X PATCH` обновит комментарий.
 
 Что анализируется:
 
@@ -999,7 +1019,7 @@ ai-agent review --base origin/main --head HEAD --out review.md
 - номера строк берутся из diff и проверяются только визуально: модель может ошибиться в номере;
 - первая сборка индекса дольше: 115 файлов и 2259 чанков с bge-m3 на CPU заняли около 11 минут; повторные запуски используют кэш эмбеддингов;
 - индекс строится из рабочей копии проекта: `--head` должен совпадать с checkout;
-- в fork-PR ревью не запускается (секреты недоступны);
+- fork-PR на self-hosted раннере не отсекаются (см. предупреждение выше): не используйте такой раннер для публичного репозитория;
 - живой прогон комментария в GitHub PR в этой проверке не выполнялся (см. итог разработки).
 
 Тесты: группа `review` (`mvn -q test-compile exec:java@self-test -Dexec.args=review`), без сети и LLM.

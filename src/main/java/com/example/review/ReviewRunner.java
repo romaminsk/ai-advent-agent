@@ -39,6 +39,13 @@ public final class ReviewRunner {
         String complete(String system, String user, int maxOutputTokens) throws Exception;
     }
 
+    /** Модель в порядке попыток: режим (облако|локально), имя, вызов и ключ (вычищается из причин сбоя). */
+    public record Model(String mode, String name, Llm llm, String secret) {
+        public Model(String mode, String name, Llm llm) {
+            this(mode, name, llm, null);
+        }
+    }
+
     /** Поиск фрагментов по индексу; null вместо поиска — RAG отключён. */
     @FunctionalInterface
     public interface Search {
@@ -150,6 +157,10 @@ public final class ReviewRunner {
     }
 
     public static Result run(Input input, Llm llm, Search search) {
+        return run(input, List.of(new Model(ReviewLlmConfig.MODE_LOCAL, "stub", llm)), search);
+    }
+
+    public static Result run(Input input, List<Model> models, Search search) {
         long started = System.nanoTime();
         Integer window = input.windowTokens();
         if (input.patches().isEmpty()) {
@@ -171,19 +182,30 @@ public final class ReviewRunner {
         String user = ReviewPrompt.user(analyzed, retrieval.chunks());
         int maxOutput = outputTokens(window);
         String answer = null;
+        Model used = null;
         String reason = null;
+        String fallbackNote = null;
         int attempts = 0;
-        while (attempts <= MAX_RETRIES && answer == null) {
-            attempts++;
-            try {
-                String text = complete(llm, ReviewPrompt.SYSTEM, user, maxOutput);
-                if (ReviewReport.hasSections(text)) {
-                    answer = text;
-                } else {
-                    reason = "ответ не в требуемом формате";
+        for (Model model : models) {
+            for (int attempt = 0; attempt <= MAX_RETRIES && answer == null; attempt++) {
+                attempts++;
+                try {
+                    String text = complete(model.llm(), ReviewPrompt.SYSTEM, user, maxOutput);
+                    if (ReviewReport.hasSections(text)) {
+                        answer = text;
+                        used = model;
+                    } else {
+                        reason = "ответ не в требуемом формате";
+                    }
+                } catch (Exception e) {
+                    reason = ReviewLlmConfig.scrub(describe(e), model.secret());
                 }
-            } catch (Exception e) {
-                reason = describe(e);
+            }
+            if (answer != null) {
+                break;
+            }
+            if (ReviewLlmConfig.MODE_CLOUD.equals(model.mode())) {
+                fallbackNote = "Облако недоступно: " + reason + "; ревью выполнено локально.";
             }
         }
         int retries = attempts - 1;
@@ -193,7 +215,7 @@ public final class ReviewRunner {
                     text, retries, retrieval.chunks().size(), budget, diffChars, elapsed(started), entries);
         }
         String markdown = ReviewReport.success(input.base(), input.head(), entries, answer,
-                retrieval.chunks(), retrieval.error());
+                retrieval.chunks(), retrieval.error(), used.name(), used.mode(), fallbackNote);
         return new Result(RagQueryRewriter.redactSecrets(markdown), null, retries,
                 retrieval.chunks().size(), budget, diffChars, elapsed(started), entries);
     }

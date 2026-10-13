@@ -17,7 +17,9 @@ import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 /** Команда «ai-agent review»: git diff base...head, RAG по документации и коду, ревью через LLM. */
 public final class ReviewCommand {
@@ -54,17 +56,25 @@ public final class ReviewCommand {
         } catch (IOException | RuntimeException e) {
             return failGit(options, ReviewRunner.describe(e), out, err);
         }
-        Integer window = windowTokens();
+        List<String> warnings = new ArrayList<>();
+        Map<String, String> env = System.getenv();
+        Map<String, String> values = ReviewLlmConfig.merged(env,
+                ReviewLlmConfig.readEnvFile(ReviewLlmConfig.envFile(env), warnings));
+        ReviewLlmConfig.Selection selection = ReviewLlmConfig.select(values);
+        warnings.addAll(selection.warnings());
+        warnings.forEach(warning -> err.println("Внимание: " + warning));
+        List<ReviewRunner.Model> models = models(selection.backends());
         ReviewRunner.Input input = new ReviewRunner.Input(options.base(), options.head(), patches,
-                window, options.maxDiff());
-        ReviewRunner.Result result = ReviewRunner.run(input, llm(), new LazyIndexSearch(project, indexDirectory(), err));
+                selection.windowTokens(), options.maxDiff());
+        ReviewRunner.Result result = ReviewRunner.run(input, models,
+                new LazyIndexSearch(project, indexDirectory(), values, err));
         try {
             write(options, ReviewReport.fitComment(result.markdown()), out);
         } catch (IOException e) {
             err.println("Ошибка записи " + options.out() + ": " + ReviewRunner.describe(e));
             return 1;
         }
-        printStats(result, window, err);
+        printStats(result, selection, err);
         return 0;
     }
 
@@ -91,33 +101,37 @@ public final class ReviewCommand {
         Files.writeString(options.out(), markdown, StandardCharsets.UTF_8);
     }
 
-    /** Окно контекста из LLM_CONTEXT_WINDOW_TOKENS; null — не задано или настройки не читаются. */
-    static Integer windowTokens() {
-        try {
-            return ModelSettings.fromEnv().contextWindowTokens();
-        } catch (RuntimeException e) {
-            return null;
+    /** Модели в порядке попыток; ошибка конфигурации становится причиной сбоя, а не падением. */
+    static List<ReviewRunner.Model> models(List<ReviewLlmConfig.Backend> backends) {
+        List<ReviewRunner.Model> models = new ArrayList<>();
+        for (ReviewLlmConfig.Backend backend : backends) {
+            models.add(new ReviewRunner.Model(backend.mode(), backend.model(), llmFor(backend), backend.apiKey()));
         }
+        return models;
     }
 
-    /** LLM-клиент; ошибка конфигурации превращается в причину «Авторевью недоступно», а не в падение. */
-    static ReviewRunner.Llm llm() {
+    static ReviewRunner.Llm llmFor(ReviewLlmConfig.Backend backend) {
         try {
-            Config config = Config.fromEnv();
-            ModelSettings settings = ModelSettings.fromEnv();
+            Config config = new Config(backend.apiKey(), backend.url(), backend.model());
             Path history = Files.createTempDirectory("ai-agent-review-").resolve("history.json");
-            LlmAgent agent = new LlmAgent(config, settings, new JsonConversationStore(history, true));
-            return (system, user, maxOutputTokens) ->
-                    agent.statelessRagCall(system, user, maxOutputTokens).text();
+            LlmAgent agent = new LlmAgent(config, ModelSettings.defaults(), new JsonConversationStore(history, true));
+            return (system, user, maxOutputTokens) -> {
+                try {
+                    return agent.statelessRagCall(system, user, maxOutputTokens).text();
+                } catch (Exception e) {
+                    throw new IllegalStateException(ReviewLlmConfig.scrub(
+                            ReviewRunner.describe(e), backend.apiKey()));
+                }
+            };
         } catch (Exception e) {
-            String reason = ReviewRunner.describe(e);
+            String reason = ReviewLlmConfig.scrub(ReviewRunner.describe(e), backend.apiKey());
             return (system, user, maxOutputTokens) -> {
                 throw new IllegalStateException(reason);
             };
         }
     }
 
-    /** Каталог индекса ревью: отдельный от help (REVIEW_INDEX_DIR или ~/.ai-advent-agent/review-index). */
+    /** Каталог индекса ревью: постоянный REVIEW_INDEX_DIR или ~/.ai-advent-agent/review-index (help не затрагивается). */
     static Path indexDirectory() {
         String configured = System.getenv(INDEX_ENV);
         if (configured != null && !configured.isBlank()) {
@@ -126,7 +140,7 @@ public final class ReviewCommand {
         return Path.of(System.getProperty("user.home"), ".ai-advent-agent", "review-index");
     }
 
-    private static void printStats(ReviewRunner.Result result, Integer window, PrintStream err) {
+    private static void printStats(ReviewRunner.Result result, ReviewLlmConfig.Selection selection, PrintStream err) {
         List<ReviewRunner.Entry> entries = result.entries();
         err.println("Ревью: файлов " + entries.size()
                 + " (проанализировано " + count(entries, ReviewRunner.Status.ANALYZED)
@@ -134,10 +148,7 @@ public final class ReviewCommand {
                 + ", пропущено " + count(entries, ReviewRunner.Status.SKIPPED)
                 + ", не анализировалось " + count(entries, ReviewRunner.Status.NOT_ANALYZED) + ")");
         err.println("Размер diff: " + result.diffChars() + " симв., бюджет " + result.budgetChars() + " симв.");
-        if (window == null) {
-            err.println("Окно модели не задано (LLM_CONTEXT_WINDOW_TOKENS): лимит diff по умолчанию "
-                    + ReviewRunner.UNKNOWN_WINDOW_DIFF_CHARS + " симв.");
-        }
+        err.println("Режимы LLM по порядку попыток: " + selection.backends());
         err.println("Чанков RAG: " + result.chunks());
         err.println("Повторов LLM: " + result.retries());
         err.println("Время: " + result.elapsedMs() + " мс");
@@ -147,16 +158,18 @@ public final class ReviewCommand {
         return entries.stream().filter(entry -> entry.status() == status).count();
     }
 
-    /** Индекс ревью строится при первом запросе к RAG, из рабочей копии проекта. */
+    /** Индекс ревью строится при первом запросе к RAG из рабочей копии проекта; эмбеддинги только локально. */
     static final class LazyIndexSearch implements ReviewRunner.Search {
         private final Path project;
         private final Path indexDir;
+        private final Map<String, String> values;
         private final PrintStream err;
         private RagRetriever retriever;
 
-        LazyIndexSearch(Path project, Path indexDir, PrintStream err) {
+        LazyIndexSearch(Path project, Path indexDir, Map<String, String> values, PrintStream err) {
             this.project = project;
             this.indexDir = indexDir;
+            this.values = values;
             this.err = err;
         }
 
@@ -169,13 +182,14 @@ public final class ReviewCommand {
         }
 
         private RagRetriever build() throws IOException, InterruptedException {
-            String baseUrl = System.getenv("EMBEDDING_BASE_URL");
-            String model = System.getenv("EMBEDDING_MODEL");
-            if (baseUrl == null || model == null || baseUrl.isBlank() || model.isBlank()) {
+            String baseUrl = values.get("EMBEDDING_BASE_URL");
+            String model = values.get("EMBEDDING_MODEL");
+            if (baseUrl == null || model == null) {
                 throw new IllegalStateException("не заданы EMBEDDING_BASE_URL и EMBEDDING_MODEL");
             }
+            Config.requireLoopbackUrl(baseUrl, "EMBEDDING_BASE_URL");
             IndexStore store = new IndexStore(indexDir);
-            Embedder embedder = OpenAiEmbedder.forReview(baseUrl, model, System.getenv("EMBEDDING_API_KEY"));
+            Embedder embedder = OpenAiEmbedder.forReview(baseUrl, model, null);
             IndexService.BuildReport report = new IndexService(store).build(STRATEGY, project.toString(),
                     new DocumentLoader(), embedder, model, line -> { });
             err.println("Индекс ревью: файлов " + report.files() + ", чанков " + report.chunks()

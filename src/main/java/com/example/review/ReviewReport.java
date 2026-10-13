@@ -54,9 +54,15 @@ public final class ReviewReport {
     }
 
     static String success(String base, String head, List<ReviewRunner.Entry> entries, String llmText,
-                          List<RagRetriever.Chunk> chunks, String ragError) {
+                          List<RagRetriever.Chunk> chunks, String ragError,
+                          String model, String mode, String fallbackNote) {
         StringBuilder text = new StringBuilder();
         text.append("## AI-ревью PR\n\n").append(summary(base, head, entries)).append("\n\n");
+        text.append("Модель: ").append(model).append(", режим: ").append(mode).append(".\n");
+        if (fallbackNote != null) {
+            text.append(fallbackNote).append('\n');
+        }
+        text.append('\n');
         text.append(filesList(entries)).append("\n\n");
         text.append(llmText.strip()).append("\n\n");
         text.append("### Источники\n");
