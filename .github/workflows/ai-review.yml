@@ -1,0 +1,55 @@
+name: ai-review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Сборка
+        run: mvn -q -DskipTests package
+
+      - name: AI-ревью
+        id: review
+        run: |
+          set +e
+          REVIEW_INDEX_DIR="$HOME/.ai-advent-agent/review-index" \
+            java -jar target/ai-advent-agent-1.0-SNAPSHOT.jar review --base origin/${{ github.base_ref }} --head HEAD --out review.md 2> review.err
+          code=$?
+          cat review.err >&2
+          if [ ! -s review.md ]; then
+            reason=$(grep -h 'Авторевью недоступно' review.err | tail -n 1 | sed 's/^Авторевью недоступно: //')
+            if [ -z "$reason" ]; then
+              reason="внутренняя ошибка команды review (код $code), подробности в логе job"
+            fi
+            printf '%s\n## AI-ревью PR\n\nАвторевью недоступно: %s\n' '<!-- ai-review -->' "$reason" > review.md
+          fi
+          cat review.md >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - name: Публикация комментария
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          comment_id=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+            -q '.[] | select(.body | contains("<!-- ai-review -->")) | .id' | head -n 1)
+          if [ -n "$comment_id" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$comment_id" -F body=@review.md > /dev/null
+          else
+            gh pr comment "$PR_NUMBER" --body-file review.md
+          fi
