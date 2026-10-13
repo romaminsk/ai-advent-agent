@@ -35,6 +35,7 @@ final class ReviewChecks extends SelfTestSupport {
         checkModeSelection();
         checkFallbackAndKeyHidden();
         checkEnvFilePermissions();
+        checkReviewHeaders();
     }
 
     private static void checkFilesAndSkips() throws Exception {
@@ -257,6 +258,38 @@ final class ReviewChecks extends SelfTestSupport {
                         && !cloudOnly.markdown().contains("Облако недоступно"));
         expect("REVIEW-8: ключ замещается маркером при очистке текста",
                 ReviewLlmConfig.scrub("ошибка " + key, key).equals("ошибка [скрыто]"));
+    }
+
+    private static void checkReviewHeaders() throws Exception {
+        List<String> agents = new ArrayList<>();
+        List<String> sessions = new ArrayList<>();
+        com.sun.net.httpserver.HttpServer server = com.sun.net.httpserver.HttpServer.create(
+                new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            agents.add(String.valueOf(exchange.getRequestHeaders().getFirst("User-Agent")));
+            sessions.add(String.valueOf(exchange.getRequestHeaders().getFirst("x-opencode-session")));
+            byte[] body = regularAnswer(1).getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        server.start();
+        try {
+            String url = "http://127.0.0.1:" + server.getAddress().getPort() + "/v1/chat/completions";
+            for (int run = 0; run < 2; run++) {
+                Path history = Files.createTempDirectory("review-headers-").resolve("history.json");
+                LlmAgent agent = new LlmAgent(new Config("test-key-1234567890", url, "m"),
+                        ModelSettings.defaults(), new JsonConversationStore(history, true));
+                agent.useReviewIdentity("ai-agent-review/1.0", "ai-agent-review");
+                agent.statelessRagCall("системная инструкция", "вопрос", 64);
+            }
+        } finally {
+            server.stop(0);
+        }
+        expect("REVIEW-10: запросы облака идут с User-Agent ai-agent-review/1.0",
+                agents.size() == 2 && agents.stream().allMatch("ai-agent-review/1.0"::equals));
+        expect("REVIEW-10: x-opencode-session стабилен между запусками ревью",
+                sessions.size() == 2 && sessions.stream().allMatch("ai-agent-review"::equals));
     }
 
     private static void checkEnvFilePermissions() throws Exception {

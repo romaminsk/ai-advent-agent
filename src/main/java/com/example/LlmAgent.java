@@ -173,6 +173,9 @@ public final class LlmAgent {
      */
     private String sessionId = UUID.randomUUID().toString();
 
+    /** User-Agent запросов; задаётся только командой ревью, в чате не используется. */
+    private String userAgent;
+
     /**
      * Завершённые пары user/assistant текущей беседы (system-сообщение здесь
      * не хранится, оно добавляется при формировании каждого запроса).
@@ -1252,7 +1255,8 @@ public final class LlmAgent {
         }
         return executeCall(List.of(new ChatMessage("system", systemPrompt),
                 new ChatMessage("user", userMessage)), maxOutputTokens,
-                UUID.randomUUID().toString(), applyTemperature, SessionTokenStats.Purpose.REGULAR);
+                userAgent != null ? sessionId : UUID.randomUUID().toString(),
+                applyTemperature, SessionTokenStats.Purpose.REGULAR);
     }
 
     /** Прогноз контекстного бюджета: оценка входа плюс резерв выхода (max_tokens). */
@@ -3202,7 +3206,7 @@ public final class LlmAgent {
         byte[] jsonBytes = json.getBytes(java.nio.charset.StandardCharsets.UTF_8);
         lastRequestBytes = jsonBytes.length;
 
-        return HttpRequest.newBuilder()
+        HttpRequest.Builder builder = HttpRequest.newBuilder()
                 .uri(URI.create(config.apiUrl()))
                 .timeout(Duration.ofSeconds(settings.requestTimeoutSeconds()))
                 .header("Content-Type", "application/json")
@@ -3210,9 +3214,20 @@ public final class LlmAgent {
                 // Обязателен для эндпоинта OpenCode Go, подтверждено документацией
                 // и ошибкой HTTP 400 MissingSessionID при его отсутствии.
                 .header("x-opencode-session",
-                        sessionOverride != null ? sessionOverride : sessionId)
-                .POST(HttpRequest.BodyPublishers.ofByteArray(jsonBytes))
-                .build();
+                        sessionOverride != null ? sessionOverride : sessionId);
+        if (userAgent != null) {
+            builder.header("User-Agent", userAgent);
+        }
+        return builder.POST(HttpRequest.BodyPublishers.ofByteArray(jsonBytes)).build();
+    }
+
+    /**
+     * Идентификация клиента для команды ревью: фиксированный User-Agent и стабильный
+     * x-opencode-session (одна сессия на все запуски ревью, а не UUID на процесс).
+     */
+    public void useReviewIdentity(String reviewUserAgent, String reviewSessionId) {
+        this.userAgent = reviewUserAgent;
+        this.sessionId = reviewSessionId;
     }
 
     /** Отправляет запрос через HttpClient и разбирает сетевые ошибки. */
