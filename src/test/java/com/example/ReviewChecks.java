@@ -188,6 +188,8 @@ final class ReviewChecks extends SelfTestSupport {
         expect("REVIEW-6: права и таймаут workflow",
                 workflow.contains("contents: read") && workflow.contains("pull-requests: write")
                         && workflow.contains("timeout-minutes: 30"));
+        expect("REVIEW-6: fork-PR не запускаются на self-hosted раннере",
+                workflow.contains("if: github.event.pull_request.head.repo.full_name == github.repository"));
         expect("REVIEW-6: workflow работает на self-hosted раннере без GitHub Secrets и Variables",
                 workflow.contains("runs-on: [self-hosted, linux]") && !workflow.contains("secrets.")
                         && !workflow.contains("vars."));
