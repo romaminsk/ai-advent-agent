@@ -25,6 +25,9 @@ import java.util.Map;
 public final class ReviewCommand {
 
     static final String STRATEGY = IndexService.STRATEGY_STRUCTURE;
+    /** Заголовки облачных запросов ревью (x-opencode-session стабилен между запусками). */
+    static final String USER_AGENT = "ai-agent-review/1.0";
+    static final String SESSION_ID = "ai-agent-review";
     static final String INDEX_ENV = "REVIEW_INDEX_DIR";
     static final String USAGE = "Использование: ai-agent review [--base <ref>] [--head <ref>] "
             + "[--project <путь>] [--out <файл>] [--max-diff <N>]";
@@ -119,6 +122,9 @@ public final class ReviewCommand {
             Config config = new Config(backend.apiKey(), backend.url(), backend.model());
             Path history = Files.createTempDirectory("ai-agent-review-").resolve("history.json");
             LlmAgent agent = new LlmAgent(config, ModelSettings.defaults(), new JsonConversationStore(history, true));
+            if (ReviewLlmConfig.MODE_CLOUD.equals(backend.mode())) {
+                agent.useReviewIdentity(USER_AGENT, SESSION_ID);
+            }
             return (system, user, maxOutputTokens) -> {
                 try {
                     return agent.statelessRagCall(system, user, maxOutputTokens).text();
