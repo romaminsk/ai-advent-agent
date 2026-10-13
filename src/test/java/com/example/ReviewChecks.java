@@ -35,6 +35,7 @@ final class ReviewChecks extends SelfTestSupport {
         checkModeSelection();
         checkFallbackAndKeyHidden();
         checkEnvFilePermissions();
+        checkReviewHeaders();
     }
 
     private static void checkFilesAndSkips() throws Exception {
@@ -138,7 +139,8 @@ final class ReviewChecks extends SelfTestSupport {
             calls.incrementAndGet();
             throw new IOException("сеть недоступна");
         };
-        ReviewRunner.Result result = ReviewRunner.run(new Input(patches, 32768).toRunnerInput(), failing, null);
+        ReviewRunner.Result result = ReviewRunner.run(new Input(patches, 32768).toRunnerInput(),
+                List.of(new ReviewRunner.Model(ReviewLlmConfig.MODE_CLOUD, "stub", failing)), null);
         expect("REVIEW-4: сбой LLM даёт запасной вывод с причиной и без исключения",
                 result.unavailable() != null
                         && result.markdown().contains("Авторевью недоступно: сеть недоступна (попыток: 3)"));
@@ -243,8 +245,14 @@ final class ReviewChecks extends SelfTestSupport {
                 List.of(new ReviewRunner.Model(ReviewLlmConfig.MODE_CLOUD, "cloud-model",
                                 cloudFails, key),
                         new ReviewRunner.Model(ReviewLlmConfig.MODE_LOCAL, "local-model", localOk)), null);
-        expect("REVIEW-8: сбой облака — три попытки в облаке, затем локальная модель",
+        expect("REVIEW-8: сбой облака — три попытки в облаке, затем одна локальная попытка",
                 cloudCalls.get() == 3 && localCalls.get() == 1 && result.unavailable() == null);
+        ReviewRunner.Result localFails = ReviewRunner.run(new Input(patches, 32768).toRunnerInput(),
+                List.of(new ReviewRunner.Model(ReviewLlmConfig.MODE_CLOUD, "cloud-model", cloudFails, key),
+                        new ReviewRunner.Model(ReviewLlmConfig.MODE_LOCAL, "local-model",
+                                (system, user, max) -> { throw new IllegalStateException("локальная недоступна"); })), null);
+        expect("REVIEW-8: локальная запасная модель — одна попытка, ревью недоступно с причиной",
+                localFails.unavailable() != null && localFails.unavailable().contains("(попыток: 4)"));
         expect("REVIEW-8: отчёт указывает модель и режим локально и пометку о сбое облака",
                 result.markdown().contains("Модель: local-model, режим: локально.")
                         && result.markdown().contains("Облако недоступно:"));
@@ -257,6 +265,38 @@ final class ReviewChecks extends SelfTestSupport {
                         && !cloudOnly.markdown().contains("Облако недоступно"));
         expect("REVIEW-8: ключ замещается маркером при очистке текста",
                 ReviewLlmConfig.scrub("ошибка " + key, key).equals("ошибка [скрыто]"));
+    }
+
+    private static void checkReviewHeaders() throws Exception {
+        List<String> agents = new ArrayList<>();
+        List<String> sessions = new ArrayList<>();
+        com.sun.net.httpserver.HttpServer server = com.sun.net.httpserver.HttpServer.create(
+                new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            agents.add(String.valueOf(exchange.getRequestHeaders().getFirst("User-Agent")));
+            sessions.add(String.valueOf(exchange.getRequestHeaders().getFirst("x-opencode-session")));
+            byte[] body = regularAnswer(1).getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        server.start();
+        try {
+            String url = "http://127.0.0.1:" + server.getAddress().getPort() + "/v1/chat/completions";
+            for (int run = 0; run < 2; run++) {
+                Path history = Files.createTempDirectory("review-headers-").resolve("history.json");
+                LlmAgent agent = new LlmAgent(new Config("test-key-1234567890", url, "m"),
+                        ModelSettings.defaults(), new JsonConversationStore(history, true));
+                agent.useReviewIdentity("ai-agent-review/1.0", "ai-agent-review");
+                agent.statelessRagCall("системная инструкция", "вопрос", 64);
+            }
+        } finally {
+            server.stop(0);
+        }
+        expect("REVIEW-10: запросы облака идут с User-Agent ai-agent-review/1.0",
+                agents.size() == 2 && agents.stream().allMatch("ai-agent-review/1.0"::equals));
+        expect("REVIEW-10: x-opencode-session стабилен между запусками ревью",
+                sessions.size() == 2 && sessions.stream().allMatch("ai-agent-review"::equals));
     }
 
     private static void checkEnvFilePermissions() throws Exception {
