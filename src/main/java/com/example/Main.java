@@ -42,6 +42,13 @@ public final class Main {
             нескольких чанков в одном пункте. Если контекст не покрывает вопрос, \
             ответь ровно: НЕ ЗНАЮ.""";
 
+    static String pingStatus() throws Exception {
+        java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder(
+                java.net.URI.create("http://localhost:8080/status")).build();
+        return java.net.http.HttpClient.newHttpClient()
+                .send(request, java.net.http.HttpResponse.BodyHandlers.ofString()).body();
+    }
+
     public static void main(String[] args) {
         if (args.length >= 1 && "private-chat".equals(args[0])) {
             int exitCode = PrivateChatClient.run(java.util.Arrays.copyOfRange(args, 1, args.length));
