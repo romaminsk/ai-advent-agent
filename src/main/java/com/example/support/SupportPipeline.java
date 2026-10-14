@@ -49,6 +49,13 @@ public final class SupportPipeline {
     public static Result ask(SupportCommand.Options options, String question, String ticketId,
                              String customerId, boolean reindex, PrintStream diagnostics)
             throws Exception {
+        return ask(options, question, ticketId, customerId, reindex, diagnostics, null, "");
+    }
+
+    /** Режим чата: previousQuestion и dialogHistory (данные) передаются в поиск и промт. */
+    public static Result ask(SupportCommand.Options options, String question, String ticketId,
+                             String customerId, boolean reindex, PrintStream diagnostics,
+                             String previousQuestion, String dialogHistory) throws Exception {
         McpClientComponent mcp = new McpClientComponent();
         boolean crmDown = false;
         JsonNode ticket = null;
@@ -82,7 +89,8 @@ public final class SupportPipeline {
         IndexStore store = new IndexStore(options.indexDir());
         ensureIndex(options, store, reindex, diagnostics);
         SupportService.Answer answer = SupportService.answer(
-                new SupportService.Input(question, ticket, customer), service(options, store));
+                new SupportService.Input(question, ticket, customer, previousQuestion, dialogHistory),
+                service(options, store));
         String mode = options.llm() instanceof SupportLlm llm && answer.decision() == SupportService.Decision.ANSWERED
                 ? llm.lastMode() : null;
         return new Result(answer, ticket, crmDown, mode);
