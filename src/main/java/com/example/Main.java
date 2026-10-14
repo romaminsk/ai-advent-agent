@@ -216,9 +216,19 @@ public final class Main {
 
     static int runLoop(TerminalUi ui, LlmAgent agent, String model,
                        com.example.rag.RagService ragService) {
+        return runLoop(ui, agent, model, ragService, System.getenv());
+    }
+
+    static int runLoop(TerminalUi ui, LlmAgent agent, String model,
+                       com.example.rag.RagService ragService, java.util.Map<String, String> env) {
         DemoRef demoRef = new DemoRef();
         McpSnapshotRef mcpSnapshot = new McpSnapshotRef();
         RagRef ragRef = new RagRef(ragService);
+        // Режим поддержки (/support): туннель закрывается при выходе и при завершении процесса.
+        com.example.support.SupportChatMode support =
+                new com.example.support.SupportChatMode(env, ui::showSystem, ui::showMessage);
+        Thread supportCleanup = new Thread(support::close, "support-cleanup");
+        Runtime.getRuntime().addShutdownHook(supportCleanup);
         try {
             // Онбординг — только на первом запуске: нет профиля и нет истории;
             // повторный запуск получает текущую короткую статусную строку.
@@ -297,6 +307,9 @@ public final class Main {
                         } else if (normalized.equals("/mcp")
                                  || normalized.startsWith("/mcp ")) {
                             handleMcpCommand(ui, input.text(), activeAgent(demoRef, agent), mcpSnapshot);
+                        } else if (normalized.equals("/support")
+                                || normalized.startsWith("/support ")) {
+                            support.command(input.text());
                         } else if (normalized.equals("/monitor")
                                 || normalized.startsWith("/monitor ")) {
                             handleMonitorCommand(ui, input.text());
@@ -322,6 +335,10 @@ public final class Main {
                         }
                     }
                     case MESSAGE -> {
+                        // Режим поддержки: сообщение уходит на support-сервер, основная история не меняется.
+                        if (support.handleMessage(input.text())) {
+                            break;
+                        }
                         LlmAgent activeAgent = activeAgent(demoRef, agent);
                         // Детерминированная проверка инвариантов на вводе: яВный
                         // конфликт ловится ДО вызова API — отказ без расхода
@@ -484,6 +501,12 @@ public final class Main {
                 }
             }
         } finally {
+            support.close();
+            try {
+                Runtime.getRuntime().removeShutdownHook(supportCleanup);
+            } catch (IllegalStateException shuttingDown) {
+                // процесс уже завершается: hook сам закроет туннель
+            }
             // Явный выход во время измерений: временные файлы закрываются тихо,
             // основная история и её счётчики не изменялись.
             if (demoRef.demo != null) {

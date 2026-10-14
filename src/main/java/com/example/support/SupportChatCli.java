@@ -4,17 +4,10 @@ import com.example.JsonSupport;
 import com.example.rag.RagRetriever;
 import com.example.review.ReviewLlmConfig;
 import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.PrintStream;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.nio.charset.StandardCharsets;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -23,7 +16,6 @@ import java.util.function.Supplier;
 /** Команда «ai-agent support-chat»: чат с памятью локально или через support-server (POST /chat). */
 public final class SupportChatCli {
 
-    static final int HTTP_TIMEOUT_SECONDS = 200;
     static final String TOKEN_VARIABLE = "SUPPORT_API_TOKEN";
     static final String USAGE = "Использование: ai-agent support-chat [--ticket T-1001] [--server URL]";
     static final String HELP = "Команды: /ticket <id> — выбрать тикет, /new — новый диалог, /help — справка, /exit — выход.";
@@ -67,7 +59,8 @@ public final class SupportChatCli {
             }
             String server = parsed.server();
             String secret = token.strip();
-            backend = (sessionId, message, ticket) -> remote(server, secret, sessionId, message, ticket);
+            SupportRemoteClient client = new SupportRemoteClient(server, secret);
+            backend = (sessionId, message, ticket) -> client.chat(sessionId, message, ticket);
         }
         return loop(parsed.ticket(), backend, in, out, err);
     }
@@ -157,40 +150,6 @@ public final class SupportChatCli {
                 : mode.startsWith(ReviewLlmConfig.MODE_LOCAL) ? "local" : null;
         return new Turn(result.sessionId(), answer.text(), sources, ticketLine(pipeline.ticket()),
                 answer.escalation(), source, (System.nanoTime() - started) / 1_000_000);
-    }
-
-    private static Turn remote(String server, String token, String sessionId, String message, String ticket)
-            throws IOException, InterruptedException {
-        ObjectNode body = JsonSupport.MAPPER.createObjectNode();
-        if (sessionId != null) {
-            body.put("sessionId", sessionId);
-        }
-        body.put("message", message);
-        if (ticket != null) {
-            body.put("ticketId", ticket);
-        }
-        HttpRequest request = HttpRequest.newBuilder(URI.create(server.replaceAll("/+$", "") + "/chat"))
-                .timeout(Duration.ofSeconds(HTTP_TIMEOUT_SECONDS))
-                .header("Content-Type", "application/json")
-                .header("Authorization", "Bearer " + token)
-                .POST(HttpRequest.BodyPublishers.ofString(JsonSupport.MAPPER.writeValueAsString(body),
-                        StandardCharsets.UTF_8))
-                .build();
-        HttpResponse<String> response = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()
-                .send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-        JsonNode json = JsonSupport.MAPPER.readTree(response.body());
-        if (response.statusCode() != 200) {
-            throw new IllegalStateException("сервер ответил HTTP " + response.statusCode() + ": "
-                    + json.path("error").asText("без подробностей"));
-        }
-        List<String> sources = new ArrayList<>();
-        json.path("sources").forEach(source -> sources.add(source.asText()));
-        JsonNode ticketNode = json.path("ticket");
-        String ticketLine = ticketNode.isObject() ? ticketLine(ticketNode) : null;
-        String source = json.path("llmSource").isNull() || json.path("llmSource").isMissingNode()
-                ? null : json.path("llmSource").asText();
-        return new Turn(json.path("sessionId").asText(), json.path("answer").asText(), sources, ticketLine,
-                json.path("escalated").asBoolean(), source, json.path("durationMs").asLong());
     }
 
     static String ticketLine(JsonNode ticket) {
