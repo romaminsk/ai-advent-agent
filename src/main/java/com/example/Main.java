@@ -78,6 +78,34 @@ public final class Main {
                     java.util.Arrays.copyOfRange(args, 1, args.length), System.out, System.err);
             System.exit(exitCode);
         }
+        if (args.length >= 1 && "crm-init".equals(args[0])) {
+            int exitCode = com.example.support.CrmInit.run(System.out, System.err);
+            if (exitCode != 0) System.exit(exitCode);
+            return;
+        }
+        if (args.length >= 1 && "crm-server".equals(args[0])) {
+            int exitCode = com.example.support.CrmHttpServer.run(
+                    java.util.Arrays.copyOfRange(args, 1, args.length), System.out, System.err);
+            if (exitCode != 0) System.exit(exitCode);
+            return;
+        }
+        if (args.length >= 1 && "mcp-crm".equals(args[0])) {
+            int exitCode = com.example.support.CrmMcpServer.run();
+            if (exitCode != 0) System.exit(exitCode);
+            return;
+        }
+        if (args.length >= 1 && "support-server".equals(args[0])) {
+            int exitCode = com.example.support.SupportServer.run(
+                    java.util.Arrays.copyOfRange(args, 1, args.length), System.out, System.err);
+            if (exitCode != 0) System.exit(exitCode);
+            return;
+        }
+        if (args.length >= 1 && "support".equals(args[0])) {
+            int exitCode = com.example.support.SupportCommand.main(
+                    java.util.Arrays.copyOfRange(args, 1, args.length), System.out, System.err);
+            if (exitCode != 0) System.exit(exitCode);
+            return;
+        }
         if (args.length >= 1 && "chat-help".equals(args[0])) {
             int exitCode = com.example.assistant.DevAssistant.chat(
                     java.util.Arrays.copyOfRange(args, 1, args.length),
@@ -5289,6 +5317,13 @@ public final class Main {
         out.println("  --project <путь> — папка Git-проекта для index, help и chat-help (иначе PROJECT_DIR из .env,");
         out.println("                     иначе текущая папка)");
         out.println("  mcp-git   — MCP stdio-сервер Git (только чтение)");
+        out.println("  crm-init  — копирует демо-данные CRM (demo/crm) в ~/.ai-advent-agent/crm, если каталог пуст");
+        out.println("  crm-server [--port 8085] — мини-CRM на 127.0.0.1 (только GET, Bearer из CRM_API_TOKEN)");
+        out.println("  mcp-crm   — MCP stdio-сервер CRM: get_customer, get_ticket, list_customer_tickets (только чтение)");
+        out.println("  support [--ticket T-1001 | --customer C-1] [--reindex] \"вопрос\" — ответ поддержки:");
+        out.println("                     CRM через MCP, RAG по support-docs/, LLM (облако, затем Ollama);");
+        out.println("                     без тикета — только RAG; порог SUPPORT_IDK_THRESHOLD (по умолчанию 0.58)");
+        out.println("  support-server [--port 8090] — HTTP support на 127.0.0.1: POST /ask, GET /health (Bearer SUPPORT_API_TOKEN)");
         out.println("  review    — AI-ревью изменений между --base и --head (--out, --max-diff; см. README)");
         out.println("  --help    — эта справка");
         out.println("  --plain   — упрощённый режим: без цветов, спиннера и сложного редактирования");
