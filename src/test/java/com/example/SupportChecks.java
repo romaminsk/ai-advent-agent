@@ -66,6 +66,32 @@ final class SupportChecks {
         checkSearchQuery();
         group("support: support-server");
         checkSupportServer(crmDir, base);
+        group("support: разбор escalated");
+        checkEscalationParsing();
+    }
+
+    private static void checkEscalationParsing() {
+        List<Object[]> cases = List.of(
+                new Object[]{"4) Эскалация: да, блокировка не снимается", true},
+                new Object[]{"Эскалация: Нужна", true},
+                new Object[]{"# 4) Эскалация\n\nДа — ошибка SSO связана с сертификатом", true},
+                new Object[]{"**4) Эскалация**\n- Нет, блокировка снимается автоматически", false},
+                new Object[]{"4) Эскалация: Нет", false},
+                new Object[]{"Эскалация: не нужна", false},
+                new Object[]{"- **Эскалация:** да", true},
+                new Object[]{"Эскалация: даже если сбросить пароль, эскалация не нужна", false},
+                new Object[]{"1) Диагноз: блокировка.\n2) Шаги: подождать.", false},
+                new Object[]{"# 4) Эскалация", false},
+                new Object[]{"4) эскалация\nда", true},
+                new Object[]{"Эскалация предусмотрена только при блокировке.\n4) Эскалация\nНет", false},
+                new Object[]{"4) Эскалация: нет\nЭскалация: да", true});
+        for (Object[] item : cases) {
+            String text = (String) item[0];
+            boolean expected = (Boolean) item[1];
+            expect("escalated: " + text.replace("\n", " / ") + " → " + expected,
+                    SupportService.escalationRequested(text) == expected);
+        }
+        expect("escalated: пустой ответ → false", !SupportService.escalationRequested(null));
     }
 
     private static void checkSupportServer(Path crmDir, Path base) throws Exception {
