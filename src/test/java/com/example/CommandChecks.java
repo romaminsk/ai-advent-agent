@@ -54,7 +54,67 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.CopyOnWriteArraySet;
 
 final class CommandChecks extends SelfTestSupport {
+    /** /support в основном чате: сообщения уходят на сервер, история агента не меняется, без LLM. */
+    private static void checkSupportChatMode() throws Exception {
+        String token = "selftest-support-chat-token";
+        try (SupportChecks.SupportStub stub = new SupportChecks.SupportStub(token)) {
+            Map<String, String> env = Map.of("SUPPORT_SERVER_URL", stub.url(), "SUPPORT_API_TOKEN", token);
+            LlmAgent agent = new LlmAgent(new Config("test-key", "https://127.0.0.1:9/v1/chat/completions",
+                    "glm-5.3-flash"), ModelSettings.defaults(), tempStore());
+            FakeUi ui = new FakeUi(
+                    TerminalUi.Input.command("/support status"),
+                    TerminalUi.Input.command("/support on T-1001"),
+                    TerminalUi.Input.message("Почему не работает авторизация?"),
+                    TerminalUi.Input.message("А если через 15 минут не помогло?"),
+                    TerminalUi.Input.command("/support status"),
+                    TerminalUi.Input.command("/support ticket T-1005"),
+                    TerminalUi.Input.message("Можно ли выгружать историю задач в Parquet по расписанию?"),
+                    TerminalUi.Input.command("/support new"),
+                    TerminalUi.Input.message("Вопрос без сессии"),
+                    TerminalUi.Input.command("/support off"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(ui, agent, "glm-5.3-flash", null, env);
+            expect("/support on: режим включён", ui.systems.stream().anyMatch(s -> s.startsWith("Поддержка включена")));
+            expect("/support: четыре сообщения ушли на /chat", stub.chatBodies.size() == 4);
+            expect("/support: первый ход с тикетом T-1001", "T-1001".equals(stub.chatBodies.get(0).path("ticketId").asText()));
+            expect("/support: второй ход той же сессии", stub.chatBodies.get(1).path("sessionId").asText().equals("S-1"));
+            expect("/support ticket: смена тикета сохраняет сессию", "T-1005".equals(stub.chatBodies.get(2).path("ticketId").asText())
+                    && "S-1".equals(stub.chatBodies.get(2).path("sessionId").asText()));
+            expect("/support new: новый диалог без sessionId", !stub.chatBodies.get(3).has("sessionId")
+                    && "T-1005".equals(stub.chatBodies.get(3).path("ticketId").asText()));
+            expect("/support: ответы выводятся markdown с тикетом, источниками и эскалацией",
+                    ui.messages.size() == 4 && ui.messages.get(0).contains("**Тикет:**")
+                            && ui.messages.get(0).contains("**Источники:**") && ui.messages.get(0).contains("**Эскалация:**"));
+            expect("/support: основная история агента не изменилась", agent.getHistory().isEmpty());
+            expect("/support status: без токена", ui.systems.stream().anyMatch(s -> s.startsWith("Поддержка: включена"))
+                    && ui.systems.stream().noneMatch(s -> s.contains(token)));
+            expect("/support off: режим выключен и туннель не нужен", ui.systems.stream()
+                    .anyMatch(s -> s.startsWith("Поддержка выключена")));
+            expect("/support: токен не попадает в вывод", ui.messages.stream().noneMatch(s -> s.contains(token))
+                    && ui.systems.stream().noneMatch(s -> s.contains(token)));
+
+            FakeUi unauthorized = new FakeUi(
+                    TerminalUi.Input.command("/support on"),
+                    TerminalUi.Input.message("Почему?"),
+                    TerminalUi.Input.command("/support off"),
+                    TerminalUi.Input.command("/exit"));
+            Main.runLoop(unauthorized, new LlmAgent(new Config("test-key", "https://127.0.0.1:9/v1/chat/completions",
+                    "glm-5.3-flash"), ModelSettings.defaults(), tempStore()), "glm-5.3-flash", null,
+                    Map.of("SUPPORT_SERVER_URL", stub.url(), "SUPPORT_API_TOKEN", "wrong-token"));
+            expect("/support 401: понятное сообщение, без ответа в основной чат",
+                    unauthorized.systems.stream().anyMatch(s -> s.contains("отклонил токен (401)"))
+                            && unauthorized.messages.isEmpty());
+        }
+        FakeUi noToken = new FakeUi(TerminalUi.Input.command("/support on"), TerminalUi.Input.command("/exit"));
+        Main.runLoop(noToken, new LlmAgent(new Config("test-key", "https://127.0.0.1:9/v1/chat/completions",
+                "glm-5.3-flash"), ModelSettings.defaults(), tempStore()), "glm-5.3-flash", null,
+                Map.of("SUPPORT_SERVER_URL", "http://127.0.0.1:9"));
+        expect("/support без SUPPORT_API_TOKEN: сообщение без запуска туннеля",
+                noToken.systems.stream().anyMatch(s -> s.contains("SUPPORT_API_TOKEN")));
+    }
+
     static void run() throws Exception {
+        checkSupportChatMode();
         checkMemoryLayerSeparation();
         checkRememberKeyFormats();
         checkRememberForgetMemoryCommands();

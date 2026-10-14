@@ -204,6 +204,8 @@ public interface TerminalUi extends AutoCloseable {
                         "ответы с проверяемыми цитатами, источниками и отказом при слабом контексте"),
                 new Row("RAG benchmark", "/rag-bench [файл] [повторов] [--quick]",
                         "сравнение ollama и cloud по фактам, цитатам и скорости"),
+                new Row("Поддержка", "/support on/off/status/ticket/new",
+                        "чат поддержки на сервере: ответы по тикету и документации, отдельная история"),
                 new Row("Прочее", "/mcp /monitor /help /exit (также exit, quit)",
                         "подключения, мониторинг и справка"),
         };
@@ -235,7 +237,7 @@ public interface TerminalUi extends AutoCloseable {
                 "/profile", "/skill", "/pipeline", "/invariant", "/clear", "/reset",
                 "/mode", "/model", "/multiline", "/paste", "/demo",
                 "/context", "/summary", "/strategy", "/facts", "/branch",
-                "/tokens", "/stats", "/limit", "/status", "/mcp", "/monitor", "/index", "/rag", "/rag-bench", "/exit",
+                "/tokens", "/stats", "/limit", "/status", "/mcp", "/monitor", "/support", "/index", "/rag", "/rag-bench", "/exit",
         };
     }
 
@@ -341,6 +343,24 @@ public interface TerminalUi extends AutoCloseable {
 
                       Связано: MCP_AUTH_TOKEN (HTTP MCP).
                      Значения токенов не выводятся.""";
+            case "/support" -> """
+                    /support — чат поддержки на сервере (VPS)
+
+                    Использование
+                      /support on [T-1001]  — включить: сообщения идут в поддержку по тикету
+                      /support off          — выключить, вернуться к обычному чату
+                      /support status       — состояние, тикет, сессия (без токена)
+                      /support ticket <id>  — выбрать тикет (T-1001, T-1002, …)
+                      /support new          — начать новый диалог поддержки
+
+                    Примеры
+                      /support on T-1001
+                      Почему не работает авторизация?
+
+                    Адрес: SUPPORT_SERVER_URL, иначе ssh-туннель к SUPPORT_SSH_HOST (по умолчанию ai-agent-01).
+                    Реплики поддержки не попадают в историю обычного чата.
+
+                    Связано: /rag, /status.""";
             case "/monitor" -> """
                     /monitor — явное управление Git-мониторингом
 

@@ -39,7 +39,14 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.io.OutputStream;
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
+import java.net.InetSocketAddress;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.example.support.SupportConnection;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -79,6 +86,123 @@ final class SupportChecks {
         checkEscalationParsing();
         group("support: чат");
         checkSupportChat(crmDir, base);
+        group("support: подключение /support");
+        checkSupportConnection();
+    }
+
+    /** Локальный stub support-сервера: /health и /chat с Bearer-проверкой; запоминает тела запросов. */
+    static final class SupportStub implements AutoCloseable {
+        final HttpServer server;
+        final String token;
+        final List<JsonNode> chatBodies = new CopyOnWriteArrayList<>();
+        final AtomicInteger sessions = new AtomicInteger();
+
+        SupportStub(String token) throws IOException {
+            this.token = token;
+            this.server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            server.createContext("/", this::handle);
+            server.start();
+        }
+
+        String url() {
+            return "http://127.0.0.1:" + server.getAddress().getPort();
+        }
+
+        private void handle(HttpExchange exchange) throws IOException {
+            try (exchange) {
+                String path = exchange.getRequestURI().getPath();
+                if ("/health".equals(path)) {
+                    reply(exchange, 200, "{\"status\":\"ok\"}");
+                    return;
+                }
+                if (!("Bearer " + token).equals(exchange.getRequestHeaders().getFirst("Authorization"))) {
+                    reply(exchange, 401, "{\"error\":\"Нужен заголовок Authorization: Bearer <токен>\"}");
+                    return;
+                }
+                if (!"/chat".equals(path)) {
+                    reply(exchange, 404, "{\"error\":\"Маршрут не найден\"}");
+                    return;
+                }
+                JsonNode body = JsonSupport.MAPPER.readTree(exchange.getRequestBody().readAllBytes());
+                chatBodies.add(body);
+                String sid = body.has("sessionId") ? body.get("sessionId").asText()
+                        : "S-" + sessions.incrementAndGet();
+                String ticket = body.has("ticketId") ? body.get("ticketId").asText() : null;
+                ObjectNode out = JsonSupport.MAPPER.createObjectNode();
+                out.put("answer", "Учётная запись заблокирована после 5 неудачных попыток [1].");
+                out.putArray("sources").add("auth.md#Блокировка учётной записи");
+                if (ticket != null) {
+                    ObjectNode summary = out.putObject("ticket");
+                    summary.put("id", ticket);
+                    summary.put("subject", "Не работает авторизация");
+                    summary.put("status", "open");
+                }
+                out.put("crmAvailable", true);
+                out.put("escalated", false);
+                out.put("llmSource", "cloud");
+                out.put("durationMs", 42);
+                out.put("sessionId", sid);
+                reply(exchange, 200, JsonSupport.MAPPER.writeValueAsString(out));
+            }
+        }
+
+        private static void reply(HttpExchange exchange, int status, String json) throws IOException {
+            byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
+            exchange.sendResponseHeaders(status, bytes.length);
+            try (OutputStream out = exchange.getResponseBody()) {
+                out.write(bytes);
+            }
+        }
+
+        @Override
+        public void close() {
+            server.stop(0);
+        }
+    }
+
+    private static boolean failsWith(ThrowingCall call, String fragment) {
+        try {
+            call.run();
+            return false;
+        } catch (Exception e) {
+            return e.getMessage() != null && e.getMessage().contains(fragment);
+        }
+    }
+
+    @FunctionalInterface
+    interface ThrowingCall {
+        void run() throws Exception;
+    }
+
+    private static void checkSupportConnection() throws Exception {
+        List<String> ssh = SupportConnection.sshCommand("ai-agent-01", 49152);
+        expect("ssh: аргументы туннеля (BatchMode, ExitOnForwardFailure, ConnectTimeout, ServerAliveInterval, -L)",
+                ssh.equals(List.of("ssh", "-N", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes",
+                        "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=30",
+                        "-L", "49152:127.0.0.1:8090", "ai-agent-01")));
+        String token = "selftest-support-chat-token";
+        try (SupportStub stub = new SupportStub(token)) {
+            SupportConnection direct = SupportConnection.open(Map.of(
+                    "SUPPORT_SERVER_URL", stub.url(), "SUPPORT_API_TOKEN", token));
+            expect("подключение: SUPPORT_SERVER_URL без ssh", direct.description().equals(stub.url()) && direct.alive());
+            SupportChatCli.Turn turn = direct.turn(null, "Почему не работает авторизация?", "T-1001");
+            expect("подключение: ход уходит на /chat и возвращает sessionId",
+                    turn.answer().contains("заблокирована") && turn.sessionId().startsWith("S-"));
+            direct.close();
+            SupportConnection wrong = SupportConnection.open(Map.of(
+                    "SUPPORT_SERVER_URL", stub.url(), "SUPPORT_API_TOKEN", "wrong-token"));
+            expect("подключение: 401 даёт понятное сообщение без токена", failsWith(
+                    () -> wrong.turn(null, "Почему?", null), "отклонил токен (401)")
+                    && !failsWith(() -> wrong.turn(null, "Почему?", null), "wrong-token"));
+            wrong.close();
+        }
+        expect("подключение: без SUPPORT_API_TOKEN — ошибка до запуска ssh", failsWith(
+                () -> SupportConnection.open(Map.of("SUPPORT_SERVER_URL", "http://127.0.0.1:9")), "SUPPORT_API_TOKEN"));
+        int closed = freePort();
+        expect("подключение: SUPPORT_SERVER_URL не отвечает — понятная ошибка", failsWith(
+                () -> SupportConnection.open(Map.of("SUPPORT_SERVER_URL", "http://127.0.0.1:" + closed,
+                        "SUPPORT_API_TOKEN", token)), "не отвечает"));
     }
 
     /** Часы для проверки TTL: время меняется только явно. */
