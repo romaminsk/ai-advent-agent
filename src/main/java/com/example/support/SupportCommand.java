@@ -2,24 +2,13 @@ package com.example.support;
 
 import com.example.AgentException;
 import com.example.Config;
-import com.example.JsonSupport;
-import com.example.McpClientComponent;
-import com.example.index.DocumentLoader;
 import com.example.index.Embedder;
-import com.example.index.IndexService;
-import com.example.index.IndexStore;
 import com.example.index.OpenAiEmbedder;
-import com.example.rag.RagPromptBuilder;
-import com.example.review.ReviewLlmConfig;
 import com.example.rag.RagRetriever;
 import com.example.rag.RagService;
-import com.example.rag.RagSettings;
-import com.example.rag.RagSettingsStore;
-import com.fasterxml.jackson.databind.JsonNode;
+import com.example.review.ReviewLlmConfig;
 
-import java.io.IOException;
 import java.io.PrintStream;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -29,8 +18,6 @@ import java.util.Map;
 /** Команда «ai-agent support»: MCP (тикет и клиент) → RAG по support-docs → LLM. Только чтение. */
 public final class SupportCommand {
 
-    static final String STRATEGY = IndexService.STRATEGY_STRUCTURE;
-    static final int TOP_K = 5;
     static final long LLM_TIMEOUT_SECONDS = SupportLlm.BUDGET_SECONDS;
     static final String THRESHOLD_VARIABLE = "SUPPORT_IDK_THRESHOLD";
     static final String USAGE = "Использование: ai-agent support --ticket T-1001 \"вопрос\" | "
@@ -41,6 +28,7 @@ public final class SupportCommand {
     public record Options(String mcpCommand, Embedder embedder, String embeddingModel,
                           RagService.LlmClient llm, Path docsDir, Path indexDir, double threshold) {
 
+        /** Для server: вызывается на каждый запрос, чтобы бюджет LLM отсчитывался заново. */
         public static Options fromEnvironment(PrintStream log) {
             Map<String, String> env = System.getenv();
             String baseUrl = env.get("EMBEDDING_BASE_URL");
@@ -69,11 +57,6 @@ public final class SupportCommand {
             }
             throw new IllegalStateException(THRESHOLD_VARIABLE + " должен быть числом в диапазоне 0..1.");
         }
-    }
-
-    private enum Lookup { OK, NOT_FOUND, UNAVAILABLE }
-
-    private record Found(Lookup status, JsonNode data, String message) {
     }
 
     private record Args(String ticket, String customer, boolean reindex, String question) {
@@ -106,51 +89,12 @@ public final class SupportCommand {
             err.println(USAGE);
             return 2;
         }
-        McpClientComponent mcp = new McpClientComponent();
-        boolean crmDown = false;
-        JsonNode ticket = null;
-        JsonNode customer = null;
-        if (parsed.ticket() != null) {
-            Found found = lookup(mcp, options.mcpCommand(), CrmMcpServer.GET_TICKET, "ticketId", parsed.ticket());
-            if (found.status() == Lookup.NOT_FOUND) {
-                err.println("Ошибка: тикет " + parsed.ticket() + " не найден в CRM. Ответ не сформирован.");
-                return 1;
-            }
-            if (found.status() == Lookup.UNAVAILABLE) {
-                crmDown = true;
-                err.println("CRM: " + found.message());
-            } else {
-                ticket = found.data();
-            }
-        }
-        String customerId = parsed.customer() != null ? parsed.customer()
-                : ticket == null ? null : ticket.path("customerId").asText(null);
-        if (customerId != null) {
-            Found found = lookup(mcp, options.mcpCommand(), CrmMcpServer.GET_CUSTOMER, "customerId", customerId);
-            if (found.status() == Lookup.NOT_FOUND && parsed.customer() != null) {
-                err.println("Ошибка: клиент " + customerId + " не найден в CRM. Ответ не сформирован.");
-                return 1;
-            }
-            if (found.status() == Lookup.UNAVAILABLE) {
-                crmDown = true;
-                err.println("CRM: " + found.message());
-            } else if (found.status() == Lookup.OK) {
-                customer = found.data();
-            }
-        }
-        if (crmDown) {
-            out.println(CRM_UNAVAILABLE);
-        }
         try {
-            IndexStore store = new IndexStore(options.indexDir());
-            ensureIndex(options, store, parsed.reindex(), err);
-            RagService service = service(options, store);
-            SupportService.Answer answer = SupportService.answer(
-                    new SupportService.Input(parsed.question(), ticket, customer), service);
-            if (options.llm() instanceof SupportLlm llm && answer.decision() == SupportService.Decision.ANSWERED) {
-                String mode = llm.lastMode();
-                err.println(mode.startsWith(ReviewLlmConfig.MODE_LOCAL)
-                        ? SupportLlm.LOCAL_NOTE : "LLM: ответ от " + mode);
+            SupportPipeline.Result result = SupportPipeline.ask(options, parsed.question(), parsed.ticket(),
+                    parsed.customer(), parsed.reindex(), err);
+            SupportService.Answer answer = result.answer();
+            if (result.crmUnavailable()) {
+                out.println(CRM_UNAVAILABLE);
             }
             out.println(String.format(Locale.ROOT,
                     "Поиск: top-1 score %.4f, порог supportIdkThreshold %.4f — %s",
@@ -166,7 +110,14 @@ public final class SupportCommand {
                     out.println("  - " + chunk.source() + "#" + chunk.section());
                 }
             }
+            if (result.llmMode() != null) {
+                err.println(result.llmMode().startsWith(ReviewLlmConfig.MODE_LOCAL)
+                        ? SupportLlm.LOCAL_NOTE : "LLM: ответ от " + result.llmMode());
+            }
             return answer.decision() == SupportService.Decision.LLM_FAILED ? 1 : 0;
+        } catch (SupportPipeline.NotFoundException e) {
+            err.println(e.getMessage());
+            return 1;
         } catch (Exception e) {
             err.println("Ошибка support: " + e.getMessage());
             return 1;
@@ -203,48 +154,5 @@ public final class SupportCommand {
             throw new IllegalArgumentException("Ошибка: укажите --ticket или --customer, не оба сразу.");
         }
         return new Args(ticket, customer, reindex, String.join(" ", rest).strip());
-    }
-
-    private static Found lookup(McpClientComponent mcp, String command, String tool, String argument, String id) {
-        try {
-            McpClientComponent.ToolCallResult result = mcp.callTool(command, tool, Map.of(argument, id));
-            String text = result.text() == null ? "" : result.text();
-            if (result.error()) {
-                if (text.startsWith(CrmMcpServer.NOT_FOUND)) {
-                    return new Found(Lookup.NOT_FOUND, null, text);
-                }
-                return new Found(Lookup.UNAVAILABLE, null, text);
-            }
-            return new Found(Lookup.OK, JsonSupport.MAPPER.readTree(text), null);
-        } catch (McpClientComponent.McpClientException e) {
-            return new Found(Lookup.UNAVAILABLE, null, e.getMessage());
-        } catch (IOException e) {
-            return new Found(Lookup.UNAVAILABLE, null, "MCP вернул некорректный ответ");
-        }
-    }
-
-    private static void ensureIndex(Options options, IndexStore store, boolean reindex, PrintStream err)
-            throws IOException, InterruptedException {
-        if (!reindex && store.exists(STRATEGY)) {
-            return;
-        }
-        if (!Files.isDirectory(options.docsDir())) {
-            throw new IllegalStateException("корпус support не найден: " + options.docsDir());
-        }
-        err.println("Сборка индекса support: " + options.docsDir());
-        IndexService.BuildReport report = new IndexService(store).build(STRATEGY, options.docsDir().toString(),
-                new DocumentLoader(), options.embedder(), options.embeddingModel(), line -> err.println("  " + line));
-        err.println("Индекс support: " + report.chunks() + " чанков из " + report.files() + " файлов, "
-                + store.file(STRATEGY));
-    }
-
-    private static RagService service(Options options, IndexStore store) throws IOException {
-        RagSettings settings = RagSettingsStore.defaultStore().load().settings()
-                .withRewrite(false)
-                .withMinScore(options.threshold())
-                .withIdkThreshold(options.threshold());
-        return new RagService(new RagRetriever(store, options.embedder(), STRATEGY, TOP_K),
-                new RagPromptBuilder(), SupportService.SYSTEM_PROMPT, options.llm(), settings, null,
-                LLM_TIMEOUT_SECONDS);
     }
 }

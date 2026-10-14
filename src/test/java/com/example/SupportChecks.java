@@ -10,6 +10,7 @@ import com.example.support.CrmMcpServer;
 import com.example.support.CrmStore;
 import com.example.support.SupportCommand;
 import com.example.support.SupportLlm;
+import com.example.support.SupportServer;
 import com.example.support.SupportService;
 import com.fasterxml.jackson.databind.JsonNode;
 
@@ -29,8 +30,11 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 
 import static com.example.SelfTestSupport.expect;
 import static com.example.SelfTestSupport.group;
@@ -60,6 +64,130 @@ final class SupportChecks {
         group("support: облако, откат и поисковый запрос");
         checkFailover();
         checkSearchQuery();
+        group("support: support-server");
+        checkSupportServer(crmDir, base);
+    }
+
+    private static void checkSupportServer(Path crmDir, Path base) throws Exception {
+        String serverToken = "selftest-support-api-token-0123";
+        ByteArrayOutputStream serverLog = new ByteArrayOutputStream();
+        PrintStream log = new PrintStream(serverLog, true, StandardCharsets.UTF_8);
+        ReviewRunner.Llm answering = (system, user, max) -> "Диагноз: учётная запись заблокирована [1] "
+                + "«заблокирована после 5 неудачных попыток».\nЭскалация: нет.";
+        HttpClient http = HttpClient.newHttpClient();
+        try (CrmHttpServer crm = CrmHttpServer.start(0, TOKEN, new CrmStore(crmDir))) {
+            String command = mcpCommand(crm.port(), TOKEN);
+            try (SupportServer server = SupportServer.start(0, serverToken,
+                    serverOptions(command, base, 0.0, answering, log), log)) {
+                String url = "http://127.0.0.1:" + server.port();
+                HttpResponse<String> health = get(http, url + "/health");
+                expect("support-server GET /health: 200", health.statusCode() == 200 && health.body().contains("ok"));
+                String auth = "Bearer " + serverToken;
+                HttpResponse<String> noAuth = post(http, url + "/ask", null, "{\"question\":\"Почему?\"}");
+                expect("support-server без токена: 401 JSON", noAuth.statusCode() == 401 && noAuth.body().contains("error"));
+                HttpResponse<String> wrong = post(http, url + "/ask", "Bearer wrong", "{\"question\":\"Почему?\"}");
+                expect("support-server с неверным токеном: 401", wrong.statusCode() == 401);
+                HttpResponse<String> notJson = post(http, url + "/ask", auth, "не json");
+                expect("support-server не JSON: 400", notJson.statusCode() == 400);
+                HttpResponse<String> noQuestion = post(http, url + "/ask", auth, "{\"ticketId\":\"T-1001\"}");
+                expect("support-server без question: 400", noQuestion.statusCode() == 400);
+                String longQuestion = "а".repeat(SupportServer.MAX_QUESTION_CHARS + 1);
+                HttpResponse<String> tooLong = post(http, url + "/ask", auth,
+                        "{\"question\":\"" + longQuestion + "\"}");
+                expect("support-server вопрос длиннее лимита: 400", tooLong.statusCode() == 400);
+                HttpResponse<String> badTicket = post(http, url + "/ask", auth,
+                        "{\"question\":\"Почему?\",\"ticketId\":\"T 1\"}");
+                expect("support-server неверный ticketId: 400", badTicket.statusCode() == 400);
+                HttpResponse<String> huge = post(http, url + "/ask", auth,
+                        "{\"question\":\"" + "x".repeat(SupportServer.MAX_BODY_BYTES) + "\"}");
+                expect("support-server тело больше 4096 байт: 413", huge.statusCode() == 413);
+                HttpResponse<String> wrongMethod = get(http, url + "/ask");
+                expect("support-server GET /ask: 405", wrongMethod.statusCode() == 405);
+
+                HttpResponse<String> ticket = post(http, url + "/ask", auth,
+                        "{\"question\":\"Почему не работает авторизация?\",\"ticketId\":\"T-1001\"}");
+                JsonNode answer = JsonSupport.MAPPER.readTree(ticket.body());
+                expect("support-server T-1001: 200, ответ, источники и llmSource cloud",
+                        ticket.statusCode() == 200 && answer.path("answer").asText().contains("заблокирована")
+                                && answer.path("sources").size() > 0 && "cloud".equals(answer.path("llmSource").asText())
+                                && "T-1001".equals(answer.path("ticket").path("id").asText())
+                                && answer.path("durationMs").isNumber());
+                expect("support-server ответ не содержит токен и email клиента",
+                        !ticket.body().contains(serverToken) && !ticket.body().contains(CUSTOMER_EMAIL));
+                HttpResponse<String> missing = post(http, url + "/ask", auth,
+                        "{\"question\":\"Почему?\",\"ticketId\":\"T-9999\"}");
+                expect("support-server неизвестный тикет: 404", missing.statusCode() == 404);
+            }
+            try (SupportServer declining = SupportServer.start(0, serverToken,
+                    serverOptions(command, base, 0.9999, answering, log), log)) {
+                HttpResponse<String> escalated = post(http, "http://127.0.0.1:" + declining.port() + "/ask",
+                        "Bearer " + serverToken,
+                        "{\"question\":\"Можно ли выгружать историю задач в Parquet?\",\"ticketId\":\"T-1005\"}");
+                JsonNode body = JsonSupport.MAPPER.readTree(escalated.body());
+                expect("support-server T-1005: escalated true, без LLM", escalated.statusCode() == 200
+                        && body.path("escalated").asBoolean() && body.path("llmSource").isNull()
+                        && body.path("answer").asText().contains("В документации нет ответа"));
+            }
+        }
+
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        ReviewRunner.Llm slow = (system, user, max) -> {
+            entered.countDown();
+            if (!release.await(20, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("тест не освободил LLM");
+            }
+            return "Диагноз: [1] «заблокирована после 5 неудачных попыток».";
+        };
+        try (CrmHttpServer crm = CrmHttpServer.start(0, TOKEN, new CrmStore(crmDir));
+             SupportServer busy = SupportServer.start(0, serverToken,
+                     serverOptions(mcpCommand(crm.port(), TOKEN), base, 0.0, slow, log), log)) {
+            String url = "http://127.0.0.1:" + busy.port() + "/ask";
+            String auth = "Bearer " + serverToken;
+            String body = "{\"question\":\"Почему не работает авторизация?\",\"ticketId\":\"T-1001\"}";
+            var first = java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+                try {
+                    return post(http, url, auth, body);
+                } catch (Exception e) {
+                    throw new IllegalStateException(e);
+                }
+            });
+            expect("support-server: первый запрос занял LLM", entered.await(20, TimeUnit.SECONDS));
+            HttpResponse<String> second = post(http, url, auth, body);
+            release.countDown();
+            expect("support-server: второй параллельный запрос: 429", second.statusCode() == 429);
+            expect("support-server: первый запрос завершён успешно", first.get(60, TimeUnit.SECONDS).statusCode() == 200);
+        }
+        expect("support-server: в логе только метод, путь и код, без токена",
+                !serverLog.toString(StandardCharsets.UTF_8).contains(serverToken));
+    }
+
+    private static Supplier<SupportCommand.Options> serverOptions(String command, Path base, double threshold,
+                                                                  ReviewRunner.Llm cloud, PrintStream log) {
+        Path index = base.resolve("server-index");
+        return () -> new SupportCommand.Options(command, new HashEmbedder(), "selftest-embedder",
+                SupportLlm.create(List.of(
+                        new ReviewRunner.Model(ReviewLlmConfig.MODE_CLOUD, "cloud-test", cloud,
+                                "selftest-cloud-key-0123456789"),
+                        new ReviewRunner.Model(ReviewLlmConfig.MODE_LOCAL, "local-test",
+                                (system, user, max) -> "локальный ответ", "ollama")),
+                        log, 60, 180, 120),
+                Path.of("support-docs"), index, threshold);
+    }
+
+    private static HttpResponse<String> get(HttpClient http, String url) throws Exception {
+        return http.send(HttpRequest.newBuilder(URI.create(url)).GET().build(),
+                HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+    }
+
+    private static HttpResponse<String> post(HttpClient http, String url, String auth, String body) throws Exception {
+        HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(url))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8));
+        if (auth != null) {
+            builder.header("Authorization", auth);
+        }
+        return http.send(builder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
     }
 
     private static void checkFailover() throws Exception {

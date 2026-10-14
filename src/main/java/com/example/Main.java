@@ -94,6 +94,12 @@ public final class Main {
             if (exitCode != 0) System.exit(exitCode);
             return;
         }
+        if (args.length >= 1 && "support-server".equals(args[0])) {
+            int exitCode = com.example.support.SupportServer.run(
+                    java.util.Arrays.copyOfRange(args, 1, args.length), System.out, System.err);
+            if (exitCode != 0) System.exit(exitCode);
+            return;
+        }
         if (args.length >= 1 && "support".equals(args[0])) {
             int exitCode = com.example.support.SupportCommand.main(
                     java.util.Arrays.copyOfRange(args, 1, args.length), System.out, System.err);
@@ -5317,6 +5323,7 @@ public final class Main {
         out.println("  support [--ticket T-1001 | --customer C-1] [--reindex] \"вопрос\" — ответ поддержки:");
         out.println("                     CRM через MCP, RAG по support-docs/, LLM (облако, затем Ollama);");
         out.println("                     без тикета — только RAG; порог SUPPORT_IDK_THRESHOLD (по умолчанию 0.58)");
+        out.println("  support-server [--port 8090] — HTTP support на 127.0.0.1: POST /ask, GET /health (Bearer SUPPORT_API_TOKEN)");
         out.println("  review    — AI-ревью изменений между --base и --head (--out, --max-diff; см. README)");
         out.println("  --help    — эта справка");
         out.println("  --plain   — упрощённый режим: без цветов, спиннера и сложного редактирования");
