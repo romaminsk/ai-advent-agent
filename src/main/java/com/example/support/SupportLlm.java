@@ -33,7 +33,7 @@ public final class SupportLlm implements RagService.LlmClient {
 
     public static final int CLOUD_ATTEMPT_SECONDS = 60;
     public static final int BUDGET_SECONDS = 180;
-    public static final int LOCAL_RESERVE_SECONDS = 90;
+    public static final int LOCAL_RESERVE_SECONDS = 120;
     static final String LOCAL_NOTE = "ответ локальной моделью (облако недоступно)";
     private static final Pattern HTTP_STATUS = Pattern.compile("HTTP-статус (\\d{3})");
     private static final ExecutorService POOL = Executors.newCachedThreadPool(task -> {

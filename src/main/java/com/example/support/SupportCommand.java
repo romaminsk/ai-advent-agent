@@ -147,7 +147,7 @@ public final class SupportCommand {
             RagService service = service(options, store);
             SupportService.Answer answer = SupportService.answer(
                     new SupportService.Input(parsed.question(), ticket, customer), service);
-            if (options.llm() instanceof SupportLlm llm && answer.decision() != SupportService.Decision.NO_DOCS) {
+            if (options.llm() instanceof SupportLlm llm && answer.decision() == SupportService.Decision.ANSWERED) {
                 String mode = llm.lastMode();
                 err.println(mode.startsWith(ReviewLlmConfig.MODE_LOCAL)
                         ? SupportLlm.LOCAL_NOTE : "LLM: ответ от " + mode);
