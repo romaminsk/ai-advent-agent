@@ -189,6 +189,7 @@ public final class SelfTest extends SelfTestSupport {
         groups.put("assistant", new TestGroup("Ассистент разработчика", true, AssistantChecks::run));
         groups.put("rag", new TestGroup("RAG", true, RagChecks::run));
         groups.put("review", new TestGroup("AI-ревью PR", true, ReviewChecks::run));
+        groups.put("support", new TestGroup("Поддержка (CRM, MCP, RAG)", true, SupportChecks::run));
         groups.put("orchestration-live", new TestGroup("Orchestration live", false,
                 SelfTest::runLiveOrchestration));
         return groups;
