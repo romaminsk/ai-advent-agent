@@ -5316,7 +5316,7 @@ public final class Main {
         out.println("  mcp-crm   — MCP stdio-сервер CRM: get_customer, get_ticket, list_customer_tickets (только чтение)");
         out.println("  support [--ticket T-1001 | --customer C-1] [--reindex] \"вопрос\" — ответ поддержки:");
         out.println("                     CRM через MCP, RAG по support-docs/, LLM (облако, затем Ollama);");
-        out.println("                     без тикета — только RAG; порог SUPPORT_IDK_THRESHOLD (по умолчанию 0.48)");
+        out.println("                     без тикета — только RAG; порог SUPPORT_IDK_THRESHOLD (по умолчанию 0.58)");
         out.println("  review    — AI-ревью изменений между --base и --head (--out, --max-diff; см. README)");
         out.println("  --help    — эта справка");
         out.println("  --plain   — упрощённый режим: без цветов, спиннера и сложного редактирования");

@@ -2,11 +2,14 @@ package com.example;
 
 import com.example.index.Embedder;
 import com.example.rag.RagService;
+import com.example.review.ReviewLlmConfig;
+import com.example.review.ReviewRunner;
 import com.example.support.CrmHttpServer;
 import com.example.support.CrmInit;
 import com.example.support.CrmMcpServer;
 import com.example.support.CrmStore;
 import com.example.support.SupportCommand;
+import com.example.support.SupportLlm;
 import com.example.support.SupportService;
 import com.fasterxml.jackson.databind.JsonNode;
 
@@ -54,6 +57,61 @@ final class SupportChecks {
         checkMcp(crmDir, base);
         group("support: команда support");
         checkSupportCommand(crmDir, base);
+        group("support: облако, откат и поисковый запрос");
+        checkFailover();
+        checkSearchQuery();
+    }
+
+    private static void checkFailover() throws Exception {
+        ByteArrayOutputStream log = new ByteArrayOutputStream();
+        PrintStream logStream = new PrintStream(log, true, StandardCharsets.UTF_8);
+        String secret = "selftest-cloud-key-0123456789";
+        ReviewRunner.Llm failing = (system, user, max) -> {
+            throw new IllegalStateException("Сервер вернул HTTP-статус 503. Тело ошибки не выводится.");
+        };
+        ReviewRunner.Llm slow = (system, user, max) -> {
+            Thread.sleep(3000);
+            return "облачный ответ";
+        };
+        ReviewRunner.Llm local = (system, user, max) -> "локальный ответ";
+        ReviewRunner.Model localModel = new ReviewRunner.Model(ReviewLlmConfig.MODE_LOCAL, "local-test", local, "ollama");
+
+        SupportLlm http = SupportLlm.create(List.of(
+                new ReviewRunner.Model(ReviewLlmConfig.MODE_CLOUD, "cloud-test", failing, secret), localModel),
+                logStream, 1, 10, 2);
+        String answer = http.complete("system", "user", 16);
+        String logged = log.toString(StandardCharsets.UTF_8);
+        expect("откат: ответ локальной модели после облака", answer.equals("локальный ответ")
+                && http.lastMode().startsWith(ReviewLlmConfig.MODE_LOCAL));
+        expect("откат: строка на каждую неудачную облачную попытку с причиной HTTP 503",
+                logged.split("облако, попытка", -1).length - 1 == 3 && logged.contains("HTTP 503"));
+        expect("откат: ключ не печатается в логе", !logged.contains(secret));
+
+        log.reset();
+        SupportLlm timeout = SupportLlm.create(List.of(
+                new ReviewRunner.Model(ReviewLlmConfig.MODE_CLOUD, "cloud-test", slow, secret), localModel),
+                logStream, 1, 10, 2);
+        timeout.complete("system", "user", 16);
+        expect("откат: таймаут облачной попытки фиксируется как timeout",
+                log.toString(StandardCharsets.UTF_8).contains("timeout"));
+    }
+
+    private static void checkSearchQuery() throws Exception {
+        JsonNode blockedCustomer = JsonSupport.MAPPER.readTree(
+                "{\"plan\":\"Pro\",\"status\":\"blocked\",\"authMethod\":\"password\"}");
+        JsonNode ssoCustomer = JsonSupport.MAPPER.readTree(
+                "{\"plan\":\"Business\",\"status\":\"active\",\"authMethod\":\"sso\",\"email\":\"user3@example.com\"}");
+        JsonNode t1001 = JsonSupport.MAPPER.readTree("{\"id\":\"T-1001\",\"subject\":\"Не работает авторизация\","
+                + "\"description\":\"Учётная запись заблокирована\",\"status\":\"open\"}");
+        JsonNode t1002 = JsonSupport.MAPPER.readTree("{\"id\":\"T-1002\",\"subject\":\"Не работает авторизация\","
+                + "\"description\":\"Вход через SSO перестал работать: ошибка проверки подписи\",\"status\":\"open\"}");
+        String q1 = SupportService.searchQuery(new SupportService.Input(
+                "Почему не работает авторизация?", t1001, blockedCustomer));
+        String q2 = SupportService.searchQuery(new SupportService.Input(
+                "Почему не работает авторизация?", t1002, ssoCustomer));
+        expect("поисковый запрос T-1001 и T-1002 различается (тикет и клиент)", !q1.equals(q2));
+        expect("поисковый запрос содержит способ входа и без email", q2.contains("способ входа: sso")
+                && !q2.contains("@"));
     }
 
     private static void copyDemo(Path target) throws IOException {

@@ -10,6 +10,7 @@ import com.example.index.IndexService;
 import com.example.index.IndexStore;
 import com.example.index.OpenAiEmbedder;
 import com.example.rag.RagPromptBuilder;
+import com.example.review.ReviewLlmConfig;
 import com.example.rag.RagRetriever;
 import com.example.rag.RagService;
 import com.example.rag.RagSettings;
@@ -30,7 +31,7 @@ public final class SupportCommand {
 
     static final String STRATEGY = IndexService.STRATEGY_STRUCTURE;
     static final int TOP_K = 5;
-    static final long LLM_TIMEOUT_SECONDS = 600;
+    static final long LLM_TIMEOUT_SECONDS = SupportLlm.BUDGET_SECONDS;
     static final String THRESHOLD_VARIABLE = "SUPPORT_IDK_THRESHOLD";
     static final String USAGE = "Использование: ai-agent support --ticket T-1001 \"вопрос\" | "
             + "--customer C-1 \"вопрос\" | \"вопрос\" [--reindex]";
@@ -40,7 +41,7 @@ public final class SupportCommand {
     public record Options(String mcpCommand, Embedder embedder, String embeddingModel,
                           RagService.LlmClient llm, Path docsDir, Path indexDir, double threshold) {
 
-        public static Options fromEnvironment() {
+        public static Options fromEnvironment(PrintStream log) {
             Map<String, String> env = System.getenv();
             String baseUrl = env.get("EMBEDDING_BASE_URL");
             String model = env.get("EMBEDDING_MODEL");
@@ -50,7 +51,7 @@ public final class SupportCommand {
             Config.requireLoopbackUrl(baseUrl, "EMBEDDING_BASE_URL");
             return new Options(CrmMcpServer.commandLine("", System.getProperty("java.class.path")),
                     new OpenAiEmbedder(baseUrl, model), model,
-                    SupportLlm.fromEnvironment(env), SupportPaths.supportDocsDir(), SupportPaths.supportIndexDir(),
+                    SupportLlm.fromEnvironment(env, log), SupportPaths.supportDocsDir(), SupportPaths.supportIndexDir(),
                     parseThreshold(env.get(THRESHOLD_VARIABLE)));
         }
 
@@ -84,7 +85,7 @@ public final class SupportCommand {
     public static int main(String[] args, PrintStream out, PrintStream err) {
         Options options;
         try {
-            options = Options.fromEnvironment();
+            options = Options.fromEnvironment(err);
         } catch (IllegalStateException | AgentException e) {
             err.println("Ошибка support: " + e.getMessage());
             return 1;
@@ -147,7 +148,9 @@ public final class SupportCommand {
             SupportService.Answer answer = SupportService.answer(
                     new SupportService.Input(parsed.question(), ticket, customer), service);
             if (options.llm() instanceof SupportLlm llm && answer.decision() != SupportService.Decision.NO_DOCS) {
-                err.println("LLM: ответ от " + llm.lastMode());
+                String mode = llm.lastMode();
+                err.println(mode.startsWith(ReviewLlmConfig.MODE_LOCAL)
+                        ? SupportLlm.LOCAL_NOTE : "LLM: ответ от " + mode);
             }
             out.println(String.format(Locale.ROOT,
                     "Поиск: top-1 score %.4f, порог supportIdkThreshold %.4f — %s",
