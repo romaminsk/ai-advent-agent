@@ -35,6 +35,9 @@ public final class SupportLlm implements RagService.LlmClient {
     public static final int BUDGET_SECONDS = 180;
     public static final int LOCAL_RESERVE_SECONDS = 120;
     static final String LOCAL_NOTE = "ответ локальной моделью (облако недоступно)";
+    /** Те же заголовки, что у команды ревью: провайдер учитывает их как один клиент и стабильную сессию. */
+    static final String CLOUD_USER_AGENT = "ai-agent-review/1.0";
+    static final String CLOUD_SESSION_ID = "ai-agent-review";
     private static final Pattern HTTP_STATUS = Pattern.compile("HTTP-статус (\\d{3})");
     private static final ExecutorService POOL = Executors.newCachedThreadPool(task -> {
         Thread thread = new Thread(task, "support-llm");
@@ -158,6 +161,9 @@ public final class SupportLlm implements RagService.LlmClient {
             Path history = Files.createTempDirectory("ai-agent-support-").resolve("history.json");
             LlmAgent agent = new LlmAgent(config, ModelSettings.defaults(),
                     new JsonConversationStore(history, true));
+            if (ReviewLlmConfig.MODE_CLOUD.equals(backend.mode())) {
+                agent.useReviewIdentity(CLOUD_USER_AGENT, CLOUD_SESSION_ID);
+            }
             return (system, user, maxOutputTokens) ->
                     agent.statelessRagCall(system, user, maxOutputTokens).text();
         } catch (Exception e) {
