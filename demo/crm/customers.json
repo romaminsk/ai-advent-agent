@@ -1,0 +1,42 @@
+[
+  {
+    "id": "C-1",
+    "name": "Анна Смирнова",
+    "email": "user1@example.com",
+    "plan": "Pro",
+    "status": "blocked",
+    "authMethod": "password",
+    "failedLoginAttempts": 5,
+    "lastLogin": "2026-10-10T09:12:00Z"
+  },
+  {
+    "id": "C-2",
+    "name": "Игорь Петров",
+    "email": "user2@example.com",
+    "plan": "Start",
+    "status": "active",
+    "authMethod": "password",
+    "failedLoginAttempts": 0,
+    "lastLogin": "2026-10-13T18:40:00Z"
+  },
+  {
+    "id": "C-3",
+    "name": "Мария Волкова",
+    "email": "user3@example.com",
+    "plan": "Business",
+    "status": "active",
+    "authMethod": "sso",
+    "failedLoginAttempts": 0,
+    "lastLogin": "2026-10-12T08:05:00Z"
+  },
+  {
+    "id": "C-4",
+    "name": "Олег Орлов",
+    "email": "user4@example.com",
+    "plan": "Pro",
+    "status": "active",
+    "authMethod": "password",
+    "failedLoginAttempts": 1,
+    "lastLogin": "2026-10-11T14:22:00Z"
+  }
+]
