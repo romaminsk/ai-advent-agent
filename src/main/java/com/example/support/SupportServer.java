@@ -29,6 +29,7 @@ public final class SupportServer implements AutoCloseable {
     public static final int MAX_BODY_BYTES = 4096;
     public static final int MAX_QUESTION_CHARS = 500;
     private static final Pattern TICKET_ID = Pattern.compile("[A-Za-z0-9-]{1,40}");
+    private static final Pattern SESSION_ID = Pattern.compile("[A-Za-z0-9-]{8,64}");
 
     private record Reply(int status, JsonNode body) {
     }
@@ -39,6 +40,7 @@ public final class SupportServer implements AutoCloseable {
     private final String token;
     private final Supplier<SupportCommand.Options> options;
     private final PrintStream log;
+    private final SupportChatService chat;
 
     private SupportServer(HttpServer server, String token, Supplier<SupportCommand.Options> options,
                           PrintStream log) {
@@ -46,6 +48,7 @@ public final class SupportServer implements AutoCloseable {
         this.token = token;
         this.options = options;
         this.log = log;
+        this.chat = new SupportChatService(log);
     }
 
     /** Запускает сервер; options вызывается на каждый запрос (свежий бюджет LLM). */
@@ -133,12 +136,15 @@ public final class SupportServer implements AutoCloseable {
                     : new Reply(405, error("Допускается только GET"));
         }
         if ("/ask".equals(path)) {
-            return ask(exchange, method);
+            return ask(exchange, method, false);
+        }
+        if ("/chat".equals(path)) {
+            return ask(exchange, method, true);
         }
         return new Reply(404, error("Маршрут не найден"));
     }
 
-    private Reply ask(HttpExchange exchange, String method) throws IOException {
+    private Reply ask(HttpExchange exchange, String method, boolean chat) throws IOException {
         if (!"POST".equals(method)) {
             return new Reply(405, error("Допускается только POST"));
         }
@@ -158,12 +164,20 @@ public final class SupportServer implements AutoCloseable {
         if (body == null || !body.isObject()) {
             return new Reply(400, error("Тело запроса должно быть JSON-объектом"));
         }
-        String question = body.path("question").isTextual() ? body.get("question").asText().strip() : "";
+        String field = chat ? "message" : "question";
+        String question = body.path(field).isTextual() ? body.get(field).asText().strip() : "";
         if (question.isEmpty()) {
-            return new Reply(400, error("Нужно непустое поле question"));
+            return new Reply(400, error("Нужно непустое поле " + field));
         }
         if (question.codePointCount(0, question.length()) > MAX_QUESTION_CHARS) {
-            return new Reply(400, error("question длиннее " + MAX_QUESTION_CHARS + " символов"));
+            return new Reply(400, error(field + " длиннее " + MAX_QUESTION_CHARS + " символов"));
+        }
+        String sessionId = null;
+        if (chat && body.has("sessionId") && !body.get("sessionId").isNull()) {
+            if (!body.get("sessionId").isTextual() || !SESSION_ID.matcher(body.get("sessionId").asText()).matches()) {
+                return new Reply(400, error("sessionId: 8–64 символа: буквы, цифры и дефис"));
+            }
+            sessionId = body.get("sessionId").asText();
         }
         String ticketId = null;
         if (body.has("ticketId") && !body.get("ticketId").isNull()) {
@@ -176,7 +190,7 @@ public final class SupportServer implements AutoCloseable {
             return new Reply(429, error("Уже обрабатывается другой запрос, повторите позже"));
         }
         try {
-            return answer(question, ticketId);
+            return chat ? chatTurn(sessionId, question, ticketId) : answer(question, ticketId);
         } finally {
             llmSlot.release();
         }
@@ -185,40 +199,63 @@ public final class SupportServer implements AutoCloseable {
     private Reply answer(String question, String ticketId) {
         long started = System.nanoTime();
         try {
-            SupportPipeline.Result result = SupportPipeline.ask(options.get(), question, ticketId, null, false, log);
-            SupportService.Answer answer = result.answer();
-            if (answer.decision() == SupportService.Decision.LLM_FAILED) {
-                return new Reply(503, error(answer.text()));
-            }
-            ObjectNode out = JsonSupport.MAPPER.createObjectNode();
-            out.put("answer", answer.text());
-            ArrayNode sources = out.putArray("sources");
-            answer.sources().forEach(chunk -> sources.add(chunk.source() + "#" + chunk.section()));
-            JsonNode ticket = result.ticket();
-            if (ticket == null) {
-                out.putNull("ticket");
-            } else {
-                ObjectNode summary = out.putObject("ticket");
-                summary.put("id", ticket.path("id").asText());
-                summary.put("subject", ticket.path("subject").asText());
-                summary.put("status", ticket.path("status").asText());
-            }
-            out.put("crmAvailable", !result.crmUnavailable());
-            out.put("escalated", answer.escalation());
-            String source = llmSource(result.llmMode());
-            if (source == null) {
-                out.putNull("llmSource");
-            } else {
-                out.put("llmSource", source);
-            }
-            out.put("durationMs", (System.nanoTime() - started) / 1_000_000);
-            return new Reply(200, out);
+            return answerReply(SupportPipeline.ask(options.get(), question, ticketId, null, false, log),
+                    started, null);
         } catch (SupportPipeline.NotFoundException e) {
             return new Reply(404, error(e.getMessage()));
         } catch (Exception e) {
             log.println("support: внутренняя ошибка (" + e.getClass().getSimpleName() + ")");
             return new Reply(500, error("Внутренняя ошибка support"));
         }
+    }
+
+    private Reply chatTurn(String sessionId, String message, String ticketId) {
+        long started = System.nanoTime();
+        try {
+            SupportChatService.ChatResult turn = chat.turn(sessionId, message, ticketId, options);
+            return answerReply(turn.result(), started, turn.sessionId());
+        } catch (SupportPipeline.NotFoundException e) {
+            return new Reply(404, error(e.getMessage()));
+        } catch (IllegalArgumentException e) {
+            return new Reply(400, error(e.getMessage()));
+        } catch (Exception e) {
+            log.println("support: внутренняя ошибка (" + e.getClass().getSimpleName() + ")");
+            return new Reply(500, error("Внутренняя ошибка support"));
+        }
+    }
+
+    /** Общий JSON для /ask и /chat; sessionId добавляется только в чате. */
+    private static Reply answerReply(SupportPipeline.Result result, long started, String sessionId) {
+        SupportService.Answer answer = result.answer();
+        if (answer.decision() == SupportService.Decision.LLM_FAILED) {
+            return new Reply(503, error(answer.text()));
+        }
+        ObjectNode out = JsonSupport.MAPPER.createObjectNode();
+        out.put("answer", answer.text());
+        ArrayNode sources = out.putArray("sources");
+        answer.sources().forEach(chunk -> sources.add(chunk.source() + "#" + chunk.section()));
+        JsonNode ticket = result.ticket();
+        if (ticket == null) {
+            out.putNull("ticket");
+        } else {
+            ObjectNode summary = out.putObject("ticket");
+            summary.put("id", ticket.path("id").asText());
+            summary.put("subject", ticket.path("subject").asText());
+            summary.put("status", ticket.path("status").asText());
+        }
+        out.put("crmAvailable", !result.crmUnavailable());
+        out.put("escalated", answer.escalation());
+        String source = llmSource(result.llmMode());
+        if (source == null) {
+            out.putNull("llmSource");
+        } else {
+            out.put("llmSource", source);
+        }
+        out.put("durationMs", (System.nanoTime() - started) / 1_000_000);
+        if (sessionId != null) {
+            out.put("sessionId", sessionId);
+        }
+        return new Reply(200, out);
     }
 
     /** cloud — ответ облака; local — локальная модель (облако недоступно); null — LLM не вызывалась. */
