@@ -11,6 +11,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -32,7 +33,9 @@ public final class SupportService {
             + "4) Эскалация: да или нет и причина одной фразой.";
     static final String SYSTEM_PROMPT = RagConstants.SYSTEM_PROMPT + "\n" + FORMAT_PROMPT;
     private static final Pattern CITATION = Pattern.compile("\\[(\\d+)\\]");
-    private static final Pattern ESCALATION_YES = Pattern.compile("(?iu)эскалация:\\s*(да|нужна)");
+    private static final Pattern MARKUP = Pattern.compile("[#*_`>]");
+    private static final Pattern LIST_MARK = Pattern.compile("^(\\d+[.)]\\s*|-\\s*)");
+    private static final Pattern YES = Pattern.compile("^(да|нужна)(?!\\p{L})");
     private static final Pattern EMAIL = Pattern.compile("[\\w.+-]+@[\\w-]+(\\.[\\w-]+)+");
 
     public enum Decision { ANSWERED, NO_DOCS, LLM_FAILED }
@@ -82,7 +85,37 @@ public final class SupportService {
             text = text + "\n(Цитаты не подтверждены проверкой по фрагментам.)";
         }
         return new Answer(Decision.ANSWERED, text, cited(text, result.chunks()), top1, threshold,
-                ESCALATION_YES.matcher(text).find());
+                escalationRequested(text));
+    }
+
+    /**
+     * Вердикт «Эскалация» из ответа модели: последняя строка с «эскалация» — либо «Эскалация: Да/Нет»,
+     * либо заголовок, а ответ в следующей непустой строке. Markdown и нумерация игнорируются.
+     * «Да», «Нужна» — true; «Нет», «Не нужна» и всё прочее — false.
+     */
+    public static boolean escalationRequested(String text) {
+        if (text == null) {
+            return false;
+        }
+        List<String> lines = text.lines().map(SupportService::plain).filter(line -> !line.isEmpty()).toList();
+        for (int i = lines.size() - 1; i >= 0; i--) {
+            String line = lines.get(i);
+            if (!line.toLowerCase(Locale.ROOT).startsWith("эскалация")) {
+                continue;
+            }
+            String verdict = line.substring("эскалация".length()).replaceFirst("^\\s*:?\\s*", "");
+            if (verdict.isEmpty() && i + 1 < lines.size()) {
+                verdict = lines.get(i + 1);
+            }
+            String lower = verdict.toLowerCase(Locale.ROOT);
+            return YES.matcher(lower).find();
+        }
+        return false;
+    }
+
+    private static String plain(String line) {
+        String text = MARKUP.matcher(line).replaceAll("").strip();
+        return LIST_MARK.matcher(text).replaceFirst("").strip();
     }
 
     /**
