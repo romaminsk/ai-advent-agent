@@ -44,3 +44,6 @@ build/
 conversation.json
 conversation.json.lock
 conversation.json.*.tmp
+
+### Результаты агента /files: локальные отчёты, не для репозитория ###
+agent-output/
