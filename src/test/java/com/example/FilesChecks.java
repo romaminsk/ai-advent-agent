@@ -36,6 +36,8 @@ final class FilesChecks extends SelfTestSupport {
         checkMcpRoundtrip(project);
         group("files: агент — сценарии и лимиты");
         checkAgentScenarios(base, project, keyStore);
+        group("files: агент — память, повторы, итог, notes");
+        checkMemoryAndLimits(base, project, keyStore);
         group("files: агент — правки и ошибки инструментов");
         checkProposals(project, keyStore);
         group("files: агент — прерывание");
@@ -370,9 +372,10 @@ final class FilesChecks extends SelfTestSupport {
 
         Script endless = new Script(action("list", Map.of("path", "docs")));
         ScriptedRun limit = runScripted(project, keyStore, new FilesChangeQueue(), journalDir, "перечисли", endless);
-        expect("лимит 12 ходов: остановка с понятным сообщением",
-                limit.outcome().stopped() && limit.outcome().stopReason().contains("лимит ходов")
-                        && limit.outcome().steps().size() == FilesAgent.MAX_TURNS);
+        expect("лимит 12 ходов: принудительный итог вместо остановки",
+                !limit.outcome().stopped() && limit.outcome().answer().contains("Лимит ходов исчерпан")
+                        && limit.outcome().steps().size() == FilesAgent.MAX_TURNS
+                        && limit.outcome().steps().get(FilesAgent.MAX_TURNS - 1).error().contains("последнем"));
 
         Script invalid = new Script("не json", "всё ещё не json");
         ScriptedRun twice = runScripted(project, keyStore, new FilesChangeQueue(), journalDir, "x", invalid);
@@ -401,6 +404,67 @@ final class FilesChecks extends SelfTestSupport {
                 && injected.outcome().steps().size() == 1);
         expect("текст файла передан модели только как <data>",
                 injection.requests().get(1).contains("<data>"));
+    }
+
+    private static void checkMemoryAndLimits(Path base, Path project, Path keyStore) throws Exception {
+        Path journalDir = base.resolve("journal-memory");
+        for (int i = 1; i <= 14; i++) {
+            StringBuilder body = new StringBuilder();
+            for (int line = 1; line <= 7; line++) body.append("ZetaMarker строка ").append(line).append('\n');
+            write(project, String.format("many/f%02d.java", i), body.toString());
+        }
+
+        ScriptedRun repeat = runScripted(project, keyStore, new FilesChangeQueue(), journalDir, "повтор",
+                new Script(action("search", Map.of("query", "ZetaMarker")),
+                        action("search", Map.of("query", "ZetaMarker")), "{\"final\": \"ok\"}"));
+        expect("повтор одного вызова не выполняется",
+                repeat.outcome().steps().size() == 2 && !repeat.outcome().steps().get(1).ok()
+                        && repeat.outcome().steps().get(1).error().contains("уже выполнен"));
+
+        List<String> facts = new ArrayList<>();
+        facts.add(action("search", Map.of("query", "ZetaMarker")));
+        for (int i = 1; i <= 6; i++) {
+            facts.add(action("read", Map.of("path", "docs/a.md", "maxChars", 100 + i)));
+        }
+        facts.add("{\"final\": \"ok\"}");
+        Script eight = new Script(facts.toArray(new String[0]));
+        ScriptedRun turns = runScripted(project, keyStore, new FilesChangeQueue(), journalDir, "факты", eight);
+        expect("ход 8: список файлов первого поиска доступен в промте",
+                turns.outcome().steps().size() == 7 && eight.requests().size() == 8
+                        && eight.requests().get(7).contains("many/f01.java")
+                        && eight.requests().get(7).contains("many/f14.java"));
+
+        FilesTools tools = new FilesTools(new FilesSandbox(project));
+        Map<String, Object> wide = tools.search("ZetaMarker", false, false, null, 500);
+        String rendered = FilesAgent.renderSearch(wide);
+        expect("формат search: 98 совпадений, 14 файлов, укладывается в 6000 символов",
+                rendered.startsWith("Найдено 98 совпадений в 14 файлах:") && rendered.length() <= 6000);
+        boolean allFiles = true;
+        for (int i = 1; i <= 14; i++) allFiles &= rendered.contains(String.format("many/f%02d.java (7)", i));
+        expect("формат search: все 14 файлов перечислены", allFiles);
+        Map<String, Object> capped = tools.search("ZetaMarker", false, false, null, 5);
+        String cappedText = FilesAgent.renderSearch(capped);
+        boolean cappedFiles = true;
+        for (int i = 1; i <= 14; i++) cappedFiles &= cappedText.contains(String.format("many/f%02d.java (7)", i));
+        expect("формат search при обрезке совпадений: все файлы всё равно перечислены", cappedFiles);
+        expect("факт поиска укладывается в 1500 символов",
+                FilesAgent.factText(wide).length() <= 1500 && FilesAgent.factText(wide).contains("many/f14.java"));
+
+        List<String> forced = new ArrayList<>();
+        for (int i = 1; i <= 11; i++) forced.add(action("list", Map.of("path", "docs", "maxResults", i)));
+        forced.add(action("list", Map.of("path", "src")));
+        forced.add("Итог по фактам: найдено.");
+        Script finish = new Script(forced.toArray(new String[0]));
+        ScriptedRun last = runScripted(project, keyStore, new FilesChangeQueue(), journalDir, "итог", finish);
+        expect("принудительное завершение на последнем ходу выдаёт итог",
+                !last.outcome().stopped() && last.outcome().answer().endsWith("Итог по фактам: найдено.")
+                        && last.outcome().steps().get(11).error().contains("последнем")
+                        && finish.requests().size() == 13);
+
+        Script withNotes = new Script("{\"tool\": \"search\", \"args\": {\"query\": \"ZetaMarker\"}, \"notes\": \"NOTE-XYZ-42\"}",
+                "{\"final\": \"ok\"}");
+        runScripted(project, keyStore, new FilesChangeQueue(), journalDir, "notes", withNotes);
+        expect("notes повторяются в следующем запросе", withNotes.requests().get(1).contains("NOTE-XYZ-42"));
     }
 
     private static boolean journalHasSteps(Path journal, int expectedSteps) throws Exception {

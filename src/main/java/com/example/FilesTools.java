@@ -129,6 +129,7 @@ final class FilesTools {
         }
         PathMatcher matcher = matcher(glob);
         List<Map<String, Object>> matches = new ArrayList<>();
+        Map<String, Integer> perFile = new LinkedHashMap<>();
         int total = 0;
         int scanned = 0;
         int skipped = 0;
@@ -149,6 +150,7 @@ final class FilesTools {
             for (int i = 0; i < lines.size(); i++) {
                 if (!pattern.matcher(lines.get(i)).find()) continue;
                 total++;
+                perFile.merge(sandbox.relative(file), 1, Integer::sum);
                 if (matches.size() < limit) {
                     Map<String, Object> match = new LinkedHashMap<>();
                     match.put("path", sandbox.relative(file));
@@ -160,6 +162,7 @@ final class FilesTools {
         }
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("matches", matches);
+        result.put("perFile", perFile);
         result.put("totalMatches", total);
         result.put("truncated", total > matches.size());
         result.put("filesScanned", scanned);
