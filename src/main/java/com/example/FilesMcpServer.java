@@ -171,6 +171,14 @@ public final class FilesMcpServer implements AutoCloseable {
         server.closeGracefully();
     }
 
+    /** Сервер живёт, пока жив клиент-родитель; при его завершении процесс не остаётся сиротой. */
+    private static void awaitParentExit() throws InterruptedException {
+        long parent = ProcessHandle.current().parent().map(ProcessHandle::pid).orElse(-1L);
+        while (ProcessHandle.current().parent().map(ProcessHandle::pid).orElse(-1L) == parent) {
+            Thread.sleep(500);
+        }
+    }
+
     public static String command(Path projectRoot) {
         try {
             if (commandExists("ai-agent")) {
@@ -223,7 +231,7 @@ public final class FilesMcpServer implements AutoCloseable {
             return 2;
         }
         try (FilesMcpServer ignored = new FilesMcpServer(Path.of(args[1]))) {
-            Thread.currentThread().join();
+            awaitParentExit();
             return 0;
         } catch (IllegalArgumentException e) {
             System.err.println("Files MCP: корень проекта недоступен.");
