@@ -53,6 +53,7 @@ public final class Main {
                 case "git-monitor" -> GitMonitorMcpServer.run();
                 case "git" -> GitMcpServer.run(java.util.Arrays.copyOfRange(args, 2, args.length));
                 case "pipeline" -> PipelineMcpServer.run(java.util.Arrays.copyOfRange(args, 2, args.length));
+                case "files" -> FilesMcpServer.run(java.util.Arrays.copyOfRange(args, 2, args.length));
                 default -> {
                     System.err.println("Неизвестный MCP-сервер: " + args[1]);
                     yield 2;
