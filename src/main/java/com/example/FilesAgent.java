@@ -52,7 +52,9 @@ final class FilesAgent {
             - propose_edit {"path": "файл", "oldText": "точный фрагмент", "newText": "замена"} — предложить правку
 
             Правила:
-            1. Сам выбирай, какие файлы смотреть. Не угадывай содержимое: читай файлы (read) и ищи (search).
+            1. Сам выбирай, какие файлы смотреть. Не угадывай содержимое: сначала ищи (search), затем читай найденные
+               пути (read). Не повторяй один и тот же вызов: если результат обрезан (truncated), сузь запрос
+               через glob, path или диапазон строк.
             2. Прежде чем утверждать, что чего-то нет или где-то что-то используется, найди это через search.
             3. Изменения предлагай только через propose_create и propose_edit. На диск ты не пишешь.
                oldText должен встречаться в файле ровно один раз; при ошибке возьми более длинный фрагмент.
@@ -160,7 +162,7 @@ final class FilesAgent {
             steps.add(new Step(steps.size() + 1, tool, args, outcome.line(), outcome.ok(), outcome.error(),
                     duration));
             progress.accept(outcome.line());
-            history.add(new Exchange(actionJson(tool, args), resultText(outcome), outcome.summary()));
+            history.add(new Exchange(actionJson(tool, args), resultText(tool, outcome), outcome.summary()));
             if (outcome.ok()) {
                 errorsInRow = 0;
             } else {
@@ -366,19 +368,57 @@ final class FilesAgent {
         }
     }
 
-    private String resultText(ToolOutcome outcome) {
-        String json;
-        try {
-            json = JsonSupport.MAPPER.writeValueAsString(outcome.data());
-        } catch (Exception e) {
-            json = "{}";
-        }
-        json = FilesSandbox.mask(json);
-        if (json.length() > MAX_RESULT_CHARS) {
-            return json.substring(0, MAX_RESULT_CHARS)
+    /** Текст результата для модели: читаемые строки вместо JSON, которое обрезается посреди. */
+    private String resultText(String tool, ToolOutcome outcome) {
+        String text = outcome.ok() ? render(tool, outcome.data()) : "ошибка: " + outcome.error();
+        text = FilesSandbox.mask(text);
+        if (text.length() > MAX_RESULT_CHARS) {
+            return text.substring(0, MAX_RESULT_CHARS)
                     + "\n[truncated=true: результат обрезан; сузь запрос (path, glob, fromLine/toLine, maxResults)]";
         }
-        return json;
+        return text;
+    }
+
+    private static String render(String tool, Map<String, Object> data) {
+        StringBuilder out = new StringBuilder();
+        switch (tool) {
+            case "list" -> {
+                List<?> files = (List<?>) data.get("files");
+                out.append("файлов: ").append(data.get("totalFiles")).append(", показано: ")
+                        .append(files.size()).append(", truncated=").append(data.get("truncated")).append('\n');
+                for (Object item : files) {
+                    Map<?, ?> file = (Map<?, ?>) item;
+                    out.append(file.get("path")).append(" (").append(file.get("size")).append(" байт)\n");
+                }
+            }
+            case "read" -> {
+                out.append(data.get("path")).append(": строки ").append(data.get("fromLine")).append('–')
+                        .append(data.get("toLine")).append(" из ").append(data.get("totalLines"))
+                        .append(", truncated=").append(data.get("truncated")).append(", sha256=")
+                        .append(data.get("sha256")).append('\n');
+                int line = ((Number) data.get("fromLine")).intValue();
+                for (String text : String.valueOf(data.get("text")).split("\n", -1)) {
+                    out.append(line++).append("| ").append(text).append('\n');
+                }
+            }
+            case "search" -> {
+                out.append("совпадений всего: ").append(data.get("totalMatches")).append(", truncated=")
+                        .append(data.get("truncated")).append('\n');
+                for (Object item : (List<?>) data.get("matches")) {
+                    Map<?, ?> match = (Map<?, ?>) item;
+                    out.append(match.get("path")).append(':').append(match.get("line")).append(": ")
+                            .append(match.get("text")).append('\n');
+                }
+            }
+            default -> {
+                try {
+                    out.append(JsonSupport.MAPPER.writeValueAsString(data));
+                } catch (Exception e) {
+                    out.append("{}");
+                }
+            }
+        }
+        return out.toString();
     }
 
     static Map<String, Object> parseAction(String raw) {
