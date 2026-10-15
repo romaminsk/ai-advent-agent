@@ -19,6 +19,12 @@
 - `com.example.index` — загрузка документов, chunking, embeddings, кэш, JSON-индекс, поиск и сравнение.
 - `DocumentLoader` исключает `src/test/**`, `target/`, `artifacts/`, `.idea/`, `.git/`, скрытые каталоги и `.env*` из корпуса.
 - `com.example.rag` — retrieval по structure-индексу, ограничение контекста, prompt, реранкер и resumable eval (`RagEvalCheckpointStore`).
+- `com.example.support` — support-чат: CRM-хранилище и MCP-инструменты CRM, транспорт (HTTP/SSH/remote), LLM-fallback и pipeline ответа.
+- CLI и режим: `SupportCommand` (`Options`, `main`), `SupportChatCli` (`Backend`, `Turn`), `SupportChatMode` (`/support on|off|status`).
+- Ответы и LLM: `SupportService` (`Answer`, порог IDK, `NO_DOCS`/эскалация, лимиты пар/истории/TTL), `SupportPipeline` (`Result`, `NotFoundException`, `ask`), `SupportLlm` (бюджеты cloud/local/резерва), `SupportException`.
+- CRM: `CrmStore`, `CrmClient`, `CrmHttpServer`, `CrmMcpServer` (`NOT_FOUND`/`UNAVAILABLE`, `commandLine`), `CrmInit` (`run`).
+- Транспорт: `SupportServer` (локальный `/ask`, лимиты body/question), `SupportRemoteClient` (клиент с токеном и таймаутом), `SupportConnection` (SSH-туннель, порт 8090).
+- `SupportPaths` — каталоги CRM, корпуса документации и отдельного индекса; переопределяются системными свойствами (package-private).
 - `src/test/java/com/example` — локальные self-tests без платных запросов к LLM.
 - `SelfTest.java` — короткий runner и реестр групп; `SelfTestSupport.java` — expect, counters, stores, stubs, локальные серверы и process helpers.
 - Group files: `DialogChecks`, `StoreChecks`, `TaskStateChecks`, `ContextChecks`, `ContextStrategyChecks`, `CommandChecks`, `InvariantGuardChecks`, `UxChecks`, `McpChecks`, `McpPipelineChecks`, `OrchestrationChecks`, `OrchestrationLiveChecks`, `WorkerSchedulerChecks`, `WorkerProcessChecks`, `StoreFailureChecks`, `MeasurementChecks`, `QuietOutputChecks`, `IntegrationChecks`, `IndexChecks`, `RagChecks`.
