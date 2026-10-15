@@ -206,6 +206,8 @@ public interface TerminalUi extends AutoCloseable {
                         "сравнение ollama и cloud по фактам, цитатам и скорости"),
                 new Row("Поддержка", "/support on/off/status/ticket/new",
                         "чат поддержки на сервере: ответы по тикету и документации, отдельная история"),
+                new Row("Файлы", "/files <цель> /files diff/apply/discard/status",
+                        "агент читает и ищет файлы проекта; правки применяются только по /files apply"),
                 new Row("Прочее", "/mcp /monitor /help /exit (также exit, quit)",
                         "подключения, мониторинг и справка"),
         };
@@ -237,7 +239,7 @@ public interface TerminalUi extends AutoCloseable {
                 "/profile", "/skill", "/pipeline", "/invariant", "/clear", "/reset",
                 "/mode", "/model", "/multiline", "/paste", "/demo",
                 "/context", "/summary", "/strategy", "/facts", "/branch",
-                "/tokens", "/stats", "/limit", "/status", "/mcp", "/monitor", "/support", "/index", "/rag", "/rag-bench", "/exit",
+                "/tokens", "/stats", "/limit", "/status", "/mcp", "/monitor", "/support", "/files", "/index", "/rag", "/rag-bench", "/exit",
         };
     }
 
@@ -343,6 +345,24 @@ public interface TerminalUi extends AutoCloseable {
 
                       Связано: MCP_AUTH_TOKEN (HTTP MCP).
                      Значения токенов не выводятся.""";
+            case "/files" -> """
+                    /files — файловый агент: ищет и читает файлы проекта, предлагает изменения
+
+                    Использование
+                      /files <цель>       — запуск: агент сам выбирает файлы и предлагает правки
+                      /files diff         — показать очередь изменений с diff
+                      /files apply        — применить очередь (проверка sha256, затем запись)
+                      /files discard      — очистить очередь без записи
+                      /files status       — размер очереди и последний журнал
+
+                    Примеры
+                      /files найди все места, где используется McpClientComponent
+                      /files обнови раздел Package Map в AGENTS.md
+
+                    Важно
+                      Правки не записываются до /files apply. Очередь живёт в памяти:
+                      при выходе из чата непримённые изменения теряются.
+                      Журнал запуска: ~/.ai-advent-agent/files-runs/""";
             case "/support" -> """
                     /support — чат поддержки на сервере (VPS)
 
