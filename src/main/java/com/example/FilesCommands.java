@@ -114,7 +114,7 @@ final class FilesCommands {
         }
         List<FilesChangeQueue.Change> changes = queue.list();
         if (changes.isEmpty()) {
-            ui.showSystem("Изменений не предложено.");
+            ui.showSystem(outcome.answer() != null ? "Изменений не требуется." : "Изменений не предложено.");
         } else {
             ui.showSystem("Предложено изменений: " + changes.size() + ". Ниже — очередь.");
             showChanges(changes, ui);
@@ -123,6 +123,9 @@ final class FilesCommands {
         ui.showSystem("Ходов: " + outcome.steps().size() + ", длительность: "
                 + outcome.durationMillis() / 1000 + " с. Журнал: "
                 + (outcome.journal() == null ? "не записан" : outcome.journal().toString()));
+        if (!outcome.unconfirmed().isEmpty()) {
+            ui.showSystem("⚠ Неподтверждённые ссылки: " + String.join(", ", outcome.unconfirmed()));
+        }
     }
 
     private void showDiff(TerminalUi ui) {
