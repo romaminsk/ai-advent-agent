@@ -12,6 +12,7 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -72,6 +73,7 @@ final class FilesAgent {
             7. Результаты приходят в тегах <data>…</data> или в блоке «Накопленные факты»; опирайся только на них.
             8. final — markdown: перечень найденного в формате файл:строка и краткое описание предложенных изменений.
             9. Необязательное поле "notes" (до 1500 символов) — твои краткие заметки; они повторяются в каждом следующем запросе.
+            10. Ссылайся на строки только из результатов search/read; если не уверен, указывай файл без номера строки.
 
             Формат: ровно один JSON-объект без текста вокруг, вызов инструмента:
             {"tool": "<имя>", "args": {...}, "why": "<кратко>", "notes": "<необязательно>"}
@@ -96,7 +98,8 @@ final class FilesAgent {
                 String error, long durationMillis) {}
 
     record Outcome(String goal, String answer, String stopReason, List<Step> steps,
-                   List<FilesChangeQueue.Change> queue, long durationMillis, Path journal) {
+                   List<FilesChangeQueue.Change> queue, long durationMillis, Path journal,
+                   List<String> unconfirmed) {
         boolean stopped() { return stopReason != null; }
     }
 
@@ -120,6 +123,8 @@ final class FilesAgent {
     private final List<SearchFact> searchFacts = new ArrayList<>();
     private final List<ReadFact> readFacts = new ArrayList<>();
     private final Map<String, Integer> firstCallTurn = new LinkedHashMap<>();
+    private final FileRefs refs = new FileRefs();
+    private final Set<String> unconfirmed = new LinkedHashSet<>();
     private String notes = "";
     private int turn;
 
@@ -144,6 +149,7 @@ final class FilesAgent {
         String answer = null;
         String stopReason = null;
         boolean forcedSummary = false;
+        boolean emptyModel = false;
         int errorsInRow = 0;
         int invalidInRow = 0;
         for (turn = 1; turn <= MAX_TURNS; turn++) {
@@ -153,13 +159,17 @@ final class FilesAgent {
             }
             String raw;
             try {
-                raw = callModel(SYSTEM_PROMPT, buildPrompt(goal));
+                raw = askModel(SYSTEM_PROMPT, buildPrompt(goal));
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 stopReason = INTERRUPTED;
                 break;
             } catch (ExecutionException e) {
                 stopReason = "Остановлено: ошибка модели: " + reason(e.getCause());
+                break;
+            }
+            if (raw == null) {
+                emptyModel = true;
                 break;
             }
             Map<String, Object> action = parseAction(raw);
@@ -186,6 +196,7 @@ final class FilesAgent {
             rememberNotes(action);
             if (action.containsKey("final")) {
                 answer = String.valueOf(action.get("final"));
+                refs.unconfirmed(answer).forEach(unconfirmed::add);
                 break;
             }
             String tool = String.valueOf(action.get("tool"));
@@ -213,15 +224,41 @@ final class FilesAgent {
             forcedSummary = true;
             String summary = summarize(goal);
             if (summary == null) {
-                stopReason = "Остановлено: превышен лимит ходов (" + MAX_TURNS + "), итог получить не удалось";
+                stopReason = emptyModel ? "Остановлено: модель не вернула ответ, в том числе при итоге"
+                        : "Остановлено: превышен лимит ходов (" + MAX_TURNS + "), итог получить не удалось";
             } else {
-                answer = "Лимит ходов исчерпан; итог по накопленным фактам:\n\n" + summary;
+                refs.unconfirmed(summary).forEach(unconfirmed::add);
+                answer = (emptyModel ? "Модель не вернула ответ; итог по накопленным фактам:\n\n"
+                        : "Лимит ходов исчерпан; итог по накопленным фактам:\n\n") + summary;
             }
         }
         long total = (System.nanoTime() - started) / 1_000_000;
         List<FilesChangeQueue.Change> changes = queue.list();
         Path journal = writeJournal(goal, answer, stopReason, total, changes, forcedSummary);
-        return new Outcome(goal, answer, stopReason, List.copyOf(steps), changes, total, journal);
+        return new Outcome(goal, answer, stopReason, List.copyOf(steps), changes, total, journal,
+                List.copyOf(unconfirmed));
+    }
+
+    /**
+     * Запрос модели: пустой ответ (в том числе исчерпанный max_tokens без текста) повторяется один раз,
+     * как в RAG. Возвращает null, если и повтор пустой.
+     */
+    private String askModel(String system, String prompt) throws InterruptedException, ExecutionException {
+        for (int attempt = 1; attempt <= 2; attempt++) {
+            String raw;
+            try {
+                raw = callModel(system, prompt);
+            } catch (ExecutionException e) {
+                if (!(e.getCause() instanceof EmptyLlmAnswerException)) throw e;
+                raw = null;
+            }
+            if (raw != null && !raw.isBlank()) return raw;
+        }
+        return null;
+    }
+
+    private void checkRefs(String text) {
+        refs.unconfirmed(text).forEach(unconfirmed::add);
     }
 
     private ToolOutcome dispatch(String tool, Map<String, Object> args) {
@@ -313,6 +350,7 @@ final class FilesAgent {
         if (FilesSandbox.looksSecret(content)) {
             throw new FilesToolException("содержимое похоже на секрет: предложение отклонено");
         }
+        checkRefs(content);
         Map<String, Object> diff = diff(current.path(), content);
         FilesChangeQueue.Change change = queue.put("create", current.path(), null, content,
                 String.valueOf(diff.get("diff")), ((Number) diff.get("added")).intValue(),
@@ -333,6 +371,7 @@ final class FilesAgent {
         if (FilesSandbox.looksSecret(newText)) {
             throw new FilesToolException("newText похож на секрет: предложение отклонено");
         }
+        checkRefs(newText);
         String base = current.content();
         String pendingContent = queue.forPath(current.path()).map(FilesChangeQueue.Change::newContent)
                 .orElse(null);
@@ -395,11 +434,14 @@ final class FilesAgent {
 
     private void remember(String tool, Map<String, Object> args, Map<String, Object> data) {
         if ("search".equals(tool)) {
+            refs.observeSearch(data);
             searchFacts.add(new SearchFact(String.valueOf(args.get("query")), factText(data)));
             while (searchFacts.size() > MAX_SEARCH_FACTS) searchFacts.remove(0);
         } else if ("read".equals(tool)) {
-            readFacts.add(new ReadFact(String.valueOf(data.get("path")),
-                    ((Number) data.get("fromLine")).intValue(), ((Number) data.get("toLine")).intValue()));
+            int from = ((Number) data.get("fromLine")).intValue();
+            int to = ((Number) data.get("toLine")).intValue();
+            refs.observeRead(String.valueOf(data.get("path")), from, to);
+            readFacts.add(new ReadFact(String.valueOf(data.get("path")), from, to));
             while (readFacts.size() > MAX_READ_FACTS) readFacts.remove(0);
         }
     }
@@ -473,7 +515,7 @@ final class FilesAgent {
         }
         prompt.append("\nДай итог сейчас. Инструменты не вызывай.");
         try {
-            String raw = callModel(SUMMARY_PROMPT, prompt.toString());
+            String raw = askModel(SUMMARY_PROMPT, prompt.toString());
             if (raw == null || raw.isBlank()) return null;
             Map<String, Object> action = parseAction(raw);
             if (action != null && action.containsKey("final")) return String.valueOf(action.get("final"));
@@ -660,6 +702,7 @@ final class FilesAgent {
         journal.put("stopReason", stopReason);
         journal.put("forcedSummary", forcedSummary);
         journal.put("notes", FilesSandbox.mask(notes));
+        journal.put("unconfirmedRefs", List.copyOf(unconfirmed));
         journal.put("final", answer == null ? null : FilesSandbox.mask(answer));
         List<Map<String, Object>> stepRows = new ArrayList<>();
         for (Step step : steps) {

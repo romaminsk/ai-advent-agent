@@ -34,10 +34,14 @@ final class FilesChecks extends SelfTestSupport {
         checkWrite(project);
         group("files: MCP stdio");
         checkMcpRoundtrip(project);
+        group("files: предпроверка песочницы (без LLM)");
+        precheck(project);
         group("files: агент — сценарии и лимиты");
         checkAgentScenarios(base, project, keyStore);
         group("files: агент — память, повторы, итог, notes");
         checkMemoryAndLimits(base, project, keyStore);
+        group("files: агент — пустой ответ, ссылки, журнал");
+        checkEmptyAndRefs(base, project, keyStore);
         group("files: агент — правки и ошибки инструментов");
         checkProposals(project, keyStore);
         group("files: агент — прерывание");
@@ -242,6 +246,101 @@ final class FilesChecks extends SelfTestSupport {
         try (java.util.stream.Stream<Path> stream = Files.walk(project)) {
             return stream.noneMatch(path -> path.getFileName().toString().endsWith(".tmp"));
         }
+    }
+
+    /** Предпроверка песочницы через MCP-сервер без LLM; значения из .env в вывод не попадают. */
+    static void runPrecheckOnRepo() throws Exception {
+        group("files-precheck: реальный корень репозитория");
+        precheck(Path.of("").toAbsolutePath().normalize());
+    }
+
+    static void precheck(Path root) throws Exception {
+        String command = serverCommand(root);
+        McpClientComponent client = new McpClientComponent();
+        List<String> returned = new ArrayList<>();
+        Path envFile = root.resolve(".env");
+        List<String> secrets = envSecretValues(envFile);
+
+        McpClientComponent.ToolCallResult envRead = call(client, command, returned, "files_read", Map.of("path", ".env"));
+        expect(".env: files_read отказан", envRead.error());
+        McpClientComponent.ToolCallResult outside = call(client, command, returned, "files_read",
+                Map.of("path", "../AGENTS.md"));
+        expect("../AGENTS.md: files_read отказан", outside.error());
+
+        Path linkDir = Files.createTempDirectory("precheck-link-");
+        Files.createSymbolicLink(linkDir.resolve("link.env"), envFile.toAbsolutePath());
+        McpClientComponent.ToolCallResult viaLink = call(client, command.replace(
+                "\"" + root + "\"", "\"" + linkDir + "\""), returned, "files_read", Map.of("path", "link.env"));
+        expect("симлинк на .env: files_read отказан", viaLink.error());
+        McpClientComponent.ToolCallResult linkSearch = call(client, command.replace(
+                "\"" + root + "\"", "\"" + linkDir + "\""), returned, "files_search",
+                Map.of("query", "LLM_API_URL"));
+        expect("симлинк на .env: поиск не находит содержимое", linkSearch.text().contains("\"totalMatches\":0"));
+
+        McpClientComponent.ToolCallResult search = call(client, command, returned, "files_search",
+                Map.of("query", "LLM_API_URL", "maxResults", 500));
+        expect("поиск по имени переменной из .env: в .env ноль совпадений",
+                !search.text().contains("\"path\":\".env\""));
+
+        Path writeRoot = Files.createTempDirectory("precheck-write-");
+        write(writeRoot, ".github/ci.yml", "name: ci\n");
+        write(writeRoot, "pom.xml", "<project/>\n");
+        String writeCommand = serverCommand(writeRoot);
+        McpClientComponent.ToolCallResult github = call(client, writeCommand, returned, "files_write",
+                Map.of("path", ".github/ci.yml", "content", "name: changed\n"));
+        expect("запись в .github/ отказана", github.error());
+        McpClientComponent.ToolCallResult pom = call(client, writeCommand, returned, "files_write",
+                Map.of("path", "pom.xml", "content", "<project changed/>\n"));
+        expect("запись в pom.xml отказана", pom.error());
+        expect("файлы .github/ci.yml и pom.xml не изменены",
+                Files.readString(writeRoot.resolve(".github/ci.yml")).equals("name: ci\n")
+                        && Files.readString(writeRoot.resolve("pom.xml")).equals("<project/>\n"));
+
+        for (String pair : envPairs(envFile)) {
+            for (String text : returned) {
+                expect("строка KEY=VALUE из .env не попадает в результаты инструментов", !text.contains(pair));
+            }
+        }
+        for (String secret : secrets) {
+            for (String text : returned) {
+                expect("секретное значение из .env не попадает в результаты инструментов", !text.contains(secret));
+            }
+        }
+    }
+
+    /** Строки KEY=VALUE из .env (только для проверки утечки; не печатаются). */
+    private static List<String> envPairs(Path envFile) throws Exception {
+        List<String> pairs = new ArrayList<>();
+        if (!Files.isRegularFile(envFile)) return pairs;
+        for (String line : Files.readAllLines(envFile, StandardCharsets.UTF_8)) {
+            String trimmed = line.strip().replaceFirst("^export\\s+", "");
+            if (trimmed.contains("=") && !trimmed.startsWith("#")) pairs.add(trimmed);
+        }
+        return pairs;
+    }
+
+    private static McpClientComponent.ToolCallResult call(McpClientComponent client, String command,
+                                                          List<String> returned, String tool,
+                                                          Map<String, Object> args) throws Exception {
+        McpClientComponent.ToolCallResult result = client.callTool(command, tool, args);
+        returned.add(result.text());
+        return result;
+    }
+
+    /** Значения секретов из .env (только для проверки утечки; не печатаются). */
+    private static List<String> envSecretValues(Path envFile) throws Exception {
+        List<String> values = new ArrayList<>();
+        if (!Files.isRegularFile(envFile)) return values;
+        for (String line : Files.readAllLines(envFile, StandardCharsets.UTF_8)) {
+            String trimmed = line.strip().replaceFirst("^export\\s+", "");
+            int eq = trimmed.indexOf('=');
+            if (eq < 0) continue;
+            String key = trimmed.substring(0, eq).strip();
+            if (!key.matches("(?i).*(KEY|TOKEN|SECRET|PASSWORD).*")) continue;
+            String value = trimmed.substring(eq + 1).replace("\"", "").replace("'", "").strip();
+            if (value.length() >= 16) values.add(value);
+        }
+        return values;
     }
 
     private static void checkMcpRoundtrip(Path project) throws Exception {
@@ -465,6 +564,71 @@ final class FilesChecks extends SelfTestSupport {
                 "{\"final\": \"ok\"}");
         runScripted(project, keyStore, new FilesChangeQueue(), journalDir, "notes", withNotes);
         expect("notes повторяются в следующем запросе", withNotes.requests().get(1).contains("NOTE-XYZ-42"));
+    }
+
+    private static void checkEmptyAndRefs(Path base, Path project, Path keyStore) throws Exception {
+        Path journalDir = base.resolve("journal-empty-refs");
+        write(project, "docs/a.md", "# A\nMcpClientComponent живёт здесь\nстрока три\n");
+
+        FileRefs tracker = new FileRefs();
+        tracker.observeSearch(Map.of("matches", List.of(Map.of("path", "a/B.java", "line", 5))));
+        tracker.observeRead("x/C.java", 10, 20);
+        List<String> local = tracker.unconfirmed("a/B.java:5 B.java#L5 B.java строка 5 C.java:12 C.java:21 D.java:1 E.java");
+        expect("ссылки: путь:строка, #L и «строка N» подтверждаются совпадением search и суффиксом пути",
+                !local.contains("a/B.java:5") && !local.contains("B.java#L5") && !local.contains("B.java строка 5")
+                        && !local.contains("C.java:12"));
+        expect("ссылки: строка вне прочитанного диапазона и чужой файл — неподтверждённые",
+                local.equals(List.of("C.java:21", "D.java:1")));
+
+        ScriptedRun empty = runScripted(project, keyStore, new FilesChangeQueue(), journalDir, "пусто",
+                new Script("", "", "Итог по фактам."));
+        expect("пустой ответ: повтор и принудительный итог, а не ошибка",
+                !empty.outcome().stopped() && empty.outcome().answer() != null
+                        && empty.outcome().answer().contains("Модель не вернула ответ")
+                        && empty.outcome().answer().endsWith("Итог по фактам.")
+                        && empty.outcome().steps().isEmpty());
+
+        ScriptedRun retried = runScripted(project, keyStore, new FilesChangeQueue(), journalDir, "повтор",
+                new Script("", "{\"final\": \"ok-после-повтора\"}"));
+        expect("пустой ответ один раз: повтор успешен, итог обычный",
+                "ok-после-повтора".equals(retried.outcome().answer()) && retried.outcome().stopReason() == null);
+
+        ScriptedRun refs = runScripted(project, keyStore, new FilesChangeQueue(), journalDir, "ссылки",
+                new Script(action("search", Map.of("query", "McpClientComponent")),
+                        "{\"final\": \"Места: docs/a.md:2, B.java:2, B.java:999, C.java строка 2, README.md:1,"
+                                + " FileRefs.java#L5\"}"));
+        List<String> unconfirmed = refs.outcome().unconfirmed();
+        expect("ссылка на совпадение search подтверждена",
+                !unconfirmed.contains("docs/a.md:2") && !unconfirmed.contains("B.java:2"));
+        expect("ссылки на строки вне совпадений помечены как неподтверждённые",
+                unconfirmed.contains("B.java:999") && unconfirmed.contains("C.java строка 2")
+                        && unconfirmed.contains("README.md:1") && unconfirmed.contains("FileRefs.java#L5"));
+        expect("ссылка без номера строки не проверяется",
+                FileRefs.references("см. FileRefs.java").isEmpty());
+        expect("журнал: пометка о неподтверждённых ссылках",
+                refs.outcome().journal() != null && JsonSupport.MAPPER.readTree(Files.readString(refs.outcome()
+                        .journal())).get("unconfirmedRefs").toString().contains("B.java:999"));
+
+        FilesChangeQueue queued = new FilesChangeQueue();
+        ScriptedRun proposal = runScripted(project, keyStore, queued, journalDir, "правка",
+                new Script(action("propose_edit", Map.of("path", "docs/a.md", "oldText", "строка три",
+                        "newText", "строка три (см. B.java:500)")), "{\"final\": \"ok\"}"));
+        expect("ссылка в предложении не удаляется: правка в очереди с предупреждением",
+                queued.size() == 1 && proposal.outcome().unconfirmed().contains("B.java:500")
+                        && queued.list().get(0).newContent().contains("B.java:500"));
+
+        Path commandJournal = base.resolve("journal-command-empty");
+        FilesCommands commands = new FilesCommands(project, commandJournal, serverCommand(project));
+        CommandCapture capture = new CommandCapture();
+        String[] replies = {"", "", "Итог: B.java:900."};
+        int[] calls = {0};
+        FilesAgent.Model model = (system, prompt) -> replies[Math.min(calls[0]++, replies.length - 1)];
+        commands.handle("/files пустой ответ модели", capture.ui(), model);
+        expect("/files: без изменений и с итогом — «изменений не требуется»",
+                capture.text().contains("Изменений не требуется."));
+        expect("/files: предупреждение о неподтверждённых ссылках в конце вывода",
+                capture.text().contains("⚠ Неподтверждённые ссылки: B.java:900"));
+        expect("/files: после пустых ответов три запроса (два повтора и итог)", calls[0] == 3);
     }
 
     private static boolean journalHasSteps(Path journal, int expectedSteps) throws Exception {
