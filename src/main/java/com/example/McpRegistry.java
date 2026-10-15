@@ -44,6 +44,22 @@ public final class McpRegistry implements AutoCloseable {
         return registry;
     }
 
+    /**
+     * Каталог файлового сервера для агента /files. Отдельно от open(...): каталог оркестратора
+     * git/pipeline не меняется.
+     */
+    public static McpRegistry openFiles(Path projectRoot) {
+        Map<String, String> commands = new LinkedHashMap<>();
+        try {
+            commands.put("files", FilesMcpServer.command(projectRoot));
+        } catch (RuntimeException e) {
+            commands.put("files", "");
+        }
+        McpRegistry registry = new McpRegistry(commands, new McpClientComponent(), projectRoot);
+        registry.discover();
+        return registry;
+    }
+
     /** Тестовый конструктор сохраняет реальный stdio-клиент и позволяет подменить команды. */
     static McpRegistry open(Map<String, String> commands, McpClientComponent client) {
         McpRegistry registry = new McpRegistry(commands, client, null);

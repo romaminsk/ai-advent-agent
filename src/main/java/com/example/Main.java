@@ -53,6 +53,7 @@ public final class Main {
                 case "git-monitor" -> GitMonitorMcpServer.run();
                 case "git" -> GitMcpServer.run(java.util.Arrays.copyOfRange(args, 2, args.length));
                 case "pipeline" -> PipelineMcpServer.run(java.util.Arrays.copyOfRange(args, 2, args.length));
+                case "files" -> FilesMcpServer.run(java.util.Arrays.copyOfRange(args, 2, args.length));
                 default -> {
                     System.err.println("Неизвестный MCP-сервер: " + args[1]);
                     yield 2;
@@ -229,6 +230,8 @@ public final class Main {
                 new com.example.support.SupportChatMode(env, ui::showSystem, ui::showMessage);
         Thread supportCleanup = new Thread(support::close, "support-cleanup");
         Runtime.getRuntime().addShutdownHook(supportCleanup);
+        // Агент файлов (/files): очередь правок живёт в памяти процесса.
+        FilesCommands files = FilesCommands.forCurrentProject();
         try {
             // Онбординг — только на первом запуске: нет профиля и нет истории;
             // повторный запуск получает текущую короткую статусную строку.
@@ -307,6 +310,11 @@ public final class Main {
                         } else if (normalized.equals("/mcp")
                                  || normalized.startsWith("/mcp ")) {
                             handleMcpCommand(ui, input.text(), activeAgent(demoRef, agent), mcpSnapshot);
+                        } else if (normalized.equals("/files")
+                                || normalized.startsWith("/files ")) {
+                            files.handle(input.text(), ui,
+                                    (system, prompt) -> agent.askWithoutHistory(system, prompt,
+                                            FilesAgent.MAX_TOKENS));
                         } else if (normalized.equals("/support")
                                 || normalized.startsWith("/support ")) {
                             support.command(input.text());
@@ -501,6 +509,7 @@ public final class Main {
                 }
             }
         } finally {
+            files.warnIfPending(ui);
             support.close();
             try {
                 Runtime.getRuntime().removeShutdownHook(supportCleanup);
