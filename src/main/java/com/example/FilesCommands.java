@@ -10,6 +10,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.stream.Stream;
 
 /** Команды чата /files: запуск агента, просмотр очереди, применение, отмена и статус. */
@@ -31,10 +32,22 @@ final class FilesCommands {
     private final FilesChangeQueue queue = new FilesChangeQueue();
     private final Path projectRoot;
     private final Path journalDir;
+    private final String serverCommand;
 
     FilesCommands(Path projectRoot, Path journalDir) {
+        this(projectRoot, journalDir, null);
+    }
+
+    /** serverCommand == null — штатный запуск files-сервера (как в установленном CLI). */
+    FilesCommands(Path projectRoot, Path journalDir, String serverCommand) {
         this.projectRoot = projectRoot;
         this.journalDir = journalDir;
+        this.serverCommand = serverCommand;
+    }
+
+    private McpRegistry openRegistry() {
+        return serverCommand == null ? McpRegistry.openFiles(projectRoot)
+                : McpRegistry.open(Map.of("files", serverCommand), new McpClientComponent());
     }
 
     static FilesCommands forCurrentProject() {
@@ -78,7 +91,7 @@ final class FilesCommands {
         Thread runner = Thread.currentThread();
         SignalHandler previous = Signal.handle(new Signal("INT"), signal -> runner.interrupt());
         FilesAgent.Outcome outcome;
-        try (McpRegistry registry = McpRegistry.openFiles(projectRoot)) {
+        try (McpRegistry registry = openRegistry()) {
             McpRegistry.ServerStatus status = registry.status("files");
             if (status == null || !status.available()) {
                 ui.showError("Файловый сервер недоступен: " + (status == null ? "нет статуса" : status.reason()));
@@ -142,7 +155,7 @@ final class FilesCommands {
         if (changes.stream().anyMatch(change -> isDocumentation(change.path()))) {
             ui.showSystem("⚠ " + THRESHOLD_WARNING);
         }
-        try (McpRegistry registry = McpRegistry.openFiles(projectRoot)) {
+        try (McpRegistry registry = openRegistry()) {
             ApplyReport report = applyQueue(changes, new FilesTools(new FilesSandbox(projectRoot)), registry, queue);
             report(report, ui);
         } catch (RuntimeException e) {

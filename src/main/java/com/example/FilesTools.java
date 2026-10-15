@@ -282,6 +282,7 @@ final class FilesTools {
     private void atomicWrite(Path target, byte[] bytes, Set<PosixFilePermission> permissions) {
         Path tmp = target.getParent().resolve("." + target.getFileName() + "." + UUID.randomUUID() + ".tmp");
         try {
+            Files.createDirectories(target.getParent());
             Files.write(tmp, bytes, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
             if (permissions != null) Files.setPosixFilePermissions(tmp, permissions);
             Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
