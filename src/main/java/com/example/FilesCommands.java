@@ -10,7 +10,9 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Stream;
 
 /** Команды чата /files: запуск агента, просмотр очереди, применение, отмена и статус. */
@@ -88,6 +90,14 @@ final class FilesCommands {
 
     private void run(String goal, TerminalUi ui, FilesAgent.Model model) {
         ui.showSystem("Файловый агент: " + goal);
+        List<FilesChangeQueue.Change> leftover = queue.list();
+        Set<Integer> leftoverIds = new HashSet<>();
+        leftover.forEach(change -> leftoverIds.add(change.id()));
+        if (!leftover.isEmpty()) {
+            ui.showSystem("В очереди уже " + leftover.size() + " " + changesWord(leftover.size())
+                    + " с прошлых запусков (файлы: " + String.join(", ", paths(leftover))
+                    + "). /files discard — очистить");
+        }
         Thread runner = Thread.currentThread();
         SignalHandler previous = Signal.handle(new Signal("INT"), signal -> runner.interrupt());
         FilesAgent.Outcome outcome;
@@ -113,13 +123,20 @@ final class FilesCommands {
             ui.showSystem(outcome.stopReason());
         }
         List<FilesChangeQueue.Change> changes = queue.list();
+        int added = (int) changes.stream().filter(change -> !leftoverIds.contains(change.id())).count();
         if (changes.isEmpty()) {
             ui.showSystem("Изменений в файлах не предложено.");
+        } else if (added == 0) {
+            ui.showSystem("Новых изменений нет. В очереди остались изменения прошлых запусков: "
+                    + String.join(", ", paths(changes)) + ".");
+            showChanges(changes, ui);
+            ui.showSystem("/files apply — применить, /files discard — отменить.");
         } else {
-            ui.showSystem("Предложено изменений: " + changes.size() + ". Ниже — очередь.");
+            ui.showSystem("Предложено изменений: " + added + ". Ниже — очередь.");
             showChanges(changes, ui);
             ui.showSystem("/files apply — применить, /files discard — отменить.");
         }
+        ui.showSystem("Новых изменений в этом запуске: " + added + ". Всего в очереди: " + changes.size() + ".");
         ui.showSystem("Ходов: " + outcome.steps().size() + ", длительность: "
                 + outcome.durationMillis() / 1000 + " с. Журнал: "
                 + (outcome.journal() == null ? "не записан" : outcome.journal().toString()));
@@ -274,6 +291,13 @@ final class FilesCommands {
     static boolean isDocumentation(String path) {
         String name = path.contains("/") ? path.substring(path.lastIndexOf('/') + 1) : path;
         return name.startsWith("README") || path.startsWith("docs/");
+    }
+
+    static String changesWord(int count) {
+        int mod10 = count % 10;
+        int mod100 = count % 100;
+        if (mod10 == 1 && mod100 != 11) return "изменение";
+        return mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14) ? "изменения" : "изменений";
     }
 
     private static List<String> paths(List<FilesChangeQueue.Change> changes) {

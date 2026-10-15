@@ -15,7 +15,9 @@ import java.util.regex.Pattern;
  */
 final class FileRefs {
     private static final Pattern REF = Pattern.compile(
-            "([\\w./-]+\\.[A-Za-z][A-Za-z0-9]{0,7})(?::(\\d+)(?:-\\d+)?|#L(\\d+)|\\s+строк[аеиуы]?\\s+(\\d+))");
+            "([\\w./-]+\\.[A-Za-z][A-Za-z0-9]{0,7})(?::(\\d+)(?:-\\d+)?|#L(\\d+)|\\s+строк[аеиуы]?\\s+(\\d+))"
+                    + "((?:\\s*(?:и|или|,)\\s*:\\d+(?:-\\d+)?)*)");
+    private static final Pattern FOLLOWING = Pattern.compile(":(\\d+)");
 
     private final Map<String, Set<Integer>> searchLines = new HashMap<>();
     private final Map<String, List<int[]>> readRanges = new HashMap<>();
@@ -39,9 +41,18 @@ final class FileRefs {
         if (text == null) return List.of();
         Matcher matcher = REF.matcher(text);
         while (matcher.find()) {
+            String file = matcher.group(1);
             String line = matcher.group(2) != null ? matcher.group(2)
                     : matcher.group(3) != null ? matcher.group(3) : matcher.group(4);
-            if (!confirmed(matcher.group(1), Integer.parseInt(line))) out.add(matcher.group(0));
+            if (!confirmed(file, Integer.parseInt(line))) {
+                out.add(text.substring(matcher.start(), matcher.start(5)).strip());
+            }
+            Matcher following = FOLLOWING.matcher(matcher.group(5));
+            while (following.find()) {
+                if (!confirmed(file, Integer.parseInt(following.group(1)))) {
+                    out.add(file + ":" + following.group(1));
+                }
+            }
         }
         return List.copyOf(out);
     }
