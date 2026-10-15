@@ -114,7 +114,7 @@ final class FilesCommands {
         }
         List<FilesChangeQueue.Change> changes = queue.list();
         if (changes.isEmpty()) {
-            ui.showSystem(outcome.answer() != null ? "Изменений не требуется." : "Изменений не предложено.");
+            ui.showSystem("Изменений в файлах не предложено.");
         } else {
             ui.showSystem("Предложено изменений: " + changes.size() + ". Ниже — очередь.");
             showChanges(changes, ui);
